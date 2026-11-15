@@ -1,5 +1,6 @@
 #include "core/scanner.h"
 #include "root_protocol.h"
+#include "index_protocol.h"
 
 #include <atomic>
 #include <jni.h>
@@ -179,4 +180,25 @@ Java_com_example_disksize_scan_NativeBridge_nativeRunScanToPipe(
         const auto result = disksize::scan_directory(session->configuration, session->cancellation, callbacks);
         writer.result(result);
     } catch (...) { fail(env, "Root scan/pipe failed"); }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_disksize_scan_NativeBridge_nativeStreamScan(
+    JNIEnv* env, jobject, jlong handle, jint output, jbyteArray session_id) {
+    try {
+        const auto session = session_for(handle);
+        if (session->running.exchange(true)) throw std::logic_error("Scan already running");
+        if (env->GetArrayLength(session_id) != 16) throw std::runtime_error("Invalid session UUID");
+        disksize::wire::Bytes id(16);
+        env->GetByteArrayRegion(session_id, 0, 16, reinterpret_cast<jbyte*>(id.data()));
+        if (env->ExceptionCheck()) return;
+        session->configuration.max_nodes = 2'000'000;
+        disksize::wire::IndexWriter writer(output, std::move(id), session->cancellation);
+        disksize::StreamCallbacks cb;
+        cb.on_nodes = [&](std::span<const disksize::ScanNode> nodes) { for (const auto& n : nodes) writer.node(n); };
+        cb.on_directory = [&](const disksize::ScanNode& n) { writer.directory(n); };
+        cb.on_issue = [&](const disksize::ScanIssue& i) { writer.issue(i); };
+        cb.on_progress = [&](const disksize::ScanProgress& p) { writer.progress(p); };
+        writer.finish(disksize::stream_directory(session->configuration, session->cancellation, cb));
+    } catch (...) { fail(env, "Incremental scan/pipe failed"); }
 }

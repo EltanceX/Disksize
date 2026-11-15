@@ -13,3 +13,7 @@ target_compile_options(disksize_native_tests PRIVATE -Wall -Wextra -Werror)
 add_executable(disksize_root_pipe_tests root_pipe_tests.cpp)
 target_link_libraries(disksize_root_pipe_tests PRIVATE disksize_core)
 target_compile_options(disksize_root_pipe_tests PRIVATE -Wall -Wextra -Werror)
+
+add_executable(disksize_stream_tests stream_tests.cpp)
+target_link_libraries(disksize_stream_tests PRIVATE disksize_core)
+target_compile_options(disksize_stream_tests PRIVATE -Wall -Wextra -Werror)

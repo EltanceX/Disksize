@@ -28,8 +28,8 @@ inline void blob(Bytes& out, std::string_view value) {
 // length (u32), UUID (16 raw bytes), sequence (u64). Max payload is 64 KiB.
 class Writer {
 public:
-    Writer(int output, Bytes session, CancellationToken& cancellation)
-        : fd_(dup(output)), session_(std::move(session)), cancellation_(cancellation) {
+    Writer(int output, Bytes session, CancellationToken& cancellation, std::uint16_t version = 1)
+        : fd_(dup(output)), session_(std::move(session)), cancellation_(cancellation), version_(version) {
         if (fd_ < 0 || session_.size() != 16) {
             if (fd_ >= 0) close(fd_);
             throw std::runtime_error("Invalid pipe/session");
@@ -46,7 +46,7 @@ public:
 
     void frame(std::uint16_t type, const Bytes& body, bool terminal = false) {
         if (body.size() > 65536) throw std::runtime_error("Frame too large");
-        Bytes header; u32(header, 0x44535a34); u32(header, (1U << 16) | type);
+        Bytes header; u32(header, 0x44535a34); u32(header, (static_cast<std::uint32_t>(version_) << 16) | type);
         u32(header, body.size()); header.insert(header.end(), session_.begin(), session_.end());
         u64(header, sequence_++);
         write(header, terminal); write(body, terminal);
@@ -112,6 +112,7 @@ private:
     int fd_;
     Bytes session_;
     CancellationToken& cancellation_;
+    std::uint16_t version_;
     std::uint64_t sequence_ = 0;
 };
 } // namespace disksize::wire
