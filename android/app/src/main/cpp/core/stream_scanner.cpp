@@ -143,13 +143,18 @@ private:
             ScanNode child; child.id = ++result_.node_count; child.parent_id = parent;
             child.name = name; child.depth = frame.node.depth + 1;
             struct stat st{};
-            if (fstatat(fd, name.c_str(), &st, AT_SYMLINK_NOFOLLOW) || !metadata(child, st)) {
+            if (fstatat(fd, name.c_str(), &st, AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT) || !metadata(child, st)) {
                 const int e = errno; deliver(child); issue(&child, classify(e), "fstatat", e);
                 continue;
             }
             child.mount_id = internal::mount_id_at(fd, name.c_str(), st, fds_);
             if (!child.mount_id) child.skipped = SkipReason::UnknownMount;
             else if (child.mount_id != r.root_mount_id || child.device != n.device) child.skipped = SkipReason::MountBoundary;
+            if (child.kind == NodeKind::Directory && child.skipped == SkipReason::None) {
+                for (const auto& ancestor : stack_) {
+                    if (internal::same_identity(ancestor.original, st)) { child.skipped = SkipReason::DirectoryAlias; break; }
+                }
+            }
             child.complete = child.skipped == SkipReason::None && child.kind != NodeKind::Directory;
             if (child.kind == NodeKind::Regular) {
                 if (observed_ > static_cast<std::uint64_t>(INT64_MAX) - child.raw_size) throw std::overflow_error("counter overflow");

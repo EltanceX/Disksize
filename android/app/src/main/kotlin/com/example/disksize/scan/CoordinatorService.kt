@@ -138,11 +138,14 @@ class CoordinatorService : Service() {
         override fun queryIndex(requestJson: String): String {
             checkCallingUid(); initialized.get(5, TimeUnit.SECONDS)
             require(requestJson.length <= 8192)
+            val query = try { JSONObject(requestJson) } catch (_: org.json.JSONException) {
+                return JSONObject().put("status", "invalid-query").toString()
+            }
             val result = JSONObject(IndexQueries(index).query(requestJson))
             // The journal must be durable before a public query can expose a
             // terminal index. SQLite may finish just ahead of that write.
             synchronized(lock) {
-                if (active?.id == JSONObject(requestJson).optString("sessionId") && result.optString("state") in setOf("completed", "partial", "failed")) {
+                if (active?.id == query.optString("sessionId") && result.optString("state") in setOf("completed", "partial", "failed")) {
                     return JSONObject().put("status", "index-finalizing").put("provisional", true).toString()
                 }
             }
@@ -375,6 +378,7 @@ class CoordinatorService : Service() {
         }
         main.removeCallbacksAndMessages(null)
         rootBackend.close()
+        worker.execute { index.close() }
         super.onDestroy()
     }
 

@@ -77,6 +77,10 @@ class IndexStoreTest {
             assertTrue(it.moveToFirst()); assertEquals("interrupted", it.getString(0)); assertEquals(1, it.getLong(1)); assertEquals(1, it.getInt(2))
         }
         assertEquals("partial", store.preview(id).getString("state"))
+        store.readableDatabase.rawQuery("EXPLAIN QUERY PLAN SELECT 1 FROM aggregates c WHERE c.sid=? AND c.parent=? AND c.complete=0", arrayOf(id, "1")).use {
+            val plan = buildString { while (it.moveToNext()) append(it.getString(3)) }
+            assertTrue(plan, plan.contains("aggregate_incomplete") && plan.contains("parent=?") && plan.contains("complete=?"))
+        }
     }
     @Test fun keysetPagesPreserveTiesAndRejectChangedRevisionAndQuery() = withStore { store ->
         val id = UUID.randomUUID().toString()
@@ -136,6 +140,21 @@ class IndexStoreTest {
                 try { IndexProtocol.read(ByteArrayInputStream(bytes), id, Process.myUid(), Process.myPid(), writer) { _, _, _ -> } }
                 catch (_: Exception) { rejected = true }
                 assertTrue("Malformed stream accepted", rejected)
+            }
+        }
+    }
+    @Test fun schemaMigrationKeepsExistingNodes() = withStore { store ->
+        val id = UUID.randomUUID().toString()
+        store.begin(id, "/fixture", "ordinary", Process.myUid(), Process.myPid()).use { it.node(node(1, 0, "", 0, 1)); it.flush() }
+        val name = File(store.writableDatabase.path).name
+        store.writableDatabase.execSQL("DROP INDEX aggregate_incomplete")
+        store.writableDatabase.execSQL("PRAGMA user_version=1")
+        store.close()
+        IndexStore(context, name).use { migrated ->
+            assertEquals(2, migrated.readableDatabase.version)
+            assertEquals(1, migrated.preview(id).getLong("nodeCount"))
+            migrated.readableDatabase.rawQuery("SELECT name FROM sqlite_master WHERE type='index' AND name='aggregate_incomplete'", null).use {
+                assertTrue(it.moveToFirst())
             }
         }
     }

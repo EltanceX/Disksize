@@ -90,6 +90,53 @@ class IndexDeviceTest {
             Log.i("DiskSize.Phase5", "ROOT_BASELINE_OK uid=${result.getInt("serviceUid")} scannerUid=0")
         } finally { connection.close() }
     }
+    @Test fun cancellationAndMidImportDeathKeepProvisionalIndex() {
+        val root = File(context.filesDir, "phase5-lifecycle-${UUID.randomUUID()}"); check(root.mkdir())
+        val (connection, remote) = service()
+        try {
+            repeat(100) { d -> val dir = File(root, "d$d"); check(dir.mkdir()); repeat(100) { check(File(dir, "f$it").createNewFile()) } }
+            fun start(service: IScanCoordinator): String {
+                val id = service.prepareScan(root.path, "own")
+                context.startForegroundService(Intent(context, CoordinatorService::class.java)
+                    .setAction(CoordinatorService.ACTION_START).putExtra(CoordinatorService.EXTRA_SESSION, id))
+                return id
+            }
+            fun terminal(service: IScanCoordinator, id: String): JSONObject {
+                val deadline = SystemClock.elapsedRealtime() + 30_000
+                while (SystemClock.elapsedRealtime() < deadline) {
+                    val value = JSONObject(service.scanSnapshot)
+                    if (value.getString("sessionId") == id && !value.getBoolean("active")) return value
+                    SystemClock.sleep(20)
+                }
+                error("Terminal state timed out")
+            }
+            var id = start(remote)
+            val runningDeadline = SystemClock.elapsedRealtime() + 5000
+            while (JSONObject(remote.scanSnapshot).getString("state") != "running" && SystemClock.elapsedRealtime() < runningDeadline) SystemClock.sleep(10)
+            remote.cancelScan(id)
+            val cancelled = terminal(remote, id)
+            assertEquals("cancelled", cancelled.getString("state")); assertTrue(cancelled.getBoolean("provisional"))
+            assertEquals("cancelled", JSONObject(remote.queryIndex(JSONObject().put("kind", "session").put("sessionId", id).toString())).getString("state"))
+            id = start(remote)
+            val deadline = SystemClock.elapsedRealtime() + 15_000; var killed = false
+            while (SystemClock.elapsedRealtime() < deadline) {
+                val value = JSONObject(remote.scanSnapshot)
+                if (value.getString("sessionId") == id && value.getLong("nodeCount") > 256 && value.getBoolean("active")) {
+                    Process.sendSignal(value.getInt("servicePid"), 9); killed = true; break
+                }
+                SystemClock.sleep(10)
+            }
+            assertTrue("Did not observe active import", killed); SystemClock.sleep(300)
+            val rebound = runBlocking { connection.getService() }
+            val recovered = terminal(rebound, id)
+            assertEquals("interrupted", recovered.getString("state"))
+            val meta = JSONObject(rebound.queryIndex(JSONObject().put("kind", "session").put("sessionId", id).toString()))
+            assertEquals("interrupted", meta.getString("state")); assertTrue(meta.getBoolean("provisional"))
+            assertTrue(meta.getLong("nodeCount") > 0)
+            val complete = scan(rebound, root.path, "own")
+            assertEquals("completed", complete.getString("state")); assertEquals(10101, complete.getLong("nodeCount"))
+        } finally { connection.close(); root.deleteRecursively() }
+    }
     @Test fun realFileScaleBaseline() {
         val size = InstrumentationRegistry.getArguments().getString("phase5Scale")?.toInt() ?: 0
         assumeTrue(size in setOf(10_000, 100_000, 1_000_000))
@@ -108,6 +155,7 @@ class IndexDeviceTest {
             }
             if (backend == "root") root(remote)
             Log.i("DiskSize.Phase5", "SCALE_START size=$size backend=$backend")
+            val dbBefore = File(context.noBackupFilesDir, "scan-index.db").length()
             val start = SystemClock.elapsedRealtime()
             val result = scan(remote, fixture.path, if (backend == "root") "root" else "own")
             val elapsed = SystemClock.elapsedRealtime() - start
@@ -135,7 +183,10 @@ class IndexDeviceTest {
                 .put("firstPageMicros", firstMicros).put("lastPageMicros", lastMicros).put("maxPageMicros", maxMicros)
                 .put("servicePid", result.getInt("servicePid")).put("scannerPid", result.getInt("scannerPid"))
                 .put("databaseBytes", File(context.noBackupFilesDir, "scan-index.db").length())
+                .put("databaseDeltaBytes", File(context.noBackupFilesDir, "scan-index.db").length() - dbBefore)
                 .put("walBytes", File(context.noBackupFilesDir, "scan-index.db-wal").length())
+            val memory = try { File("/proc/${result.getInt("servicePid")}/status").readText() } catch (_: Exception) { "" }
+            report.put("serviceVmHwmKiB", Regex("VmHWM:\\s+(\\d+)").find(memory)?.groupValues?.get(1)?.toLong() ?: 0)
             File(context.filesDir, "phase5-scale-$size-$backend.json").writeText(report.toString())
             Log.i("DiskSize.Phase5", "SCALE_RESULT $report")
         } finally {

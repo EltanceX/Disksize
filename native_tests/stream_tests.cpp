@@ -5,6 +5,9 @@
 #include <iostream>
 #include <map>
 #include <unistd.h>
+#include <sched.h>
+#include <sys/mount.h>
+#include <sys/wait.h>
 
 namespace fs = std::filesystem;
 using namespace disksize;
@@ -55,8 +58,46 @@ int main() {
         cb.on_nodes = [](std::span<const ScanNode>) { throw std::runtime_error("consumer"); };
         const auto failed = stream_directory(c, fail, cb);
         require(failed.scan.state == SessionState::Failed && failed.scan.metrics.open_fds_at_finish == 0, "consumer failure");
+        // A retained parent descriptor cannot be redirected through a replaced entry.
+        c.max_nodes = 100000; cb = {};
+        fs::create_directory(std::string(root) + "/replace");
+        bool replaced = false, replacement_reported = false;
+        cb.on_nodes = [&](std::span<const ScanNode> nodes) {
+            if (!replaced && nodes.front().kind == NodeKind::Directory && nodes.front().name == "replace") {
+                fs::rename(std::string(root) + "/replace", std::string(root) + "/moved");
+                require(symlink("nested", (std::string(root) + "/replace").c_str()) == 0, "replace symlink"); replaced = true;
+            }
+        };
+        cb.on_issue = [&](const ScanIssue& i) { if (i.operation == "open-directory") replacement_reported = true; };
+        CancellationToken mutation;
+        const auto changed = stream_directory(c, mutation, cb);
+        require(replaced && replacement_reported && changed.scan.state == SessionState::Partial, "replacement escaped");
+        // Long-lived directory FDs are bounded by depth, not width or node count.
+        const auto deep = std::string(root) + "/deep"; fs::create_directory(deep);
+        std::string path = deep;
+        for (int i = 0; i < 100; ++i) { path += "/level"; fs::create_directory(path); }
+        c.root_path = deep; cb = {}; CancellationToken depth;
+        const auto deep_result = stream_directory(c, depth, cb);
+        require(deep_result.scan.state == SessionState::Completed && deep_result.node_count == 101 &&
+            deep_result.scan.metrics.peak_open_fds <= 103 && deep_result.scan.metrics.open_fds_at_finish == 0, "deep fd bounds");
+        c.root_path = "/proc"; CancellationToken pseudo;
+        require(stream_directory(c, pseudo, cb).scan.state == SessionState::Partial, "pseudo filesystem");
+        fs::create_directory(std::string(root) + "/bind");
+        const auto pid = fork(); require(pid >= 0, "fork");
+        if (pid == 0) {
+            if (unshare(CLONE_NEWNS) || mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr)) _exit(77);
+            if (mount((std::string(root) + "/nested").c_str(), (std::string(root) + "/bind").c_str(), nullptr, MS_BIND, nullptr)) _exit(1);
+            c.root_path = root; bool boundary = false;
+            cb.on_nodes = [&](std::span<const ScanNode> nodes) {
+                if (nodes.front().name == "bind") boundary = nodes.front().skipped == SkipReason::MountBoundary;
+            };
+            CancellationToken mounted;
+            const auto scanned = stream_directory(c, mounted, cb);
+            _exit(boundary && scanned.scan.state == SessionState::Partial ? 0 : 1);
+        }
+        int status = 0; require(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0, "mount boundary");
         fs::remove_all(root);
-        std::cout << "{\"suite\":\"stream\",\"tests\":4,\"failed\":0}\n";
+        std::cout << "{\"suite\":\"stream\",\"tests\":8,\"failed\":0}\n";
         return 0;
     } catch (const std::exception& e) { fs::remove_all(root); std::cerr << e.what() << '\n'; return 1; }
 }

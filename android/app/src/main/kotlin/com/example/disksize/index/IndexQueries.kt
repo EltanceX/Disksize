@@ -86,7 +86,7 @@ internal class IndexQueries(private val store: IndexStore) {
         "SELECT revision,provisional,state,phase,nodes,issues,metrics FROM sessions WHERE id=?", arrayOf(id)).use {
         if (!it.moveToFirst()) null else JSONObject().put("revision", it.getLong(0)).put("provisional", it.getInt(1) == 1)
             .put("state", it.getString(2)).put("phase", it.getString(3)).put("nodeCount", it.getLong(4)).put("issueCount", it.getLong(5))
-            .put("schemaVersion", 1).put("metrics", JSONObject(it.getString(6)))
+            .put("schemaVersion", IndexStore.SCHEMA_VERSION).put("metrics", JSONObject(it.getString(6)))
     }
     private fun detail(c: Cursor): JSONObject {
         fun long(name: String) = c.getLong(c.getColumnIndexOrThrow(name))

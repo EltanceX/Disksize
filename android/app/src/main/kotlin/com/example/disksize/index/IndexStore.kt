@@ -13,7 +13,7 @@ import java.util.concurrent.CancellationException
 
 /** Owned by the ordinary scanner process. Import/finalize are confined to its single worker. */
 internal class IndexStore(context: Context, filename: String = "scan-index.db") : SQLiteOpenHelper(
-    context, File(context.noBackupFilesDir, filename).absolutePath, null, 1) {
+    context, File(context.noBackupFilesDir, filename).absolutePath, null, SCHEMA_VERSION) {
     init { setWriteAheadLoggingEnabled(true) }
     override fun onConfigure(db: SQLiteDatabase) {
         db.setForeignKeyConstraintsEnabled(true)
@@ -42,6 +42,7 @@ internal class IndexStore(context: Context, filename: String = "scan-index.db") 
             logical INTEGER NOT NULL, allocated INTEGER NOT NULL, complete INTEGER NOT NULL,
             PRIMARY KEY(sid,id)) WITHOUT ROWID""")
         db.execSQL("CREATE INDEX aggregate_parent ON aggregates(sid,parent,id)")
+        db.execSQL("CREATE INDEX aggregate_incomplete ON aggregates(sid,parent,complete)")
         db.execSQL("CREATE INDEX aggregate_depth ON aggregates(sid,depth,id)")
         db.execSQL("CREATE INDEX children_logical ON aggregates(sid,parent,logical DESC,id DESC)")
         db.execSQL("CREATE INDEX children_allocated ON aggregates(sid,parent,allocated DESC,id DESC)")
@@ -59,8 +60,13 @@ internal class IndexStore(context: Context, filename: String = "scan-index.db") 
             complete INTEGER NOT NULL)""")
     }
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
+        if (oldVersion == 1 && newVersion == 2) {
+            db.execSQL("CREATE INDEX aggregate_incomplete ON aggregates(sid,parent,complete)")
+            return
+        }
         error("Unsupported index migration $oldVersion -> $newVersion; existing data preserved")
     }
+    companion object { const val SCHEMA_VERSION = 2 }
     fun recover() {
         writableDatabase.execSQL("""UPDATE sessions SET state='interrupted', phase='interrupted',
             reason='process-interrupted', revision=revision+1, ended=? WHERE state IN ('running','finalizing')""", arrayOf(now()))
@@ -164,25 +170,30 @@ internal class IndexStore(context: Context, filename: String = "scan-index.db") 
         fun check() { if (cancelled()) throw CancellationException("Index finalization cancelled") }
         check()
         transaction(id) { it.execSQL("UPDATE sessions SET state='finalizing',phase='deduplicating' WHERE id=?", arrayOf(id)) }
-        // Cancellation is checked per group and every bounded write transaction.
-        db.rawQuery("""SELECT device,inode,MIN(path),
-            (MIN(size)<>MAX(size) OR MIN(allocated)<>MAX(allocated) OR MIN(seconds)<>MAX(seconds) OR MIN(nanos)<>MAX(nanos))
-            FROM nodes WHERE sid=? AND valid=1 AND skip=0 AND kind<>1 GROUP BY device,inode""", arrayOf(id), signal).use { groups ->
-            db.compileStatement("INSERT INTO hardlinks VALUES(?,?,?,?,?)").use { statement ->
-                var rows = 0; var opened = false
-                try {
-                    while (groups.moveToNext()) {
-                        check()
-                        if (!opened) { db.beginTransactionNonExclusive(); opened = true }
-                        statement.bindAll(listOf(id, groups.getBlob(0), groups.getBlob(1), groups.getBlob(2), groups.getInt(3)))
-                        statement.executeInsert(); rows++
-                        if (rows % 1024 == 0) {
-                            db.execSQL("UPDATE sessions SET revision=revision+1 WHERE id=?", arrayOf(id))
-                            db.setTransactionSuccessful(); db.endTransaction(); opened = false
+        // Page groups too: Android CursorWindow refills can otherwise re-run an
+        // unbounded GROUP BY from its start for each window, causing quadratic work.
+        var lastDevice = ""; var lastInode = ""
+        db.compileStatement("INSERT INTO hardlinks VALUES(?,?,?,?,?)").use { statement ->
+            while (true) {
+                check()
+                // These are hex encodings of two validated 8-byte DB identities.
+                // rawQuery only accepts string bindings, so use typed BLOB literals.
+                val after = if (lastDevice.isEmpty()) "" else " AND (device,inode)>(X'$lastDevice',X'$lastInode')"
+                var rows = 0
+                transaction(id) {
+                    db.rawQuery("""SELECT device,inode,MIN(path),
+                        (MIN(size)<>MAX(size) OR MIN(allocated)<>MAX(allocated) OR MIN(seconds)<>MAX(seconds) OR MIN(nanos)<>MAX(nanos))
+                        FROM nodes WHERE sid=? AND valid=1 AND skip=0 AND kind<>1$after
+                        GROUP BY device,inode ORDER BY device,inode LIMIT 1024""", arrayOf(id), signal).use { groups ->
+                        while (groups.moveToNext()) {
+                            check()
+                            val device = groups.getBlob(0); val inode = groups.getBlob(1)
+                            statement.bindAll(listOf(id, device, inode, groups.getBlob(2), groups.getInt(3)))
+                            statement.executeInsert(); rows++; lastDevice = device.hex(); lastInode = inode.hex()
                         }
                     }
-                    if (opened) { db.setTransactionSuccessful(); db.endTransaction(); opened = false }
-                } finally { if (opened) db.endTransaction() }
+                }
+                if (rows < 1024) break
             }
         }
         transaction(id) { it.execSQL("UPDATE sessions SET phase='aggregating' WHERE id=?", arrayOf(id)) }
