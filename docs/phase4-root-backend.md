@@ -24,7 +24,7 @@ flowchart LR
 
 - 授权状态为 `not-requested`、`requesting`、`ready`、`unavailable`。拒绝后关闭非 root 的缓存 shell，允许再次显式请求。libsu shell 初始化使用其 20 秒默认时限，服务绑定另设 25 秒时限。
 - root 身份必须同时满足实际 UID 和有效 UID 为 0；管道首帧再次核对 native 身份及已绑定 PID。
-- 不使用 `FLAG_MOUNT_MASTER`、daemon 或 `setenforce`。读取该 root 进程自己的 `/proc/self/mountinfo`、`/proc/self/ns/mnt` 和 SELinux 上下文，使用 su 实际提供的命名空间。
+- 在普通 coordinator 进程中、创建 libsu 主 shell 之前配置 `FLAG_MOUNT_MASTER`；仍仅在显式请求 root 时运行 su。不使用 daemon 或 `setenforce`。优先通过 `su --mount-master` 启动服务，避免继承应用数据隔离的 tmpfs 视图；su 不支持该选项时 libsu 会回退，最终仍读取实际 root 进程的 `/proc/self/mountinfo`、`/proc/self/ns/mnt` 和 SELinux 上下文。问题复现与设备回归见[Root 挂载视图修复](./root-mount-namespace.md)。
 - 候选入口包括 `/data`、当前用户的 CE/DE 应用目录、`/data/media/<user>` 和 `/storage/emulated/<user>`。每项显示可打开状态、挂载 ID、文件系统和共享存储别名组；root 路径的最终解析由 root native 完成，普通服务不替它规范化路径。
 - 切换 root 模式默认仍指向应用自身目录。选择 `/data` 是显式扩大到整卷，会包含所选挂载上可访问的其他用户目录；界面对此作出说明。其他用户和工作资料没有自动扫描入口，可通过显式路径选择范围。
 - 通过普通客户端 UID 推导 Android 用户，列出 `/data/user` 下可见的数字目录，并查询当前上下文的 `UserManager.isUserUnlocked`；无法确认时显示“未知”。可打开目录不代表全部加密内容已经解锁，也不尝试绕过 fscrypt。

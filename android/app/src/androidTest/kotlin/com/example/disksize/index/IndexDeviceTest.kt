@@ -90,6 +90,65 @@ class IndexDeviceTest {
             Log.i("DiskSize.Phase5", "ROOT_BASELINE_OK uid=${result.getInt("serviceUid")} scannerUid=0")
         } finally { connection.close() }
     }
+    @Test fun rootAppDataUsesGlobalMountNamespace() {
+        val arguments = InstrumentationRegistry.getArguments()
+        // Explicit opt-in: this test indexes live application metadata, never file contents.
+        assumeTrue(arguments.getString("rootAppData") == "true")
+        val expectedNamespace = requireNotNull(arguments.getString("rootMountNamespace")) {
+            "Pass the device's independently read /proc/1/ns/mnt as rootMountNamespace"
+        }
+        val fixture = File(context.filesDir, "root-namespace-${UUID.randomUUID()}"); check(fixture.mkdir())
+        val (connection, remote) = service()
+        try {
+            File(fixture, "sample").writeText("namespace")
+            val nested = File(fixture, "nested"); check(nested.mkdir())
+            File(nested, "sample").writeText("root")
+            val ordinary = scan(remote, fixture.path, "own")
+            assertEquals("completed", ordinary.getString("state"))
+            assertEquals(4, ordinary.getLong("nodeCount"))
+            root(remote)
+            val view = JSONObject(remote.rootStatus)
+            assertEquals(0, view.getInt("uid")); assertEquals(0, view.getInt("effectiveUid"))
+            assertEquals(expectedNamespace, view.getString("mountNamespace"))
+            val cePath = "/data/user/${Process.myUid() / 100000}"
+            val roots = view.getJSONArray("roots")
+            val ce = (0 until roots.length()).map { roots.getJSONObject(it) }
+                .single { it.getString("requestedPath") == cePath }
+            assertTrue(ce.getBoolean("readable"))
+            assertNotEquals("tmpfs", ce.getString("filesystem"))
+            for (path in listOf(fixture.path, "$cePath/${context.packageName}/files/${fixture.name}")) {
+                val sample = scan(remote, path, "root")
+                assertEquals("completed", sample.getString("state"))
+                assertEquals(ordinary.getLong("nodeCount"), sample.getLong("nodeCount"))
+                assertEquals(ordinary.getLong("logicalBytes"), sample.getLong("logicalBytes"))
+                assertEquals(ordinary.getLong("allocatedBytes"), sample.getLong("allocatedBytes"))
+                assertEquals(0, sample.getLong("openFdsAtFinish"))
+            }
+            // Reproduce the reported failure through the real Binder/pipe/index path.
+            // A live tree may change while being scanned, so Partial is legitimate.
+            val result = scan(remote, "/data/data", "root")
+            assertTrue(result.getString("state") in setOf("completed", "partial"))
+            assertTrue(result.getLong("nodeCount") > 4)
+            assertTrue(result.getLong("logicalBytes") > 0)
+            assertTrue(result.getLong("allocatedBytes") > 0)
+            assertNotEquals(0x01021994L, result.getLong("rootFilesystemType")) // TMPFS_MAGIC
+            assertEquals(0, result.getInt("scannerUid"))
+            assertEquals(Process.myUid(), result.getInt("serviceUid"))
+            assertEquals(0, result.getLong("openFdsAtFinish"))
+            val page = JSONObject(remote.queryIndex(JSONObject().put("kind", "children")
+                .put("sessionId", result.getString("sessionId")).put("parentId", 1).put("limit", 100).toString()))
+            assertEquals("ok", page.getString("status")); assertFalse(page.getBoolean("provisional"))
+            val children = page.getJSONArray("entries")
+            assertTrue((0 until children.length()).any {
+                val child = children.getJSONObject(it)
+                child.getString("skipped") == "none" && child.getLong("logicalBytes") > 0
+            })
+            File(context.filesDir, "root-namespace-result.json").writeText(result.toString())
+            Log.i("DiskSize.RootNamespace", "APP_DATA_OK namespace=$expectedNamespace nodes=${result.getLong("nodeCount")} " +
+                "logical=${result.getLong("logicalBytes")} allocated=${result.getLong("allocatedBytes")} " +
+                "mount=${result.getLong("rootMountId")} state=${result.getString("state")}")
+        } finally { connection.close(); fixture.deleteRecursively() }
+    }
     @Test fun cancellationAndMidImportDeathKeepProvisionalIndex() {
         val root = File(context.filesDir, "phase5-lifecycle-${UUID.randomUUID()}"); check(root.mkdir())
         val (connection, remote) = service()

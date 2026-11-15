@@ -23,6 +23,15 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.RejectedExecutionException
 
 internal class RootBackend(private val context: Context) : AutoCloseable {
+    companion object {
+        init {
+            // Configure once per coordinator process, before libsu creates its main shell.
+            // A plain su can retain Android's app-data tmpfs masks even with UID 0.
+            // This only configures the builder; su still requires an explicit request().
+            Shell.setDefaultBuilder(Shell.Builder.create().setFlags(Shell.FLAG_MOUNT_MASTER))
+        }
+    }
+
     private val main = Handler(Looper.getMainLooper())
     private val executor = Executors.newSingleThreadExecutor()
     private val lock = Any()
@@ -58,7 +67,6 @@ internal class RootBackend(private val context: Context) : AutoCloseable {
         }
         executor.execute {
             try {
-                // No FLAG_MOUNT_MASTER: inspect exactly the namespace granted by su.
                 val shell = Shell.getShell()
                 if (!shell.isRoot) throw RootFailure("root-denied")
                 val future = CompletableFuture<IRootScanner>()
