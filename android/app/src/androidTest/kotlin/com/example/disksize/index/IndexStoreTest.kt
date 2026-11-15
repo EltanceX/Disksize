@@ -158,4 +158,17 @@ class IndexStoreTest {
             }
         }
     }
+    @Test fun directoryReplacementRemovesPreviouslyCountedBlocks() = withStore { store ->
+        val id = UUID.randomUUID().toString()
+        store.begin(id, "/fixture", "ordinary", Process.myUid(), Process.myPid()).use {
+            it.node(node(1, 0, "", 4096, 1))
+            it.node(node(2, 1, "replaced", 4096, 2).copy(kind = 1, complete = false))
+            it.node(node(3, 1, "file", 3, 3))
+            it.issue(2, 6, 116, "directory-replaced"); it.directory(2, false, false, 6)
+            it.directory(1, true, true, 0); it.flush()
+        }
+        val result = store.finalize(id, StreamSummary("partial", 3, 1, 1, 2, 0, 1, 1)) { false }
+        assertEquals("partial", result.getString("state")); assertEquals(3, result.getLong("logicalBytes"))
+        assertEquals(8192, result.getLong("allocatedBytes"))
+    }
 }

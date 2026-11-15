@@ -1,7 +1,6 @@
 package com.example.disksize.index
 
 import android.content.Context
-import android.database.Cursor
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
 import android.database.sqlite.SQLiteStatement
@@ -127,6 +126,8 @@ internal class IndexStore(context: Context, filename: String = "scan-index.db") 
             db.execSQL("UPDATE nodes SET enumerated=?,complete=?,skip=? WHERE sid=? AND id=? AND kind=1",
                 arrayOf<Any>(if (enumerated) 1 else 0, if (complete) 1 else 0, skip, id, node))
             db.execSQL("UPDATE aggregates SET complete=? WHERE sid=? AND id=?", arrayOf<Any>(if (complete) 1 else 0, id, node))
+            if (skip != 0) db.execSQL("UPDATE aggregates SET own_logical=0,own_allocated=0,logical=0,allocated=0 WHERE sid=? AND id=?",
+                arrayOf<Any>(id, node))
             writeNanos += System.nanoTime() - before
             if (actions >= 256) flush()
         }
