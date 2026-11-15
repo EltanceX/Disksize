@@ -8,6 +8,7 @@ interface IScanCoordinator {
     String getRootStatus();
     String prepareScan(String rootPath, String source);
     String getScanSnapshot();
+    String queryIndex(String requestJson);
     void cancelScan(String sessionId);
     void rejectPreparedScan(String sessionId, String reason);
 }

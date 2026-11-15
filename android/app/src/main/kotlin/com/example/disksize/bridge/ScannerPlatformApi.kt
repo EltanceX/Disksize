@@ -102,6 +102,7 @@ internal class ScannerPlatformApi(private val activity: MainActivity) : ScannerH
     }
 
     override suspend fun cancelScan(sessionId: String) { callCoordinator { it.cancelScan(sessionId) } }
+    override suspend fun queryIndex(requestJson: String): String = callCoordinator { it.queryIndex(requestJson) }
 
     private fun requireForeground() {
         if (closed || !activity.isResumedForScan) {

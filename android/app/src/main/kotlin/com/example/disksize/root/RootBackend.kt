@@ -11,6 +11,9 @@ import android.os.Looper
 import android.os.ParcelFileDescriptor
 import android.util.Log
 import com.example.disksize.scan.ipc.IRootScanner
+import com.example.disksize.index.IndexProtocol
+import com.example.disksize.index.IndexStore
+import com.example.disksize.index.StreamSummary
 import com.topjohnwu.superuser.Shell
 import com.topjohnwu.superuser.ipc.RootService
 import org.json.JSONObject
@@ -72,7 +75,7 @@ internal class RootBackend(private val context: Context) : AutoCloseable {
                 }
                 val service = future.get(25, TimeUnit.SECONDS)
                 val inspection = JSONObject(service.inspect())
-                check(inspection.getInt("protocolVersion") == 1 && inspection.getInt("uid") == 0 && inspection.getInt("effectiveUid") == 0)
+                check(inspection.getInt("protocolVersion") == 2 && inspection.getInt("uid") == 0 && inspection.getInt("effectiveUid") == 0)
                 synchronized(lock) { check(!closed); status = inspection.toString() }
             } catch (error: Exception) {
                 Log.w("DiskSize.Root", "Root authorization/binding failed", error)
@@ -91,7 +94,7 @@ internal class RootBackend(private val context: Context) : AutoCloseable {
         JSONObject(status).optString("state") == "ready" && remote?.asBinder()?.isBinderAlive == true
     }
 
-    fun run(id: String, root: String, progress: (Long, Long, Long) -> Unit): JSONObject {
+    fun run(id: String, root: String, writer: IndexStore.Import, progress: (Long, Long, Long) -> Unit): StreamSummary {
         val service: IRootScanner
         val pid: Int
         val pipe = ParcelFileDescriptor.createPipe()
@@ -103,7 +106,7 @@ internal class RootBackend(private val context: Context) : AutoCloseable {
             service.start(id, root.toByteArray(Charsets.UTF_8), pipe[1], client)
             pipe[1].close() // Binder owns an independent writer descriptor.
             return ParcelFileDescriptor.AutoCloseInputStream(pipe[0]).use {
-                RootProtocol.read(it, id, pid, progress)
+                IndexProtocol.read(it, id, 0, pid, writer, progress)
             }
         } catch (error: Exception) {
             try { service.cancel(id) } catch (_: Exception) { }

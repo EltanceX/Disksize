@@ -32,6 +32,7 @@ android {
         // For more information, see: https://flutter.dev/to/review-gradle-config.
         minSdk = 29
         targetSdk = 36
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         ndk {
             abiFilters += listOf("arm64-v8a", "x86_64")
         }
@@ -70,6 +71,8 @@ flutter {
 }
 
 dependencies {
+    androidTestImplementation("androidx.test:runner:1.3.0")
+    androidTestImplementation("androidx.test.ext:junit:1.1.2")
     implementation("com.github.topjohnwu.libsu:service:6.0.0")
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20240303")

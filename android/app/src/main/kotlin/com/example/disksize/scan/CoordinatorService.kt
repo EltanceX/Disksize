@@ -14,12 +14,16 @@ import android.os.Process
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.os.CancellationSignal
 import android.util.Log
 import com.example.disksize.scan.ipc.IScanCoordinator
 import com.example.disksize.scan.ipc.NativeDiagnosticsParcel
 import com.example.disksize.MainActivity
 import com.example.disksize.root.RootBackend
 import com.example.disksize.root.RootFailure
+import com.example.disksize.index.IndexStore
+import com.example.disksize.index.LocalScanPipe
+import com.example.disksize.index.IndexQueries
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -38,15 +42,16 @@ class CoordinatorService : Service() {
         var cancelled = false
         var forcedState: String? = null
         var reason = ""
+        val indexCancellation = CancellationSignal()
     }
     private val lock = Any()
     private val main = Handler(Looper.getMainLooper())
-    private val worker = Executors.newSingleThreadExecutor()
     private val initialized = CompletableFuture<Unit>()
     private val pendingWrite = AtomicReference<String?>(null)
     private val writing = AtomicBoolean(false)
     private lateinit var journal: SessionJournal
     private lateinit var rootBackend: RootBackend
+    private lateinit var index: IndexStore
     private var current: JSONObject? = null
     @Volatile private var encoded = ""
     @Volatile private var destroyed = false
@@ -58,13 +63,17 @@ class CoordinatorService : Service() {
         super.onCreate()
         journal = SessionJournal(this)
         rootBackend = RootBackend(this)
+        index = IndexStore(this)
         getSystemService(NotificationManager::class.java).createNotificationChannel(
             NotificationChannel(CHANNEL, "目录扫描", NotificationManager.IMPORTANCE_LOW),
         )
-        journalExecutor.execute {
+        // Queue recovery after a previous service instance's cancelled work.
+        worker.execute { journalExecutor.execute {
             try {
+                index.recover()
                 val restored = journal.read()
                 if (restored != null && (restored.optBoolean("active") || restored.optString("state") in ACTIVE_STATES)) {
+                    index.interrupt(restored.getString("sessionId"), "interrupted", "process-interrupted")
                     restored.put("state", "interrupted").put("reason", "process-interrupted")
                         .put("active", false).put("complete", false)
                         .put("endedAtMillis", now()).put("updatedAtMillis", now())
@@ -79,7 +88,7 @@ class CoordinatorService : Service() {
                     encoded = current.toString()
                 }
             } finally { initialized.complete(Unit) }
-        }
+        } }
     }
 
     private val binder = object : IScanCoordinator.Stub() {
@@ -126,6 +135,19 @@ class CoordinatorService : Service() {
         }
 
         override fun cancelScan(sessionId: String) { checkCallingUid(); cancel(sessionId) }
+        override fun queryIndex(requestJson: String): String {
+            checkCallingUid(); initialized.get(5, TimeUnit.SECONDS)
+            require(requestJson.length <= 8192)
+            val result = JSONObject(IndexQueries(index).query(requestJson))
+            // The journal must be durable before a public query can expose a
+            // terminal index. SQLite may finish just ahead of that write.
+            synchronized(lock) {
+                if (active?.id == JSONObject(requestJson).optString("sessionId") && result.optString("state") in setOf("completed", "partial", "failed")) {
+                    return JSONObject().put("status", "index-finalizing").put("provisional", true).toString()
+                }
+            }
+            return result.toString()
+        }
         override fun rejectPreparedScan(sessionId: String, reason: String) {
             checkCallingUid(); rejectPrepared(sessionId, reason)
         }
@@ -196,10 +218,12 @@ class CoordinatorService : Service() {
                 }
                 main.post { updateNotification() }
             }
-            val result = if (task.rootMode) {
+            val view = synchronized(lock) { JSONObject(current.toString()) }
+            val summary = index.begin(task.id, task.root, if (task.rootMode) "root" else "ordinary",
+                view.getInt("scannerUid"), view.getInt("scannerPid")).use { importer -> val streamed = if (task.rootMode) {
                 // A queued cancellation must not dispatch new privileged work.
                 if (synchronized(lock) { task.cancelled || destroyed }) throw RootFailure("cancelled-before-root-start")
-                rootBackend.run(task.id, task.root) { nodes, logical, issues ->
+                rootBackend.run(task.id, task.root, importer) { nodes, logical, issues ->
                     progress(nodes, logical, issues)
                     if (synchronized(lock) { task.cancelled || destroyed }) rootBackend.cancel(task.id)
                 }
@@ -209,8 +233,15 @@ class CoordinatorService : Service() {
                     task.handle = handle
                     if (task.cancelled || destroyed) NativeBridge.nativeCancelScan(handle)
                 }
-                JSONObject(NativeBridge.nativeRunScan(handle) { nodes, logical, issues, _ -> progress(nodes, logical, issues) })
+                LocalScanPipe.run(handle, task.id, importer, progress)
+            }; streamed.copy(importWriteMicros = importer.writeNanos / 1000) }
+            synchronized(lock) {
+                if (!destroyed && active === task) {
+                    current!!.put("peakOpenFds", summary.peakFds).put("openFdsAtFinish", summary.finishFds)
+                        .put("rootMountId", summary.mount)
+                }
             }
+            val result = index.finalize(task.id, summary, task.indexCancellation) { synchronized(lock) { task.cancelled || destroyed } }
             synchronized(lock) {
                 if (!destroyed && active === task) {
                     result.keys().forEach { key -> current!!.put(key, result.get(key)) }
@@ -222,17 +253,26 @@ class CoordinatorService : Service() {
                     } else if (task.cancelled) {
                         current!!.put("state", "cancelled").put("complete", false)
                     }
-                    current!!.put("provisional", false)
+                    if (task.forcedState != null || task.cancelled) {
+                        index.interrupt(task.id, current!!.getString("state"), task.reason)
+                        current!!.put("provisional", true)
+                    }
                     finishLocked(task)
                 }
             }
         } catch (error: Throwable) {
             Log.e(TAG, "Scan failed", error)
+            val failedState = synchronized(lock) { task.forcedState ?: if (task.cancelled) "cancelled" else if (task.rootMode) "interrupted" else "failed" }
+            try { index.interrupt(task.id, failedState, task.reason.ifEmpty { "scan-or-index-failure" }) }
+            catch (storageError: Exception) { Log.e(TAG, "Index failure persistence failed", storageError) }
+            val persisted = try { index.preview(task.id) } catch (_: Exception) { null }
             synchronized(lock) {
                 if (!destroyed && active === task) {
+                    persisted?.keys()?.forEach { key -> current!!.put(key, persisted.get(key)) }
                     val rootReason = (error as? RootFailure)?.reason
                     current!!.put("state", task.forcedState ?: if (task.cancelled) "cancelled" else if (rootReason != null) "interrupted" else "failed")
-                        .put("reason", task.reason.ifEmpty { if (task.cancelled) "" else rootReason ?: "native-or-journal-failure" }).put("complete", false)
+                        .put("reason", task.reason.ifEmpty { if (task.cancelled) "" else rootReason ?: "native-or-journal-failure" })
+                        .put("complete", false).put("provisional", true)
                     finishLocked(task)
                 }
             }
@@ -283,6 +323,7 @@ class CoordinatorService : Service() {
         synchronized(lock) {
             val task = active?.takeIf { it.id == id && !it.finalizing } ?: return
             task.cancelled = true
+            task.indexCancellation.cancel()
             current!!.put("state", "cancelling")
             if (task.handle != 0L) NativeBridge.nativeCancelScan(task.handle)
             if (task.rootMode) rootBackend.cancel(task.id)
@@ -323,6 +364,7 @@ class CoordinatorService : Service() {
             destroyed = true
             active?.takeUnless { it.finalizing }?.let { task ->
                 task.cancelled = true
+                task.indexCancellation.cancel()
                 if (task.handle != 0L) NativeBridge.nativeCancelScan(task.handle)
                 if (task.rootMode) rootBackend.cancel(task.id)
                 current!!.put("state", task.forcedState ?: "interrupted")
@@ -332,7 +374,6 @@ class CoordinatorService : Service() {
             }
         }
         main.removeCallbacksAndMessages(null)
-        worker.shutdown()
         rootBackend.close()
         super.onDestroy()
     }
@@ -429,5 +470,6 @@ class CoordinatorService : Service() {
         // Shared across service instances in this process; old shutdown writes
         // cannot race a new instance's recovery of the same AtomicFile.
         private val journalExecutor = Executors.newSingleThreadExecutor()
+        private val worker = Executors.newSingleThreadExecutor()
     }
 }

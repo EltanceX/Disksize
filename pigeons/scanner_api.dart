@@ -61,6 +61,8 @@ abstract class ScannerHostApi {
   ScanSnapshot? getScanSnapshot();
   @async
   void cancelScan(String sessionId);
+  @async
+  String queryIndex(String requestJson);
 }
 
 class RootPath {

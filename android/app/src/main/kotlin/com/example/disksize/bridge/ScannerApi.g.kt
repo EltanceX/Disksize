@@ -800,6 +800,7 @@ interface ScannerHostApi {
   suspend fun startScan(rootPath: String, source: String): String
   suspend fun getScanSnapshot(): ScanSnapshot?
   suspend fun cancelScan(sessionId: String)
+  suspend fun queryIndex(requestJson: String): String
 
   companion object {
     /** The codec used by ScannerHostApi. */
@@ -962,6 +963,25 @@ interface ScannerHostApi {
               val wrapped: List<Any?> = try {
                 api.cancelScan(sessionIdArg)
                 listOf(null)
+              } catch (exception: Throwable) {
+                ScannerApiPigeonUtils.wrapError(exception)
+              }
+              reply.reply(wrapped)
+            }
+          }
+        } else {
+          channel.setMessageHandler(null)
+        }
+      }
+      run {
+        val channel = BasicMessageChannel<Any?>(binaryMessenger, "dev.flutter.pigeon.disksize.ScannerHostApi.queryIndex$separatedMessageChannelSuffix", codec)
+        if (api != null) {
+          channel.setMessageHandler { message, reply ->
+            val args = message as List<Any?>
+            val requestJsonArg = args[0] as String
+            CoroutineScope(Dispatchers.Main).launch {
+              val wrapped: List<Any?> = try {
+                listOf(api.queryIndex(requestJsonArg))
               } catch (exception: Throwable) {
                 ScannerApiPigeonUtils.wrapError(exception)
               }

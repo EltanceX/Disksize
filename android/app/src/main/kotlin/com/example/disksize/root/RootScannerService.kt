@@ -67,7 +67,7 @@ class RootScannerService : RootService() {
             }
             val unlocked: Any = try { getSystemService(UserManager::class.java)?.isUserUnlocked ?: JSONObject.NULL }
                 catch (_: Exception) { JSONObject.NULL }
-            return JSONObject().put("state", "ready").put("protocolVersion", 1)
+            return JSONObject().put("state", "ready").put("protocolVersion", 2)
                 .put("uid", native.processUid).put("effectiveUid", native.effectiveUid).put("pid", native.processId)
                 .put("coreVersion", native.coreVersion).put("mountNamespace", Os.readlink("/proc/self/ns/mnt"))
                 .put("selinux", File("/proc/self/attr/current").readText().trim().trimEnd('\u0000'))
@@ -91,7 +91,7 @@ class RootScannerService : RootService() {
                         synchronized(lock) { job.handle = handle; if (job.cancelled) NativeBridge.nativeCancelScan(handle) }
                         val uuid = UUID.fromString(sessionId)
                         val bytes = ByteBuffer.allocate(16).putLong(uuid.mostSignificantBits).putLong(uuid.leastSignificantBits).array()
-                        NativeBridge.nativeRunScanToPipe(handle, output.fd, bytes)
+                        NativeBridge.nativeStreamScan(handle, output.fd, bytes)
                     } catch (error: Throwable) {
                         Log.w("DiskSize.Root", "Root scan/transport stopped", error)
                     } finally {
