@@ -1,4 +1,4 @@
-param([Parameter(Mandatory = $true)][string]$Serial)
+param([Parameter(Mandatory = $true)][string]$Serial, [switch]$RootInstall)
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false
 $repository = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
@@ -50,9 +50,10 @@ try {
 } finally {
     if ($testJob) { Stop-Job $testJob; Remove-Job $testJob -Force }
     if (Test-Path -LiteralPath $normalApk) {
-        & $adb -s $Serial install -r $normalApk
+        & (Join-Path $repository 'tools/install-android-apk.ps1') -Serial $Serial -Apk $normalApk -UseRoot:$RootInstall
         Copy-Item -LiteralPath $normalApk -Destination (Join-Path $repository 'build/app/outputs/flutter-apk/app-debug.apk')
         & $adb -s $Serial shell am start -n com.example.disksize/.MainActivity
+        if ($LASTEXITCODE -ne 0) { throw 'Starting the restored dashboard failed.' }
     }
     Set-Location $previous
 }

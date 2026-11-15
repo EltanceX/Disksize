@@ -16,7 +16,7 @@ Copy-Item build/app/outputs/flutter-apk/app-debug.apk .local/phase4/app-debug.ap
 
 `verify.ps1` 是当前 Xiaomi 平板、中文 KernelSU 3.3.0 管理器和 3048×2032 横屏布局的设备驱动，包含两个有截图依据的搜索/导航坐标，不能直接用于其他管理器或屏幕布局。它会在测试应用显式请求 su 后，仅为 `com.example.disksize` 打开管理器的应用授权，回到测试 Activity 并写入普通 UID 的同步标记。不同设备应替换该授权驱动，应用后端不依赖这些坐标。
 
-Flutter 集成测试可能卸载测试 APK，导致 UID 改变及 KernelSU 授权丢失。因此先保存正常入口 APK；驱动在 finally 中恢复它，不把测试 runner 留作启动入口。新安装的正常应用可能需要用户再次在 root 管理器中允许 DiskSize。脚本不会变更其他应用授权、SELinux、全局挂载命名空间、所有文件 AppOp 或前台服务时限。
+Flutter 集成测试可能卸载测试 APK，导致 UID 改变及 KernelSU 授权丢失。因此先保存正常入口 APK；驱动在 finally 中通过 `tools/install-android-apk.ps1 -UseRoot` 恢复它，使用已授权的 ADB shell su 避免系统安装器弹窗，不把测试 runner 留作启动入口。新安装的正常应用可能需要用户再次在 root 管理器中允许 DiskSize。脚本不会变更其他应用授权、SELinux、全局挂载命名空间、所有文件 AppOp 或前台服务时限。
 
 设备必须保留阶段 0 的只读基线：
 
@@ -43,4 +43,4 @@ adb -s '7b9a982f' shell su -c /data/local/tmp/disksize-phase2-bin/disksize_root_
 
 3 组测试覆盖真实 pipe 的 EPIPE、写端背压时取消和消费者停读超时；最后一组预期约 10 秒。JVM `RootProtocolTest` 单独覆盖恶意/损坏帧拒绝与原始名称保真。完整实现和限制见[阶段 4 验收文档](../../docs/phase4-root-backend.md)。
 
-阶段 5 后，JVM 测试保留验证 v1 参考协议；应用使用的 v2 增量协议由 Android instrumentation 测试覆盖，见[阶段 5 工具说明](../phase5/README.md)。此脚本让 Flutter 测试在后台独立写日志，授权 UI 驱动每 100 ms 处理新增事件，避免授权导航阻塞日志消费和错过 root 进程中断时机。
+阶段 5 后，JVM 测试保留验证 v1 参考协议；应用增量协议在阶段 6 升为 v3，由 Android instrumentation 测试覆盖，见[阶段 6 工具说明](../phase6/README.md)。此脚本让 Flutter 测试在后台独立写日志，授权 UI 驱动每 100 ms 处理新增事件，避免授权导航阻塞日志消费和错过 root 进程中断时机。

@@ -144,7 +144,7 @@ try {
     Invoke-Device 'rm -f /data/local/tmp/disksize-create-phase4.sh /sdcard/disksize-phase4-ui.xml' | Out-Null
 } finally {
     if ($rootTest) { Stop-Job $rootTest; Remove-Job $rootTest -Force }
-    & $adb -s $Serial install -r $normalApk
+    & (Join-Path $repository 'tools/install-android-apk.ps1') -Serial $Serial -Apk $normalApk -UseRoot
     Copy-Item -LiteralPath $normalApk -Destination (Join-Path $repository 'build/app/outputs/flutter-apk/app-debug.apk')
     Invoke-Device 'am start -n com.example.disksize/.MainActivity' | Out-Null
     Set-Location $previous
