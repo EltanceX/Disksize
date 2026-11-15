@@ -2,9 +2,9 @@
 
 面向开发者的 Android 存储分析工具，采用 Flutter、Kotlin 和 C++，支持普通权限与可选 root 模式。
 
-阶段 0～4 已完成。应用支持普通模式下扫描自身目录、应用外部目录、主共享存储和自定义真实路径，提供权限引导、进度/取消、有限结果及错误范围预览，并在进程死亡、授权撤销和系统超时后记录中断状态。Root 模式通过显式授权、libsu 6.0.0 RootService 和二进制管道调用同一扫描库，支持挂载入口、原始名称、取消和断开恢复。Flutter 经 Pigeon、独立 `:scanner` 服务和 JNI 调用共用 C++ 核心；硬链接去重和挂载边界沿用同一统计规则。运行环境检查保留在首页右上角。
+阶段 0～5 已完成。应用支持普通模式下扫描自身目录、应用外部目录、主共享存储和自定义真实路径，提供权限引导、进度/取消、有限结果及错误范围预览，并在进程死亡、授权撤销和系统超时后记录中断状态。Root 模式通过显式授权、libsu 6.0.0 RootService 和二进制管道调用同一扫描库，支持挂载入口、原始名称、取消和断开恢复。Flutter 经 Pigeon、独立 `:scanner` 服务和 JNI 调用共用 C++ 核心；普通 UID 的 SQLite 索引负责硬链接归属、最终聚合及分页查询。运行环境检查保留在首页右上角。
 
-当前为只读原型，Android 入口最多 100,000 节点、64 个结果和 64 个错误预览；完整索引与分页是下一步的阶段 5。使用 root 时点击“请求 root 访问”并按管理器授权；若显示拒绝，在管理器中允许 DiskSize 后重试，再切换后端。应用不会在普通启动时自动请求 root。
+当前为只读原型，Android 入口最多 2,000,000 节点、512 层深度。首页保留 64 条有界预览；索引 API 支持子项、大文件、详情和错误列表，每页最多 100 条，完整浏览界面将在阶段 6 实现。使用 root 时点击“请求 root 访问”并按管理器授权；若显示拒绝，在管理器中允许 DiskSize 后重试，再切换后端。应用不会在普通启动时自动请求 root。
 
 ## 开发环境
 
@@ -43,6 +43,8 @@ flutter build apk --debug --target-platform 'android-arm64,android-x64'
 
 Root 真机验证和协议单元测试见[阶段 4 工具说明](tools/phase4/README.md)。当前授权驱动针对本机 KernelSU 平板布局；其他管理器需替换授权驱动。应用通过 Binder 校验普通客户端 UID，root 进程只读取目标元数据；会话及后续索引由普通应用 UID 管理。
 
+索引及规模测试见[阶段 5 工具说明](tools/phase5/README.md)。真机已验证百万真实节点的增量扫描、SQLite 聚合和 9,990 页完整遍历；扫描与入库约 59 秒、聚合约 54 秒，新增索引约 1 GiB。详细内存、查询延迟、root 验证和限制见[阶段 5 验收](docs/phase5-index.md)。
+
 修改 `pigeons/scanner_api.dart` 后运行 `tools/generate-bridge.ps1`，将 Dart 与 Kotlin 生成文件一同提交。应用的 `pubspec.lock`、Gradle Wrapper 和生成桥接代码均纳入版本管理。
 
 本机路径、原始设备日志及临时构建验证工程放在忽略提交的 `.local/`；构建输出、签名材料和 `android/local.properties` 也已忽略。
@@ -56,3 +58,4 @@ Root 真机验证和协议单元测试见[阶段 4 工具说明](tools/phase4/RE
 - [阶段 2 扫描核心与验收](docs/phase2-scanner.md)
 - [阶段 3 普通模式与生命周期](docs/phase3-ordinary-lifecycle.md)
 - [阶段 4 Root 后端与验收](docs/phase4-root-backend.md)
+- [阶段 5 索引、聚合与分页验收](docs/phase5-index.md)

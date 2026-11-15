@@ -89,9 +89,23 @@ try {
         }
     }
     [IO.File]::WriteAllText($log, '')
-    & flutter test integration_test/root_scanning_test.dart -d $Serial 2>&1 | ForEach-Object {
-        $line = $_.ToString()
-        Add-Content -Encoding utf8 $log $line
+    # Keep draining Flutter output during manager navigation. Its VM/service
+    # connection and the test log must not depend on this UI driver's latency.
+    $rootTest = Start-Job -ArgumentList $repository,$Serial,$log -ScriptBlock {
+        param($repo,$device,$outputLog)
+        $OutputEncoding = [Text.UTF8Encoding]::new($false)
+        [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+        Set-Location $repo
+        & flutter test integration_test/root_scanning_test.dart -d $device 2>&1 | ForEach-Object {
+            Add-Content -Encoding utf8 $outputLog $_.ToString()
+        }
+        return $LASTEXITCODE
+    }
+    $seenLines = 0
+    do {
+        $incoming = @(Get-Content -LiteralPath $log)
+        while ($seenLines -lt $incoming.Count) {
+        $line = $incoming[$seenLines++]
         Write-Output $line
         if ($line -eq 'PHASE4_AUTHORIZE') {
             Grant-DevelopmentPackage
@@ -116,14 +130,20 @@ try {
             if ($remaining -notmatch 'gone') { throw 'Root service outlived its coordinator client.' }
             Add-Content -Encoding utf8 (Join-Path $logs 'client-cleanup.txt') "rootPid=$rootPid gone after client death"
         }
-    }
-    if ($LASTEXITCODE -ne 0) { throw 'Root integration failed; inspect .local/phase4/root-integration.log' }
+        }
+        Start-Sleep -Milliseconds 100
+    } while ($rootTest.State -eq 'Running' -or $seenLines -lt @(Get-Content -LiteralPath $log).Count)
+    $rootExit = @(Receive-Job $rootTest)
+    Remove-Job $rootTest
+    $rootTest = $null
+    if ($rootExit.Count -eq 0 -or $rootExit[-1] -ne 0) { throw 'Root integration failed; inspect .local/phase4/root-integration.log' }
     $after = @(Invoke-Device 'su -c "find /data/local/tmp/disksize-phase4 -exec stat -c %f:%s:%b:%d:%i:%u:%g {} +"')
     $after | Set-Content -Encoding utf8 (Join-Path $logs 'fixture-stat-after.txt')
     if (Compare-Object $reference $after) { throw 'Scanning changed fixture metadata or ownership.' }
     Invoke-Device 'su -c "test -f /data/local/tmp/disksize-phase4/.disksize-owned-fixture && chmod 700 /data/local/tmp/disksize-phase4/protected && rm -rf /data/local/tmp/disksize-phase4"' | Out-Null
     Invoke-Device 'rm -f /data/local/tmp/disksize-create-phase4.sh /sdcard/disksize-phase4-ui.xml' | Out-Null
 } finally {
+    if ($rootTest) { Stop-Job $rootTest; Remove-Job $rootTest -Force }
     & $adb -s $Serial install -r $normalApk
     Copy-Item -LiteralPath $normalApk -Destination (Join-Path $repository 'build/app/outputs/flutter-apk/app-debug.apk')
     Invoke-Device 'am start -n com.example.disksize/.MainActivity' | Out-Null

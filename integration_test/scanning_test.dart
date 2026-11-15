@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:disksize/platform/diagnostics_client.dart';
 import 'package:disksize/platform/generated/scanner_api.g.dart';
 import 'package:disksize/platform/scan_client.dart';
+import 'package:disksize/platform/index_client.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -111,6 +112,50 @@ void main() {
         true,
       );
       expect((await client.snapshot())!.sessionId, id);
+      final index = AndroidIndexClient();
+      final names = <String>{};
+      String? cursor;
+      IndexDetail? sparseDetail;
+      do {
+        final page = await index.query(
+          IndexRequest(
+            sessionId: id,
+            kind: IndexQueryKind.children,
+            parentId: 1,
+            sort: IndexSort.name,
+            limit: 2,
+            cursor: cursor,
+          ),
+        );
+        expect(page.status, 'ok');
+        expect(page.provisional, false);
+        for (final entry in page.entries) {
+          expect(names.add(entry.nameHex), true);
+          if (entry.nameHex == pathHex('sparse')) {
+            sparseDetail = (await index.query(
+              IndexRequest(
+                sessionId: id,
+                kind: IndexQueryKind.detail,
+                nodeId: entry.id,
+              ),
+            )).detail;
+          }
+        }
+        cursor = page.nextCursor;
+      } while (cursor != null);
+      expect(names, {
+        pathHex('hello'),
+        pathHex('中文 space\nname'),
+        pathHex('sparse'),
+        pathHex('protected'),
+        pathHex('cycle'),
+      });
+      expect(sparseDetail!.rawSize, 5 * 1024 * 1024 * 1024);
+      expect(sparseDetail.rawAllocatedBytes, 0);
+      final indexedIssues = await index.query(
+        IndexRequest(sessionId: id, kind: IndexQueryKind.issues),
+      );
+      expect(indexedIssues.issues.single.code, 'permission-denied');
       await client.cancel('stale-session-id');
       expect((await client.snapshot())!.state, 'partial');
       debugPrint(

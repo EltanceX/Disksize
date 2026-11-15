@@ -42,3 +42,5 @@ adb -s '7b9a982f' shell su -c /data/local/tmp/disksize-phase2-bin/disksize_root_
 ```
 
 3 组测试覆盖真实 pipe 的 EPIPE、写端背压时取消和消费者停读超时；最后一组预期约 10 秒。JVM `RootProtocolTest` 单独覆盖恶意/损坏帧拒绝与原始名称保真。完整实现和限制见[阶段 4 验收文档](../../docs/phase4-root-backend.md)。
+
+阶段 5 后，JVM 测试保留验证 v1 参考协议；应用使用的 v2 增量协议由 Android instrumentation 测试覆盖，见[阶段 5 工具说明](../phase5/README.md)。此脚本让 Flutter 测试在后台独立写日志，授权 UI 驱动每 100 ms 处理新增事件，避免授权导航阻塞日志消费和错过 root 进程中断时机。
