@@ -1,0 +1,139 @@
+import 'package:flutter/foundation.dart';
+
+import '../../platform/index_client.dart';
+
+/// Holds one result page and a bounded ancestor chain, never a directory tree.
+class ExplorerController extends ChangeNotifier {
+  ExplorerController(this.client, this.sessionId);
+  final IndexClient client;
+  final String sessionId;
+  int directoryId = 1;
+  bool largeFiles = false;
+  bool allocated = false;
+  IndexSort sort = IndexSort.logical;
+  IndexPage? page;
+  IndexDetail? directory, root;
+  List<IndexAncestor> ancestors = const [];
+  bool loading = false;
+  String? message;
+  int pageNumber = 1;
+  int _generation = 0;
+  bool _disposed = false;
+  String? _cursor;
+
+  Future<void> refresh() => load(cursor: _cursor, number: pageNumber);
+
+  IndexRequest request(IndexQueryKind kind, {int nodeId = 0, String? cursor}) =>
+      IndexRequest(
+        sessionId: sessionId,
+        kind: kind,
+        parentId: directoryId,
+        nodeId: nodeId,
+        sort: sort,
+        limit: 50,
+        cursor: cursor,
+      );
+
+  Future<void> load({String? cursor, int number = 1}) async {
+    final generation = ++_generation;
+    if (cursor == null) {
+      _cursor = null;
+      pageNumber = 1;
+    }
+    loading = true;
+    message = null;
+    notifyListeners();
+    try {
+      final responses = await Future.wait([
+        client.query(
+          request(
+            largeFiles ? IndexQueryKind.largeFiles : IndexQueryKind.children,
+            cursor: cursor,
+          ),
+        ),
+        client.query(request(IndexQueryKind.detail, nodeId: directoryId)),
+        client.query(request(IndexQueryKind.detail, nodeId: 1)),
+        client.query(request(IndexQueryKind.ancestors, nodeId: directoryId)),
+      ]);
+      if (_disposed || generation != _generation) return;
+      if (responses.any((p) => p.needsRefresh) ||
+          responses.map((p) => p.revision).toSet().length > 1) {
+        // A single retry allows an import batch to settle without a busy loop.
+        if (cursor != null) {
+          await load();
+          if (!_disposed && generation + 1 == _generation) {
+            message = '扫描数据已更新，已返回第一页。';
+            notifyListeners();
+          }
+          return;
+        }
+        page = null;
+        directory = null;
+        root = null;
+        message = '扫描数据正在更新，请稍后刷新。';
+      } else if (responses.any((p) => p.status != 'ok')) {
+        page = null;
+        directory = null;
+        root = null;
+        message = responses.any((p) => p.status == 'index-finalizing')
+            ? '正在完成索引，请稍后刷新。'
+            : '该索引或目录暂不可用，请刷新重试。';
+      } else {
+        page = responses[0];
+        directory = responses[1].detail;
+        root = responses[2].detail;
+        ancestors = responses[3].ancestors;
+        pageNumber = number;
+        _cursor = cursor;
+      }
+    } catch (_) {
+      if (!_disposed && generation == _generation) {
+        page = null;
+        message = '无法读取索引，请检查服务连接后重试。';
+      }
+    } finally {
+      if (!_disposed && generation == _generation) {
+        loading = false;
+        notifyListeners();
+      }
+    }
+  }
+
+  Future<void> navigate(int id) async {
+    directoryId = id;
+    page = null;
+    directory = null;
+    ancestors = const [];
+    _cursor = null;
+    await load();
+  }
+
+  Future<void> setLargeFiles(bool value) async {
+    largeFiles = value;
+    page = null;
+    if (value && sort == IndexSort.name) {
+      sort = allocated ? IndexSort.allocated : IndexSort.logical;
+    }
+    await load();
+  }
+
+  Future<void> setMetric(bool value) async {
+    allocated = value;
+    if (sort != IndexSort.name) {
+      sort = value ? IndexSort.allocated : IndexSort.logical;
+    }
+    await load();
+  }
+
+  Future<void> setSort(IndexSort value) async {
+    sort = value;
+    await load();
+  }
+
+  @override
+  void dispose() {
+    _disposed = true;
+    _generation++;
+    super.dispose();
+  }
+}

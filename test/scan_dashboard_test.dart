@@ -4,6 +4,8 @@ import 'package:disksize/features/scan/presentation/scan_dashboard_page.dart';
 import 'package:disksize/platform/diagnostics_client.dart';
 import 'package:disksize/platform/generated/scanner_api.g.dart';
 import 'package:disksize/platform/scan_client.dart';
+import 'package:disksize/platform/index_client.dart';
+import 'package:disksize/features/explorer/explorer_page.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -11,6 +13,33 @@ import 'package:flutter_test/flutter_test.dart';
 class _UnusedDiagnostics implements DiagnosticsClient {
   @override
   Future<NativeDiagnostics> readDiagnostics() => throw UnimplementedError();
+}
+
+class _Library implements IndexClient {
+  @override
+  Future<List<IndexSession>> recent() async => [
+    IndexSession.fromJson({
+      'sessionId': 'previous',
+      'rootPath': '/previous',
+      'state': 'completed',
+    }),
+  ];
+  @override
+  Future<List<StorageEntry>> volumes() async => [
+    StorageEntry.fromJson({
+      'label': '内部存储',
+      'path': '/shared',
+      'state': 'mounted',
+      'removable': false,
+      'totalBytes': 100000,
+      'freeBytes': 60000,
+      'availableBytes': 50000,
+      'capturedAtMillis': 1000,
+    }),
+  ];
+  @override
+  Future<IndexPage> query(IndexRequest request) async =>
+      IndexPage.fromJson({'status': 'not-found'});
 }
 
 ScanSnapshot view(String state, {bool active = false}) => ScanSnapshot(
@@ -121,6 +150,58 @@ Widget _page(_Client client) => MaterialApp(
 );
 
 void main() {
+  testWidgets(
+    'volume selection preserves permission checks and recent sessions open',
+    (tester) async {
+      final client = _Client();
+      await tester.pumpWidget(
+        MaterialApp(
+          home: ScanDashboardPage(
+            client: client,
+            diagnosticsClient: _UnusedDiagnostics(),
+            indexClient: _Library(),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('内部存储'));
+      await tester.pumpAndSettle();
+      await tester.scrollUntilVisible(
+        find.byKey(const Key('scan-root')),
+        200,
+        scrollable: find.byType(Scrollable).first,
+      );
+      expect(
+        tester
+            .widget<TextField>(find.byKey(const Key('scan-root')))
+            .controller!
+            .text,
+        '/shared',
+      );
+      await tester.scrollUntilVisible(
+        find.byKey(const Key('start-scan')),
+        150,
+        scrollable: find.byType(Scrollable).first,
+      );
+      expect(
+        tester
+            .widget<FilledButton>(find.byKey(const Key('start-scan')))
+            .onPressed,
+        isNull,
+      );
+      await tester.scrollUntilVisible(
+        find.byKey(const ValueKey('recent-previous')),
+        -300,
+        scrollable: find.byType(Scrollable).first,
+      );
+      await tester.tap(find.byKey(const ValueKey('recent-previous')));
+      await tester.pumpAndSettle();
+      expect(find.byType(ExplorerPage), findsOneWidget);
+      expect(client.rootRequests, 0);
+      await tester.pumpWidget(const SizedBox());
+    },
+  );
+
   testWidgets(
     'root access is explicit and denial leaves ordinary scanning available',
     (tester) async {

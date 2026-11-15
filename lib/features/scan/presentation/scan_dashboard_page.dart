@@ -6,6 +6,9 @@ import 'package:flutter/services.dart';
 import '../../../platform/diagnostics_client.dart';
 import '../../../platform/generated/scanner_api.g.dart';
 import '../../../platform/scan_client.dart';
+import '../../../platform/index_client.dart';
+import '../../explorer/explorer_page.dart';
+import '../../explorer/explorer_format.dart';
 import 'scan_home_page.dart';
 
 class ScanDashboardPage extends StatefulWidget {
@@ -13,9 +16,11 @@ class ScanDashboardPage extends StatefulWidget {
     super.key,
     required this.client,
     required this.diagnosticsClient,
+    this.indexClient,
   });
   final ScanClient client;
   final DiagnosticsClient diagnosticsClient;
+  final IndexClient? indexClient;
 
   @override
   State<ScanDashboardPage> createState() => _ScanDashboardPageState();
@@ -35,19 +40,66 @@ class _ScanDashboardPageState extends State<ScanDashboardPage>
   bool _refreshing = false;
   bool _resumed = true;
   Timer? _poll;
+  late final IndexClient _index;
+  List<IndexSession> _recent = const [];
+  List<StorageEntry> _volumes = const [];
+  bool _libraryBusy = false;
+  bool _allRecent = false;
+  String? _libraryError;
+  DateTime? _libraryRead;
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    _index = widget.indexClient ?? AndroidIndexClient();
     unawaited(_refresh());
+    unawaited(_refreshLibrary());
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     _resumed = state == AppLifecycleState.resumed;
     _poll?.cancel();
-    if (_resumed) unawaited(_refresh());
+    if (_resumed) {
+      unawaited(_refresh());
+      unawaited(_refreshLibrary());
+    }
+  }
+
+  Future<void> _refreshLibrary() async {
+    if (_libraryBusy) return;
+    _libraryBusy = true;
+    _libraryRead = DateTime.now();
+    try {
+      final values = await Future.wait<Object>([
+        _index.recent(),
+        _index.volumes(),
+      ]);
+      if (mounted) {
+        setState(() {
+          _recent = values[0] as List<IndexSession>;
+          _volumes = values[1] as List<StorageEntry>;
+          _libraryError = null;
+        });
+      }
+    } catch (_) {
+      if (mounted) setState(() => _libraryError = '暂时无法读取卷和最近会话，点击刷新重试。');
+    } finally {
+      _libraryBusy = false;
+    }
+  }
+
+  Future<void> _openIndex(String id) async {
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => ExplorerPage(client: _index, sessionId: id),
+      ),
+    );
+    if (mounted) {
+      unawaited(_refresh());
+      unawaited(_refreshLibrary());
+    }
   }
 
   Future<void> _refresh() async {
@@ -75,6 +127,10 @@ class _ScanDashboardPageState extends State<ScanDashboardPage>
         if (snapshot?.sessionId == _pendingId) _pendingId = null;
         _error = null;
       });
+      if (_libraryRead == null ||
+          DateTime.now().difference(_libraryRead!).inSeconds >= 3) {
+        unawaited(_refreshLibrary());
+      }
     } catch (error) {
       if (mounted) setState(() => _error = _message(error));
     } finally {
@@ -163,7 +219,10 @@ class _ScanDashboardPageState extends State<ScanDashboardPage>
           ),
           IconButton(
             tooltip: '刷新',
-            onPressed: _refresh,
+            onPressed: () {
+              unawaited(_refresh());
+              unawaited(_refreshLibrary());
+            },
             icon: const Icon(Icons.refresh),
           ),
         ],
@@ -179,6 +238,65 @@ class _ScanDashboardPageState extends State<ScanDashboardPage>
               const SizedBox(height: 8),
               const Text('选择可访问的目录，只读取文件元数据。'),
               const SizedBox(height: 16),
+              if (_volumes.isNotEmpty) ...[
+                Text('存储卷入口', style: text.titleMedium),
+                for (final volume in _volumes)
+                  Card.outlined(
+                    child: ListTile(
+                      leading: Icon(
+                        volume.removable
+                            ? Icons.sd_storage_outlined
+                            : Icons.storage,
+                      ),
+                      title: Text(volume.label),
+                      subtitle: Text(
+                        '${volume.path.isEmpty ? '系统未提供可扫描路径' : volume.path}\n${volume.stats.valid ? '可用 ${formatBytes(volume.stats.availableBytes)} / ${formatBytes(volume.stats.totalBytes)} · ${formatTime(volume.stats.capturedAtMillis)}' : '统计不可用 · ${volume.state}'}',
+                      ),
+                      isThreeLine: true,
+                      onTap:
+                          active || _busy || !volume.mounted || access == null
+                          ? null
+                          : () => setState(() {
+                              _source = _rootMode
+                                  ? 'root'
+                                  : volume.path == access.sharedPath
+                                  ? 'shared'
+                                  : 'path';
+                              _path.text = volume.path;
+                            }),
+                    ),
+                  ),
+                const Text('入口来自普通应用的挂载视图；root 挂载入口见下方扫描设置。别名可能指向同一数据，不应相加。'),
+                const SizedBox(height: 12),
+              ],
+              if (_recent.isNotEmpty) ...[
+                Text('最近会话', style: text.titleMedium),
+                for (final session in (_allRecent ? _recent : _recent.take(3)))
+                  Card.filled(
+                    child: ListTile(
+                      key: ValueKey('recent-${session.id}'),
+                      leading: const Icon(Icons.history),
+                      title: Text(
+                        session.rootPath,
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      subtitle: Text(
+                        '${session.backend == 'root' ? 'Root' : '普通'} · ${sessionState(session.state)} · ${session.nodeCount} 项\n${formatTime(session.startedAtMillis)}',
+                      ),
+                      trailing: const Icon(Icons.chevron_right),
+                      onTap: () => _openIndex(session.id),
+                    ),
+                  ),
+                if (_recent.length > 3)
+                  TextButton(
+                    onPressed: () => setState(() => _allRecent = !_allRecent),
+                    child: Text(
+                      _allRecent ? '收起会话' : '查看最近 ${_recent.length} 次会话',
+                    ),
+                  ),
+                const SizedBox(height: 12),
+              ],
               if (_error != null)
                 Card.filled(
                   child: Padding(
@@ -285,7 +403,9 @@ class _ScanDashboardPageState extends State<ScanDashboardPage>
                           )
                         else
                           DropdownButtonFormField<String>(
+                            key: ValueKey('source-$_source'),
                             initialValue: _source,
+                            isExpanded: true,
                             decoration: const InputDecoration(
                               labelText: '扫描入口',
                               border: OutlineInputBorder(),
@@ -438,6 +558,12 @@ class _ScanDashboardPageState extends State<ScanDashboardPage>
                         Text(
                           '已发现 ${snapshot.nodeCount} 项 · 问题 ${snapshot.issueCount} 项',
                         ),
+                        TextButton.icon(
+                          key: const Key('browse-current-index'),
+                          onPressed: () => _openIndex(snapshot.sessionId),
+                          icon: const Icon(Icons.folder_open),
+                          label: const Text('浏览目录与大文件'),
+                        ),
                         Text(
                           '${snapshot.provisional ? '暂定逻辑大小（未去重）' : '逻辑大小（已知范围）'}：${snapshot.logicalBytes} 字节',
                         ),
@@ -500,9 +626,14 @@ class _ScanDashboardPageState extends State<ScanDashboardPage>
                 if (snapshot.previewTruncated)
                   const Padding(
                     padding: EdgeInsets.all(8),
-                    child: Text('当前展示有限预览；完整索引和分页浏览将在后续版本接入。'),
+                    child: Text('这里只展示有限预览；点击“浏览目录与大文件”查看完整分页索引。'),
                   ),
               ],
+              if (_libraryError != null)
+                TextButton(
+                  onPressed: _refreshLibrary,
+                  child: Text(_libraryError!),
+                ),
             ],
           ),
         ),

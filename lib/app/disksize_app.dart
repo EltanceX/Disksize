@@ -3,12 +3,19 @@ import 'package:flutter/material.dart';
 import '../features/scan/presentation/scan_dashboard_page.dart';
 import '../platform/diagnostics_client.dart';
 import '../platform/scan_client.dart';
+import '../platform/index_client.dart';
 
 class DiskSizeApp extends StatelessWidget {
-  const DiskSizeApp({super.key, this.diagnosticsClient, this.scanClient});
+  const DiskSizeApp({
+    super.key,
+    this.diagnosticsClient,
+    this.scanClient,
+    this.indexClient,
+  });
 
   final DiagnosticsClient? diagnosticsClient;
   final ScanClient? scanClient;
+  final IndexClient? indexClient;
 
   @override
   Widget build(BuildContext context) {
@@ -22,6 +29,7 @@ class DiskSizeApp extends StatelessWidget {
       home: ScanDashboardPage(
         client: scanClient ?? AndroidScanClient(),
         diagnosticsClient: diagnosticsClient ?? AndroidDiagnosticsClient(),
+        indexClient: indexClient,
       ),
     );
   }

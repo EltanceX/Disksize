@@ -49,5 +49,12 @@ String displayScanPath(String hex) {
       .replaceAll('\\', '\\\\')
       .replaceAll('\n', r'\n')
       .replaceAll('\r', r'\r')
-      .replaceAll('\t', r'\t');
+      .replaceAll('\t', r'\t')
+      .replaceAllMapped(
+        RegExp(
+          r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]',
+        ),
+        (match) =>
+            '\\u${match[0]!.codeUnitAt(0).toRadixString(16).padLeft(4, '0')}',
+      );
 }
