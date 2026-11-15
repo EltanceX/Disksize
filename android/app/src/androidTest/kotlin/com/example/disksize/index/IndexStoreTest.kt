@@ -105,19 +105,27 @@ class IndexStoreTest {
         }
         val first = JSONObject(queries.query(request("children", "name").toString()))
         val token = first.getString("nextCursor")
+        for (sort in listOf("logical", "allocated", "name")) {
+            val start = JSONObject(queries.query(request("children", sort).toString()))
+            val second = JSONObject(queries.query(request("children", sort, start.getString("nextCursor")).toString()))
+            val previous = JSONObject(queries.query(request("children", sort, second.getString("previousCursor")).toString()))
+            assertEquals(start.getJSONArray("entries").toString(), previous.getJSONArray("entries").toString())
+            assertFalse(previous.has("previousCursor"))
+            assertEquals(second.getJSONArray("entries").toString(), JSONObject(queries.query(request("children", sort, previous.getString("nextCursor")).toString())).getJSONArray("entries").toString())
+        }
         assertEquals("invalid-query", JSONObject(queries.query(request("children", "allocated", token).toString())).getString("status"))
         store.writableDatabase.execSQL("UPDATE sessions SET revision=revision+1 WHERE id=?", arrayOf(id))
         assertEquals("stale-cursor", JSONObject(queries.query(request("children", "name", token).toString())).getString("status"))
         val detail = JSONObject(queries.query(JSONObject().put("sessionId", id).put("kind", "detail").put("nodeId", 2).toString())).getJSONObject("detail")
         assertEquals("66696c652d32", detail.getString("pathHex")); assertEquals(8, detail.getLong("rawSize"))
     }
-    @Test fun v2RejectsMalformedAndInterruptedStreams() = withStore { store ->
+    @Test fun v3RejectsMalformedAndInterruptedStreams() = withStore { store ->
         val id = UUID.randomUUID().toString()
         fun payload(block: (DataOutputStream) -> Unit): ByteArray = ByteArrayOutputStream().also { buffer ->
             DataOutputStream(buffer).use(block)
         }.toByteArray()
         fun frame(type: Int, sequence: Long, body: ByteArray) = payload {
-            it.writeInt(0x44535a34); it.writeShort(2); it.writeShort(type); it.writeInt(body.size)
+            it.writeInt(0x44535a34); it.writeShort(3); it.writeShort(type); it.writeInt(body.size)
             it.write(uuidBytes(id)); it.writeLong(sequence); it.write(body)
         }
         val identity = frame(1, 0, payload { it.writeInt(Process.myUid()); it.writeInt(Process.myUid()); it.writeInt(Process.myPid()) })
@@ -143,20 +151,71 @@ class IndexStoreTest {
             }
         }
     }
-    @Test fun schemaMigrationKeepsExistingNodes() = withStore { store ->
-        val id = UUID.randomUUID().toString()
-        store.begin(id, "/fixture", "ordinary", Process.myUid(), Process.myPid()).use { it.node(node(1, 0, "", 0, 1)); it.flush() }
-        val name = File(store.writableDatabase.path).name
-        store.writableDatabase.execSQL("DROP INDEX aggregate_incomplete")
-        store.writableDatabase.execSQL("PRAGMA user_version=1")
-        store.close()
-        IndexStore(context, name).use { migrated ->
-            assertEquals(2, migrated.readableDatabase.version)
-            assertEquals(1, migrated.preview(id).getLong("nodeCount"))
-            migrated.readableDatabase.rawQuery("SELECT name FROM sqlite_master WHERE type='index' AND name='aggregate_incomplete'", null).use {
-                assertTrue(it.moveToFirst())
-            }
+    @Test fun schemaMigrationKeepsExistingNodes() {
+        for (version in listOf(1, 2)) {
+            val name = "phase6-migration-${UUID.randomUUID()}.db"
+            val file = File(context.noBackupFilesDir, name)
+            val id = UUID.randomUUID().toString()
+            try {
+                SQLiteDatabase.openOrCreateDatabase(file, null).use { old ->
+                    val fixture = InstrumentationRegistry.getInstrumentation().context.assets.open("index-v2.sql").bufferedReader().use { it.readText() }
+                    for (sql in fixture.split(';')) if (sql.trim().isNotEmpty()) old.execSQL(sql)
+                    if (version == 1) old.execSQL("DROP INDEX aggregate_incomplete")
+                    old.execSQL("INSERT INTO sessions(id,root,backend,state,phase,started,scanner_uid,scanner_pid) VALUES(?,'/old','ordinary','completed','complete',1,10000,10000)", arrayOf(id))
+                    old.execSQL("""INSERT INTO nodes(sid,id,parent,depth,name,name_key,path,link,kind,mode,uid,gid,device,inode,mount,nlink,size,allocated,seconds,nanos,valid,complete,skip)
+                        VALUES(?,1,0,0,X'6f6c642d6e6f6465','6f6c642d6e6f6465',X'',X'',1,16832,10000,10000,X'01',X'02',1,1,0,4096,1,0,1,1,0)""", arrayOf(id))
+                    old.version = version
+                }
+                IndexStore(context, name).use { migrated ->
+                    assertEquals(3, migrated.readableDatabase.version)
+                    migrated.readableDatabase.rawQuery("SELECT name FROM nodes WHERE sid=?", arrayOf(id)).use {
+                        assertTrue(it.moveToFirst()); assertEquals("old-node", it.getBlob(0).toString(Charsets.UTF_8))
+                    }
+                    val session = JSONObject(IndexQueries(migrated).query(JSONObject().put("kind", "session").put("sessionId", id).toString()))
+                    assertEquals("ok", session.getString("status")); assertEquals(0, session.getJSONObject("volume").length())
+                    migrated.readableDatabase.rawQuery("SELECT name FROM sqlite_master WHERE type='index' AND name IN ('aggregate_incomplete','sessions_recent')", null).use {
+                        assertEquals(2, it.count)
+                    }
+                }
+            } finally { SQLiteDatabase.deleteDatabase(file) }
         }
+    }
+    @Test fun scopedFilesAncestorsStatusesAndRecentSessions() = withStore { store ->
+        val id = UUID.randomUUID().toString()
+        store.begin(id, "/fixture", "ordinary", Process.myUid(), Process.myPid()).use {
+            it.node(node(1, 0, "", 4096, 1))
+            it.node(node(2, 1, "scope", 4096, 2).copy(kind=1, complete=false))
+            it.node(node(3, 1, "scope2", 4096, 3).copy(kind=1, complete=false))
+            it.node(node(4, 2, "one", 10, 4).copy(depth=2))
+            it.node(node(5, 2, "nested", 4096, 5).copy(depth=2, kind=1, complete=false))
+            it.node(node(6, 5, "two", 20, 6).copy(depth=3))
+            it.node(node(7, 3, "outside", 100, 7).copy(depth=2))
+            it.node(node(8, 2, "alias", 10, 4).copy(depth=2))
+            it.node(node(9, 2, "denied", 0, 9).copy(depth=2, kind=0, valid=false, complete=false))
+            it.issue(9, 1, 13, "stat")
+            it.node(node(10, 2, "mount", 4096, 10).copy(depth=2, kind=1, complete=false, skip=1))
+            for (directory in listOf(1L,2L,3L,5L)) it.directory(directory, true, true, 0)
+            it.volume(1000000, 400000, 300000, 1000)
+            it.flush()
+        }
+        store.finalize(id, StreamSummary("partial", 10, 1, 1, 2, 0, 1, 1)) { false }
+        val queries = IndexQueries(store)
+        fun query(kind: String, parent: Long=0, node: Long=0) = JSONObject(queries.query(JSONObject()
+            .put("kind", kind).put("sessionId", id).put("parentId", parent).put("nodeId", node).toString()))
+        val files = query("large-files", 2).getJSONArray("entries")
+        assertEquals(setOf(4L,6L,8L), (0 until files.length()).map { files.getJSONObject(it).getLong("id") }.toSet())
+        val chain = query("ancestors", node=6).getJSONArray("ancestors")
+        assertEquals(listOf(1L,2L,5L,6L), (0 until chain.length()).map { chain.getJSONObject(it).getLong("id") })
+        val children = query("children", 2).getJSONArray("entries")
+        val denied = (0 until children.length()).map { children.getJSONObject(it) }.first { it.getLong("id")==9L }
+        assertTrue(denied.getBoolean("inaccessible")); assertFalse(denied.getBoolean("metadataValid"))
+        assertEquals("mount-boundary", query("detail", node=10).getJSONObject("detail").getString("skipped"))
+        val owner = query("detail", node=4).getJSONObject("detail").getLong("ownerId")
+        assertEquals(8L, owner) // alias sorts before one in raw path ordering
+        val recent = JSONObject(queries.query("{\"kind\":\"recent\"}")).getJSONArray("sessions")
+        assertEquals(id, recent.getJSONObject(0).getString("sessionId"))
+        assertEquals(1000000, recent.getJSONObject(0).getJSONObject("volume").getLong("totalBytes"))
+        assertEquals("not-found", query("large-files", 999).getString("status"))
     }
     @Test fun directoryReplacementRemovesPreviouslyCountedBlocks() = withStore { store ->
         val id = UUID.randomUUID().toString()

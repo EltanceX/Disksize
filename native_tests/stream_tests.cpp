@@ -43,6 +43,8 @@ int main() {
         const auto result = stream_directory(c, token, cb);
         require(result.scan.state == SessionState::Completed && count == 20005 && closures == 2 && raw_seen, "stream result");
         require(result.scan.nodes.empty() && result.scan.issues.empty(), "retained full tree");
+        require(result.volume.valid && result.volume.total > 0 && result.volume.free <= result.volume.total &&
+            result.volume.available <= result.volume.free && result.volume.captured_millis > 0, "volume sample");
         require(result.scan.metrics.peak_open_fds <= 6 && result.scan.metrics.open_fds_at_finish == 0, "fd bounds");
         CancellationToken cancel;
         cb.on_directory = {};

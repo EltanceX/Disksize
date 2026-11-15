@@ -67,7 +67,7 @@ class RootScannerService : RootService() {
             }
             val unlocked: Any = try { getSystemService(UserManager::class.java)?.isUserUnlocked ?: JSONObject.NULL }
                 catch (_: Exception) { JSONObject.NULL }
-            return JSONObject().put("state", "ready").put("protocolVersion", 2)
+            return JSONObject().put("state", "ready").put("protocolVersion", 3)
                 .put("uid", native.processUid).put("effectiveUid", native.effectiveUid).put("pid", native.processId)
                 .put("coreVersion", native.coreVersion).put("mountNamespace", Os.readlink("/proc/self/ns/mnt"))
                 .put("selinux", File("/proc/self/attr/current").readText().trim().trimEnd('\u0000'))

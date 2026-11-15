@@ -6,87 +6,129 @@ import android.util.Base64
 import org.json.JSONArray
 import org.json.JSONObject
 
-/** Pages contain at most 100 rows. No unbounded page or path cache. */
+/** Bounded pages and ancestor chains; no tree or unbounded cursor history in memory. */
 internal class IndexQueries(private val store: IndexStore) {
-    fun query(request: String): String {
-        return try { execute(JSONObject(request)).toString() }
+    fun query(request: String): String = try { execute(JSONObject(request)).toString() }
         catch (_: IllegalArgumentException) { JSONObject().put("status", "invalid-query").toString() }
         catch (_: org.json.JSONException) { JSONObject().put("status", "invalid-query").toString() }
-    }
+
     private fun execute(q: JSONObject): JSONObject {
+        val kind = q.getString("kind")
+        val db = store.readableDatabase
+        if (kind == "recent") {
+            val sessions = JSONArray()
+            db.rawQuery("SELECT id FROM sessions ORDER BY started DESC,id DESC LIMIT 20", null).use {
+                while (it.moveToNext()) metadata(db, it.getString(0))?.let(sessions::put)
+            }
+            return JSONObject().put("status", "ok").put("sessions", sessions)
+        }
         val id = q.getString("sessionId"); require(id.length == 36)
-        val kind = q.getString("kind"); require(kind in setOf("session", "children", "large-files", "detail", "issues"))
+        require(kind in setOf("session", "children", "large-files", "detail", "issues", "ancestors"))
         val parent = q.optLong("parentId"); val node = q.optLong("nodeId")
         val sort = q.optString("sort", "logical"); require(sort in setOf("logical", "allocated", "name"))
         val limit = q.optInt("limit", 100); require(limit in 1..100 && parent >= 0 && node >= 0)
-        require(kind != "children" || parent > 0); require(kind != "detail" || node > 0)
+        require(kind != "children" || parent > 0); require(kind !in setOf("detail", "ancestors") || node > 0)
         require(kind != "large-files" || sort != "name")
         val token = q.optString("cursor"); require(token.length <= 4096)
-        val db = store.readableDatabase
         val meta = metadata(db, id) ?: return JSONObject().put("status", "not-found")
         val revision = meta.getLong("revision")
         val signature = "$id|$kind|$parent|$node|$sort|$limit"
         val cursor = if (token.isEmpty()) null else JSONObject(String(Base64.decode(token, Base64.URL_SAFE or Base64.NO_WRAP), Charsets.UTF_8)).also {
-            require(it.getInt("version") == 1 && it.getString("query") == signature)
+            require(it.getInt("version") == 2 && it.getString("query") == signature && it.getString("direction") in setOf("after", "before"))
         }
         if (cursor != null && cursor.getLong("revision") != revision) return meta.put("status", "stale-cursor")
         val result = meta.put("status", "ok").put("entries", JSONArray()).put("issues", JSONArray())
-        if (kind == "detail") {
-            db.rawQuery("""SELECT n.*,a.logical,a.allocated AS total_allocated,a.complete AS subtree_complete,a.owner
+        when (kind) {
+            "detail" -> db.rawQuery("""SELECT n.*,a.logical,a.allocated AS total_allocated,a.complete AS subtree_complete,a.owner,
+                EXISTS(SELECT 1 FROM issues i WHERE i.sid=n.sid AND i.node=n.id AND i.code=1) AS inaccessible
                 FROM nodes n JOIN aggregates a ON a.sid=n.sid AND a.id=n.id WHERE n.sid=? AND n.id=?""", arrayOf(id, node.toString())).use {
                 if (!it.moveToFirst()) result.put("status", "not-found") else result.put("detail", detail(it))
             }
-        } else if (kind == "issues") {
-            val after = cursor?.getLong("lastId") ?: 0L; require(after >= 0)
-            val filter = if (node == 0L) "" else " AND node=?"
-            val args = mutableListOf(id, after.toString()); if (node != 0L) args.add(node.toString()); args.add((limit + 1).toString())
-            val rows = result.getJSONArray("issues"); var last = 0L
-            db.rawQuery("SELECT id,node,code,errno,operation FROM issues WHERE sid=? AND id>?$filter ORDER BY id LIMIT ?", args.toTypedArray()).use {
-                while (it.moveToNext()) {
-                    if (rows.length() == limit) { result.put("nextCursor", encode(signature, revision, last, "")); break }
-                    last = it.getLong(0)
-                    rows.put(JSONObject().put("id", last).put("nodeId", it.getLong(1)).put("code", errors[it.getInt(2)])
-                        .put("systemError", it.getInt(3)).put("operation", it.getString(4)))
+            "ancestors" -> {
+                val rows = JSONArray()
+                db.rawQuery("""WITH RECURSIVE chain(id,parent,name,depth) AS (
+                    SELECT id,parent,name,depth FROM nodes WHERE sid=? AND id=? UNION ALL
+                    SELECT n.id,n.parent,n.name,n.depth FROM nodes n JOIN chain c ON n.id=c.parent WHERE n.sid=? AND c.depth>0)
+                    SELECT id,parent,name FROM chain ORDER BY depth LIMIT 513""", arrayOf(id, node.toString(), id)).use {
+                    while (it.moveToNext()) rows.put(JSONObject().put("id", it.getLong(0)).put("parentId", it.getLong(1)).put("nameHex", it.getBlob(2).hex()))
                 }
+                result.put("ancestors", rows)
+                if (rows.length() == 0) result.put("status", "not-found")
             }
-        } else if (kind != "session") {
-            val column = if (sort == "name") "name_key" else sort
-            val ascending = sort == "name"; val comparison = if (ascending) ">" else "<"
-            val order = if (ascending) "ASC" else "DESC"
-            val filter = if (kind == "children") "a.parent=?" else "a.kind=2"
-            val args = mutableListOf(id); if (kind == "children") args.add(parent.toString())
-            val continuation = if (cursor == null) "" else {
-                val lastId = cursor.getLong("lastId"); require(lastId > 0)
-                val key = cursor.getString("key")
-                if (ascending) require(key.length <= 510 && key.matches(Regex("[0-9a-f]*")))
-                else require(key.toLong() >= 0)
-                args.add(key); args.add(lastId.toString()); " AND (a.$column,a.id)$comparison(?,?)"
-            }
-            args.add((limit + 1).toString())
-            val rows = result.getJSONArray("entries"); var lastId = 0L; var lastKey = ""
-            db.rawQuery("""SELECT a.id,a.parent,n.name,a.kind,a.logical,a.allocated,a.complete,a.owner,a.$column
-                FROM aggregates a JOIN nodes n ON n.sid=a.sid AND n.id=a.id
-                WHERE a.sid=? AND $filter$continuation ORDER BY a.$column $order,a.id $order LIMIT ?""", args.toTypedArray()).use {
-                while (it.moveToNext()) {
-                    if (rows.length() == limit) { result.put("nextCursor", encode(signature, revision, lastId, lastKey)); break }
-                    lastId = it.getLong(0); lastKey = it.getString(8)
-                    rows.put(JSONObject().put("id", lastId).put("parentId", it.getLong(1)).put("nameHex", it.getBlob(2).hex())
-                        .put("kind", kinds[it.getInt(3)]).put("logicalBytes", it.getLong(4)).put("allocatedBytes", it.getLong(5))
-                        .put("complete", it.getInt(6) == 1).put("ownerId", it.getLong(7)))
-                }
-            }
+            "issues" -> issues(db, id, node, limit, cursor, signature, revision, result)
+            "children", "large-files" -> entries(db, id, kind, parent, sort, limit, cursor, signature, revision, result)
         }
-        // All indexed writes advance revision in the same transaction. This
-        // double-read accepts only a stable interval, also on Android 29 where
-        // SQLiteDatabase has no read-only transaction API.
-        if (metadata(db, id)?.getLong("revision") != revision) return meta.put("status", "stale-cursor").put("entries", JSONArray()).put("issues", JSONArray()).also { it.remove("detail"); it.remove("nextCursor") }
+        // Every indexed write advances revision atomically. Only accept a stable read interval.
+        if (metadata(db, id)?.getLong("revision") != revision) return JSONObject().put("status", "stale-cursor")
         return result
     }
+    private data class Row(val value: JSONObject, val id: Long, val key: String)
+    private fun pages(rows: MutableList<Row>, limit: Int, cursor: JSONObject?, signature: String, revision: Long, result: JSONObject, field: String) {
+        val before = cursor?.getString("direction") == "before"
+        val extra = rows.size > limit
+        if (extra) rows.removeAt(rows.lastIndex)
+        if (before) rows.reverse()
+        result.put(field, JSONArray(rows.map { it.value }))
+        if (rows.isEmpty()) return
+        if (if (before) extra else cursor != null) result.put("previousCursor", encode(signature, revision, rows.first(), "before"))
+        if (if (before) cursor != null else extra) result.put("nextCursor", encode(signature, revision, rows.last(), "after"))
+    }
+    private fun issues(db: SQLiteDatabase, id: String, node: Long, limit: Int, cursor: JSONObject?, signature: String, revision: Long, result: JSONObject) {
+        val before = cursor?.getString("direction") == "before"
+        val args = mutableListOf(id)
+        val continuation = if (cursor == null) "" else { val last = cursor.getLong("lastId"); require(last > 0); args.add(last.toString()); " AND id${if (before) "<" else ">"}?" }
+        val filter = if (node == 0L) "" else { args.add(node.toString()); " AND node=?" }
+        args.add((limit + 1).toString())
+        val rows = mutableListOf<Row>()
+        db.rawQuery("SELECT id,node,code,errno,operation FROM issues WHERE sid=?$continuation$filter ORDER BY id ${if (before) "DESC" else "ASC"} LIMIT ?", args.toTypedArray()).use {
+            while (it.moveToNext()) rows.add(Row(JSONObject().put("id", it.getLong(0)).put("nodeId", it.getLong(1)).put("code", errors[it.getInt(2)])
+                .put("systemError", it.getInt(3)).put("operation", it.getString(4)), it.getLong(0), ""))
+        }
+        pages(rows, limit, cursor, signature, revision, result, "issues")
+    }
+    private fun entries(db: SQLiteDatabase, id: String, kind: String, parent: Long, sort: String, limit: Int, cursor: JSONObject?, signature: String, revision: Long, result: JSONObject) {
+        val before = cursor?.getString("direction") == "before"
+        val ascending = (sort == "name") != before
+        val column = if (sort == "name") "name_key" else sort
+        val args = mutableListOf(id)
+        var from = "aggregates a JOIN nodes n ON n.sid=a.sid AND n.id=a.id"
+        var filter = if (kind == "children") { args.add(parent.toString()); "a.parent=?" } else "a.kind=2"
+        if (kind == "large-files" && parent > 1) {
+            val path = db.rawQuery("SELECT path FROM nodes WHERE sid=? AND id=? AND kind=1", arrayOf(id, parent.toString())).use {
+                if (!it.moveToFirst()) { result.put("status", "not-found"); return }; it.getBlob(0)
+            }
+            // Controlled BLOB literals preserve raw byte ordering; force a subtree range scan
+            // before sorting, rather than walking the whole volume's large-file index.
+            from = "nodes n INDEXED BY node_path CROSS JOIN aggregates a ON a.sid=n.sid AND a.id=n.id"
+            filter += " AND n.sid=? AND n.path>=X'${(path + byteArrayOf(47)).hex()}' AND n.path<X'${(path + byteArrayOf(48)).hex()}'"
+            args.add(id)
+        }
+        val continuation = if (cursor == null) "" else {
+            val last = cursor.getLong("lastId"); require(last > 0)
+            val key = cursor.getString("key")
+            if (sort == "name") require(key.length <= 510 && key.matches(Regex("[0-9a-f]*"))) else require(key.toLong() >= 0)
+            args.add(key); args.add(last.toString()); " AND (a.$column,a.id)${if (ascending) ">" else "<"}(?,?)"
+        }
+        args.add((limit + 1).toString())
+        val order = if (ascending) "ASC" else "DESC"
+        val rows = mutableListOf<Row>()
+        db.rawQuery("""SELECT a.id,a.parent,n.name,a.kind,a.logical,a.allocated,a.complete,a.owner,a.$column,n.valid,n.skip,
+            EXISTS(SELECT 1 FROM issues i WHERE i.sid=n.sid AND i.node=n.id AND i.code=1)
+            FROM $from WHERE a.sid=? AND $filter$continuation ORDER BY a.$column $order,a.id $order LIMIT ?""", args.toTypedArray()).use {
+            while (it.moveToNext()) rows.add(Row(JSONObject().put("id", it.getLong(0)).put("parentId", it.getLong(1)).put("nameHex", it.getBlob(2).hex())
+                .put("kind", kinds[it.getInt(3)]).put("logicalBytes", it.getLong(4)).put("allocatedBytes", it.getLong(5))
+                .put("complete", it.getInt(6) == 1).put("ownerId", it.getLong(7)).put("metadataValid", it.getInt(9) == 1)
+                .put("skipped", skips[it.getInt(10)]).put("inaccessible", it.getInt(11) == 1), it.getLong(0), it.getString(8)))
+        }
+        pages(rows, limit, cursor, signature, revision, result, "entries")
+    }
     private fun metadata(db: SQLiteDatabase, id: String): JSONObject? = db.rawQuery(
-        "SELECT revision,provisional,state,phase,nodes,issues,metrics FROM sessions WHERE id=?", arrayOf(id)).use {
-        if (!it.moveToFirst()) null else JSONObject().put("revision", it.getLong(0)).put("provisional", it.getInt(1) == 1)
+        "SELECT revision,provisional,state,phase,nodes,issues,metrics,root,backend,started,ended,volume,reason FROM sessions WHERE id=?", arrayOf(id)).use {
+        if (!it.moveToFirst()) null else JSONObject().put("sessionId", id).put("revision", it.getLong(0)).put("provisional", it.getInt(1) == 1)
             .put("state", it.getString(2)).put("phase", it.getString(3)).put("nodeCount", it.getLong(4)).put("issueCount", it.getLong(5))
-            .put("schemaVersion", IndexStore.SCHEMA_VERSION).put("metrics", JSONObject(it.getString(6)))
+            .put("schemaVersion", IndexStore.SCHEMA_VERSION).put("metrics", JSONObject(it.getString(6))).put("rootPath", it.getString(7))
+            .put("backend", it.getString(8)).put("startedAtMillis", it.getLong(9)).put("endedAtMillis", it.getLong(10))
+            .put("volume", JSONObject(it.getString(11))).put("reason", it.getString(12))
     }
     private fun detail(c: Cursor): JSONObject {
         fun long(name: String) = c.getLong(c.getColumnIndexOrThrow(name))
@@ -99,9 +141,9 @@ internal class IndexQueries(private val store: IndexStore) {
             .put("deviceHex", bytes("device")).put("inodeHex", bytes("inode")).put("mountId", long("mount"))
             .put("linkCount", long("nlink")).put("rawSize", long("size")).put("rawAllocatedBytes", long("allocated"))
             .put("mtimeSeconds", long("seconds")).put("mtimeNanos", long("nanos")).put("metadataValid", long("valid") == 1L)
-            .put("skipped", skips[long("skip").toInt()])
+            .put("skipped", skips[long("skip").toInt()]).put("inaccessible", long("inaccessible") == 1L)
     }
-    private fun encode(query: String, revision: Long, id: Long, key: String): String = Base64.encodeToString(
-        JSONObject().put("version", 1).put("query", query).put("revision", revision).put("lastId", id).put("key", key)
+    private fun encode(query: String, revision: Long, row: Row, direction: String): String = Base64.encodeToString(
+        JSONObject().put("version", 2).put("query", query).put("revision", revision).put("lastId", row.id).put("key", row.key).put("direction", direction)
             .toString().toByteArray(), Base64.URL_SAFE or Base64.NO_WRAP)
 }

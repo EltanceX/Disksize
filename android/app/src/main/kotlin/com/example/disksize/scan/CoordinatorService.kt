@@ -145,6 +145,13 @@ class CoordinatorService : Service() {
             // The journal must be durable before a public query can expose a
             // terminal index. SQLite may finish just ahead of that write.
             synchronized(lock) {
+                val recent = result.optJSONArray("sessions")
+                for (i in 0 until (recent?.length() ?: 0)) {
+                    val session = recent!!.getJSONObject(i)
+                    if (active?.id == session.optString("sessionId") && session.optString("state") in setOf("completed", "partial", "failed")) {
+                        session.put("state", "running").put("phase", "index-finalizing").put("provisional", true)
+                    }
+                }
                 if (active?.id == query.optString("sessionId") && result.optString("state") in setOf("completed", "partial", "failed")) {
                     return JSONObject().put("status", "index-finalizing").put("provisional", true).toString()
                 }

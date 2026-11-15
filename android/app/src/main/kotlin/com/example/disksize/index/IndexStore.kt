@@ -24,7 +24,9 @@ internal class IndexStore(context: Context, filename: String = "scan-index.db") 
             state TEXT NOT NULL, phase TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 0,
             provisional INTEGER NOT NULL DEFAULT 1, started INTEGER NOT NULL, ended INTEGER NOT NULL DEFAULT 0,
             nodes INTEGER NOT NULL DEFAULT 0, issues INTEGER NOT NULL DEFAULT 0, reason TEXT NOT NULL DEFAULT '',
-            scanner_uid INTEGER NOT NULL, scanner_pid INTEGER NOT NULL, metrics TEXT NOT NULL DEFAULT '{}')""")
+            scanner_uid INTEGER NOT NULL, scanner_pid INTEGER NOT NULL, metrics TEXT NOT NULL DEFAULT '{}',
+            volume TEXT NOT NULL DEFAULT '{}')""")
+        db.execSQL("CREATE INDEX sessions_recent ON sessions(started DESC,id DESC)")
         db.execSQL("""CREATE TABLE nodes(sid TEXT NOT NULL REFERENCES sessions(id), id INTEGER NOT NULL,
             parent INTEGER NOT NULL, depth INTEGER NOT NULL, name BLOB NOT NULL, name_key TEXT NOT NULL,
             path BLOB NOT NULL, link BLOB NOT NULL, kind INTEGER NOT NULL, mode INTEGER NOT NULL,
@@ -59,13 +61,16 @@ internal class IndexStore(context: Context, filename: String = "scan-index.db") 
             complete INTEGER NOT NULL)""")
     }
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        if (oldVersion == 1 && newVersion == 2) {
-            db.execSQL("CREATE INDEX aggregate_incomplete ON aggregates(sid,parent,complete)")
-            return
+        require(oldVersion in 1..2 && newVersion == SCHEMA_VERSION) {
+            "Unsupported index migration $oldVersion -> $newVersion; existing data preserved"
         }
-        error("Unsupported index migration $oldVersion -> $newVersion; existing data preserved")
+        if (oldVersion == 1) {
+            db.execSQL("CREATE INDEX aggregate_incomplete ON aggregates(sid,parent,complete)")
+        }
+        db.execSQL("ALTER TABLE sessions ADD COLUMN volume TEXT NOT NULL DEFAULT '{}'")
+        db.execSQL("CREATE INDEX sessions_recent ON sessions(started DESC,id DESC)")
     }
-    companion object { const val SCHEMA_VERSION = 2 }
+    companion object { const val SCHEMA_VERSION = 3 }
     fun recover() {
         writableDatabase.execSQL("""UPDATE sessions SET state='interrupted', phase='interrupted',
             reason='process-interrupted', revision=revision+1, ended=? WHERE state IN ('running','finalizing')""", arrayOf(now()))
@@ -139,6 +144,12 @@ internal class IndexStore(context: Context, filename: String = "scan-index.db") 
             db.execSQL("UPDATE aggregates SET complete=0 WHERE sid=? AND id=?", arrayOf<Any>(id, node))
             writeNanos += System.nanoTime() - before
             if (actions >= 256) flush()
+        }
+        fun volume(total: Long, free: Long, available: Long, captured: Long) {
+            action()
+            val value = JSONObject().put("totalBytes", total).put("freeBytes", free)
+                .put("availableBytes", available).put("capturedAtMillis", captured)
+            db.execSQL("UPDATE sessions SET volume=? WHERE id=?", arrayOf(value.toString(), id))
         }
         fun flush() {
             if (!transaction) return

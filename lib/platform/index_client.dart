@@ -2,7 +2,7 @@ import 'dart:convert';
 
 import 'generated/scanner_api.g.dart';
 
-enum IndexQueryKind { session, children, largeFiles, detail, issues }
+enum IndexQueryKind { session, children, largeFiles, detail, issues, ancestors }
 
 enum IndexSort { logical, allocated, name }
 
@@ -42,10 +42,14 @@ final class IndexedEntry {
       logicalBytes = value['logicalBytes'] as int,
       allocatedBytes = value['allocatedBytes'] as int,
       complete = value['complete'] as bool,
-      ownerId = value['ownerId'] as int;
+      ownerId = value['ownerId'] as int,
+      metadataValid = value['metadataValid'] as bool? ?? true,
+      inaccessible = value['inaccessible'] as bool? ?? false,
+      skipped = value['skipped'] as String? ?? 'none';
   final int id, parentId, logicalBytes, allocatedBytes, ownerId;
-  final String nameHex, kind;
-  final bool complete;
+  final String nameHex, kind, skipped;
+  final bool complete, metadataValid, inaccessible;
+  bool get sharedLink => ownerId != 0 && ownerId != id;
 }
 
 final class IndexedIssue {
@@ -101,6 +105,13 @@ final class IndexPage {
       nodeCount = value['nodeCount'] as int? ?? 0,
       issueCount = value['issueCount'] as int? ?? 0,
       nextCursor = value['nextCursor'] as String?,
+      previousCursor = value['previousCursor'] as String?,
+      session = IndexSession.fromJson(value),
+      ancestors = List.unmodifiable(
+        (value['ancestors'] as List? ?? []).map(
+          (e) => IndexAncestor.fromJson(e as Map<String, dynamic>),
+        ),
+      ),
       entries = List.unmodifiable(
         (value['entries'] as List? ?? []).map(
           (e) => IndexedEntry.fromJson(e as Map<String, dynamic>),
@@ -117,18 +128,84 @@ final class IndexPage {
   final String status, state, phase;
   final int revision, nodeCount, issueCount;
   final bool provisional;
-  final String? nextCursor;
+  final String? nextCursor, previousCursor;
+  final IndexSession session;
+  final List<IndexAncestor> ancestors;
   final List<IndexedEntry> entries;
   final List<IndexedIssue> issues;
   final IndexDetail? detail;
   bool get needsRefresh => status == 'stale-cursor';
 }
 
+final class IndexAncestor {
+  IndexAncestor.fromJson(Map<String, dynamic> value)
+    : id = value['id'] as int,
+      parentId = value['parentId'] as int,
+      nameHex = value['nameHex'] as String;
+  final int id, parentId;
+  final String nameHex;
+}
+
+final class VolumeStats {
+  VolumeStats.fromJson(Map<String, dynamic> value)
+    : totalBytes = value['totalBytes'] as int? ?? 0,
+      freeBytes = value['freeBytes'] as int? ?? 0,
+      availableBytes = value['availableBytes'] as int? ?? 0,
+      capturedAtMillis = value['capturedAtMillis'] as int? ?? 0;
+  final int totalBytes, freeBytes, availableBytes, capturedAtMillis;
+  bool get valid => capturedAtMillis > 0;
+  int get usedBytes => totalBytes - freeBytes;
+}
+
+final class StorageEntry {
+  StorageEntry.fromJson(Map<String, dynamic> value)
+    : label = value['label'] as String,
+      path = value['path'] as String,
+      state = value['state'] as String,
+      removable = value['removable'] as bool,
+      stats = VolumeStats.fromJson(value);
+  final String label, path, state;
+  final bool removable;
+  final VolumeStats stats;
+  bool get mounted =>
+      path.isNotEmpty && (state == 'mounted' || state == 'mounted_ro');
+}
+
+final class IndexSession {
+  IndexSession.fromJson(Map<String, dynamic> value)
+    : id = value['sessionId'] as String? ?? '',
+      rootPath = value['rootPath'] as String? ?? '',
+      backend = value['backend'] as String? ?? 'ordinary',
+      state = value['state'] as String? ?? '',
+      phase = value['phase'] as String? ?? '',
+      reason = value['reason'] as String? ?? '',
+      startedAtMillis = value['startedAtMillis'] as int? ?? 0,
+      endedAtMillis = value['endedAtMillis'] as int? ?? 0,
+      nodeCount = value['nodeCount'] as int? ?? 0,
+      issueCount = value['issueCount'] as int? ?? 0,
+      provisional = value['provisional'] as bool? ?? true,
+      volume = VolumeStats.fromJson(
+        value['volume'] as Map<String, dynamic>? ?? {},
+      );
+  final String id, rootPath, backend, state, phase, reason;
+  final int startedAtMillis, endedAtMillis, nodeCount, issueCount;
+  final bool provisional;
+  final VolumeStats volume;
+  bool get active => state == 'running' || state == 'finalizing';
+}
+
+abstract interface class IndexClient {
+  Future<IndexPage> query(IndexRequest request);
+  Future<List<IndexSession>> recent();
+  Future<List<StorageEntry>> volumes();
+}
+
 /// Returns one bounded page; callers replace the page when navigating.
 /// A stale cursor requires a new request without its cursor.
-final class AndroidIndexClient {
+final class AndroidIndexClient implements IndexClient {
   AndroidIndexClient({ScannerHostApi? api}) : _api = api ?? ScannerHostApi();
   final ScannerHostApi _api;
+  @override
   Future<IndexPage> query(IndexRequest request) async {
     if (request.limit < 1 || request.limit > 100) {
       throw ArgumentError.value(
@@ -139,5 +216,29 @@ final class AndroidIndexClient {
     }
     final payload = await _api.queryIndex(jsonEncode(request.toJson()));
     return IndexPage.fromJson(jsonDecode(payload) as Map<String, dynamic>);
+  }
+
+  @override
+  Future<List<IndexSession>> recent() async {
+    final value = jsonDecode(
+      await _api.queryIndex('{"kind":"recent"}'),
+    ) as Map<String, dynamic>;
+    return List.unmodifiable(
+      (value['sessions'] as List).map(
+        (e) => IndexSession.fromJson(e as Map<String, dynamic>),
+      ),
+    );
+  }
+
+  @override
+  Future<List<StorageEntry>> volumes() async {
+    final value = jsonDecode(
+      await _api.queryIndex('{"kind":"volumes"}'),
+    ) as Map<String, dynamic>;
+    return List.unmodifiable(
+      (value['volumes'] as List).map(
+        (e) => StorageEntry.fromJson(e as Map<String, dynamic>),
+      ),
+    );
   }
 }

@@ -5,7 +5,7 @@
 namespace disksize::wire {
 class IndexWriter {
 public:
-    IndexWriter(int fd, Bytes id, CancellationToken& token) : wire_(fd, std::move(id), token, 2) {
+    IndexWriter(int fd, Bytes id, CancellationToken& token) : wire_(fd, std::move(id), token, 3) {
         Bytes b; u32(b, getuid()); u32(b, geteuid()); u32(b, getpid()); wire_.frame(1, b, true);
         u32(batch_, 0);
     }
@@ -36,6 +36,10 @@ public:
     }
     void progress(const ScanProgress& p) { flush(); wire_.progress(p); }
     void finish(const StreamResult& r) {
+        if (r.volume.valid) {
+            flush(); Bytes v; u64(v, r.volume.total); u64(v, r.volume.free);
+            u64(v, r.volume.available); u64(v, r.volume.captured_millis); wire_.frame(8, v, true);
+        }
         flush(); Bytes b; u32(b, static_cast<std::uint32_t>(r.scan.state)); u64(b, r.node_count);
         u64(b, r.scan.summary.issue_count); u64(b, r.scan.metrics.elapsed_microseconds);
         u64(b, r.scan.metrics.peak_open_fds); u64(b, r.scan.metrics.open_fds_at_finish);

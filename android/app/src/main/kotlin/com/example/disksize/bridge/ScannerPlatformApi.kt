@@ -102,7 +102,13 @@ internal class ScannerPlatformApi(private val activity: MainActivity) : ScannerH
     }
 
     override suspend fun cancelScan(sessionId: String) { callCoordinator { it.cancelScan(sessionId) } }
-    override suspend fun queryIndex(requestJson: String): String = callCoordinator { it.queryIndex(requestJson) }
+    override suspend fun queryIndex(requestJson: String): String {
+        require(requestJson.length <= 8192)
+        if (try { JSONObject(requestJson).optString("kind") == "volumes" } catch (_: org.json.JSONException) { false }) {
+            return withContext(Dispatchers.IO) { ScanAccess.volumes(context) }
+        }
+        return callCoordinator { it.queryIndex(requestJson) }
+    }
 
     private fun requireForeground() {
         if (closed || !activity.isResumedForScan) {

@@ -106,6 +106,12 @@ private:
         }
         r.root_mount_id = internal::mount_id_for_fd(root.get(), fds_);
         r.root_filesystem_type = static_cast<std::uint64_t>(fs.f_type);
+        if (fs.f_bsize > 0 && fs.f_blocks <= static_cast<std::uint64_t>(INT64_MAX) / fs.f_bsize &&
+            fs.f_bfree <= fs.f_blocks && fs.f_bavail <= fs.f_bfree) {
+            result_.volume = {true, fs.f_blocks * fs.f_bsize, fs.f_bfree * fs.f_bsize, fs.f_bavail * fs.f_bsize,
+                static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count())};
+        }
         if (!r.root_mount_id) { failed_ = true; issue(nullptr, ScanErrorCode::Unsupported, "root-mount", 0); return; }
         ScanNode n; n.id = 1; n.mount_id = r.root_mount_id;
         if (!metadata(n, s)) { failed_ = true; issue(nullptr, ScanErrorCode::Io, "root-metadata", EOVERFLOW); return; }

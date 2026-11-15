@@ -35,8 +35,9 @@ internal object IndexProtocol {
         val expected = uuidBytes(id); val stream = DataInputStream(input)
         var sequence = 0L; var count = 0L; var issues = 0L; var identity = false
         var summary: StreamSummary? = null
+        var volumeSeen = false
         while (true) {
-            require(stream.readInt() == 0x44535a34 && stream.readUnsignedShort() == 2) { "Bad stream magic/version" }
+            require(stream.readInt() == 0x44535a34 && stream.readUnsignedShort() == 3) { "Bad stream magic/version" }
             val type = stream.readUnsignedShort(); val length = stream.readInt()
             require(length in 0..65536) { "Frame too large" }
             require(ByteArray(16).also { stream.readFully(it) }.contentEquals(expected)) { "Session mismatch" }
@@ -92,6 +93,12 @@ internal object IndexProtocol {
                     summary = StreamSummary(state, count, issues, body.positive(), body.positive(), body.positive(), body.positive(), body.positive())
                     require(summary.finishFds == 0L)
                     writer.flush()
+                }
+                8 -> {
+                    require(!volumeSeen); volumeSeen = true
+                    val total = body.positive(); val free = body.positive(); val available = body.positive(); val captured = body.positive()
+                    require(free <= total && available <= free && captured > 0)
+                    writer.volume(total, free, available, captured)
                 }
                 6 -> {
                     require(summary != null && length == 0 && stream.read() == -1) { "Missing end/EOF" }
