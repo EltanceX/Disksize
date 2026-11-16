@@ -2,7 +2,15 @@ import 'dart:convert';
 
 import 'generated/scanner_api.g.dart';
 
-enum IndexQueryKind { session, children, largeFiles, detail, issues, ancestors }
+enum IndexQueryKind {
+  session,
+  children,
+  largeFiles,
+  detail,
+  issues,
+  ancestors,
+  treemap,
+}
 
 enum IndexSort { logical, allocated, name }
 
@@ -124,7 +132,10 @@ final class IndexPage {
       ),
       detail = value['detail'] == null
           ? null
-          : IndexDetail.fromJson(value['detail'] as Map<String, dynamic>);
+          : IndexDetail.fromJson(value['detail'] as Map<String, dynamic>),
+      treemap = value['treemap'] == null
+          ? null
+          : TreemapSummary.fromJson(value['treemap'] as Map<String, dynamic>);
   final String status, state, phase;
   final int revision, nodeCount, issueCount;
   final bool provisional;
@@ -134,7 +145,18 @@ final class IndexPage {
   final List<IndexedEntry> entries;
   final List<IndexedIssue> issues;
   final IndexDetail? detail;
+  final TreemapSummary? treemap;
   bool get needsRefresh => status == 'stale-cursor';
+}
+
+final class TreemapSummary {
+  TreemapSummary.fromJson(Map<String, dynamic> value)
+    : totalBytes = value['totalBytes'] as int,
+      otherBytes = value['otherBytes'] as int,
+      childCount = value['childCount'] as int,
+      zeroCount = value['zeroCount'] as int,
+      unknownCount = value['unknownCount'] as int;
+  final int totalBytes, otherBytes, childCount, zeroCount, unknownCount;
 }
 
 final class IndexAncestor {

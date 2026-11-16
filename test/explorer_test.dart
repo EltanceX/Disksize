@@ -96,6 +96,15 @@ class ExplorerFixture implements IndexClient {
         m['issues'] = [];
       case IndexQueryKind.session:
         break;
+      case IndexQueryKind.treemap:
+        m['entries'] = r.parentId == 2 ? [entry(4)] : [entry(2), entry(3)];
+        m['treemap'] = {
+          'totalBytes': 16384,
+          'otherBytes': 0,
+          'childCount': 2,
+          'zeroCount': 0,
+          'unknownCount': 0,
+        };
     }
     return IndexPage.fromJson(m);
   }

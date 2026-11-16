@@ -23,13 +23,14 @@ internal class IndexQueries(private val store: IndexStore) {
             return JSONObject().put("status", "ok").put("sessions", sessions)
         }
         val id = q.getString("sessionId"); require(id.length == 36)
-        require(kind in setOf("session", "children", "large-files", "detail", "issues", "ancestors"))
+        require(kind in setOf("session", "children", "large-files", "detail", "issues", "ancestors", "treemap"))
         val parent = q.optLong("parentId"); val node = q.optLong("nodeId")
         val sort = q.optString("sort", "logical"); require(sort in setOf("logical", "allocated", "name"))
         val limit = q.optInt("limit", 100); require(limit in 1..100 && parent >= 0 && node >= 0)
-        require(kind != "children" || parent > 0); require(kind !in setOf("detail", "ancestors") || node > 0)
+        require(kind !in setOf("children", "treemap") || parent > 0); require(kind !in setOf("detail", "ancestors") || node > 0)
         require(kind != "large-files" || sort != "name")
         val token = q.optString("cursor"); require(token.length <= 4096)
+        require(kind != "treemap" || (sort != "name" && token.isEmpty()))
         val meta = metadata(db, id) ?: return JSONObject().put("status", "not-found")
         val revision = meta.getLong("revision")
         val signature = "$id|$kind|$parent|$node|$sort|$limit"
@@ -57,10 +58,32 @@ internal class IndexQueries(private val store: IndexStore) {
             }
             "issues" -> issues(db, id, node, limit, cursor, signature, revision, result)
             "children", "large-files" -> entries(db, id, kind, parent, sort, limit, cursor, signature, revision, result)
+            "treemap" -> treemap(db, id, parent, sort, limit, signature, revision, result)
         }
         // Every indexed write advances revision atomically. Only accept a stable read interval.
         if (metadata(db, id)?.getLong("revision") != revision) return JSONObject().put("status", "stale-cursor")
         return result
+    }
+    private fun treemap(db: SQLiteDatabase, id: String, parent: Long, sort: String, limit: Int, signature: String, revision: Long, result: JSONObject) {
+        // In-progress aggregates are not additive yet. Never draw them as proportions.
+        if (result.getBoolean("provisional")) return
+        val total = db.rawQuery("SELECT $sort FROM aggregates WHERE sid=? AND id=? AND kind=1", arrayOf(id, parent.toString())).use {
+            if (!it.moveToFirst()) { result.put("status", "not-found"); return }; it.getLong(0)
+        }
+        entries(db, id, "children", parent, sort, limit, null, signature, revision, result)
+        result.remove("nextCursor"); result.remove("previousCursor")
+        val rows = result.getJSONArray("entries")
+        var represented = 0L
+        val key = if (sort == "logical") "logicalBytes" else "allocatedBytes"
+        for (i in 0 until rows.length()) represented = Math.addExact(represented, rows.getJSONObject(i).getLong(key))
+        if (represented > total) { result.put("status", "inconsistent-index"); return }
+        db.rawQuery("""SELECT COUNT(*),COALESCE(SUM(a.$sort=0),0),COALESCE(SUM(a.complete=0 OR n.valid=0),0)
+            FROM aggregates a JOIN nodes n ON n.sid=a.sid AND n.id=a.id WHERE a.sid=? AND a.parent=?""",
+            arrayOf(id, parent.toString())).use {
+            check(it.moveToFirst())
+            result.put("treemap", JSONObject().put("totalBytes", total).put("otherBytes", total - represented)
+                .put("childCount", it.getLong(0)).put("zeroCount", it.getLong(1)).put("unknownCount", it.getLong(2)))
+        }
     }
     private data class Row(val value: JSONObject, val id: Long, val key: String)
     private fun pages(rows: MutableList<Row>, limit: Int, cursor: JSONObject?, signature: String, revision: Long, result: JSONObject, field: String) {

@@ -9,12 +9,14 @@ class ExplorerController extends ChangeNotifier {
   final String sessionId;
   int directoryId = 1;
   bool largeFiles = false;
+  bool treemap = false;
   bool allocated = false;
   IndexSort sort = IndexSort.logical;
   IndexPage? page;
   IndexDetail? directory, root;
   List<IndexAncestor> ancestors = const [];
   bool loading = false;
+  bool retryAutomatically = false;
   String? message;
   int pageNumber = 1;
   int _generation = 0;
@@ -29,8 +31,10 @@ class ExplorerController extends ChangeNotifier {
         kind: kind,
         parentId: directoryId,
         nodeId: nodeId,
-        sort: sort,
-        limit: 50,
+        sort: treemap
+            ? (allocated ? IndexSort.allocated : IndexSort.logical)
+            : sort,
+        limit: treemap ? 100 : 50,
         cursor: cursor,
       );
 
@@ -41,13 +45,18 @@ class ExplorerController extends ChangeNotifier {
       pageNumber = 1;
     }
     loading = true;
+    retryAutomatically = false;
     message = null;
     notifyListeners();
     try {
       final responses = await Future.wait([
         client.query(
           request(
-            largeFiles ? IndexQueryKind.largeFiles : IndexQueryKind.children,
+            treemap
+                ? IndexQueryKind.treemap
+                : largeFiles
+                ? IndexQueryKind.largeFiles
+                : IndexQueryKind.children,
             cursor: cursor,
           ),
         ),
@@ -70,12 +79,20 @@ class ExplorerController extends ChangeNotifier {
         page = null;
         directory = null;
         root = null;
+        ancestors = const [];
+        retryAutomatically = true;
         message = '扫描数据正在更新，请稍后刷新。';
       } else if (responses.any((p) => p.status != 'ok')) {
         page = null;
         directory = null;
         root = null;
-        message = responses.any((p) => p.status == 'index-finalizing')
+        ancestors = const [];
+        retryAutomatically = responses.any(
+          (p) => p.status == 'index-finalizing',
+        );
+        message = responses.any((p) => p.status == 'not-found')
+            ? '该会话或目录已不可用，请返回最近会话重新选择。'
+            : responses.any((p) => p.status == 'index-finalizing')
             ? '正在完成索引，请稍后刷新。'
             : '该索引或目录暂不可用，请刷新重试。';
       } else {
@@ -89,6 +106,10 @@ class ExplorerController extends ChangeNotifier {
     } catch (_) {
       if (!_disposed && generation == _generation) {
         page = null;
+        directory = null;
+        root = null;
+        ancestors = const [];
+        retryAutomatically = true;
         message = '无法读取索引，请检查服务连接后重试。';
       }
     } finally {
@@ -109,11 +130,19 @@ class ExplorerController extends ChangeNotifier {
   }
 
   Future<void> setLargeFiles(bool value) async {
+    treemap = false;
     largeFiles = value;
     page = null;
     if (value && sort == IndexSort.name) {
       sort = allocated ? IndexSort.allocated : IndexSort.logical;
     }
+    await load();
+  }
+
+  Future<void> setTreemap() async {
+    treemap = true;
+    largeFiles = false;
+    page = null;
     await load();
   }
 

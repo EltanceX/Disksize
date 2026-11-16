@@ -1,0 +1,32 @@
+# 阶段 7 树图验证
+
+在仓库根目录加载 `.local/android-env.ps1`，设备需已允许 ADB 调试；本机已授权 shell su，安装使用 `-RootInstall` 避免系统安装器确认：
+
+```powershell
+flutter analyze
+flutter test
+./tools/phase7/verify.ps1 -Serial '<device-id>' -RootInstall
+```
+
+脚本构建正常入口双 ABI debug APK 和树图集成测试 profile APK，通过 `pm install -r` 覆盖安装，再从目标进程日志读取 Dart VM Service URL。使用动态 ADB 转发端口和 `flutter drive --use-existing-app` 附加测试，不经 Flutter 的设备测试安装/卸载流程。结束时移除转发并恢复正常 APK。未授权 shell su 的设备省略 `-RootInstall`，继续使用普通 ADB 安装。
+
+profile 集成测试创建目录、零大小文件、稀疏文件、超过 100 个直接子项，以及含 120 个等大小文件的 Stress 子目录。核验真实索引的有界树图查询、两种容量口径、点击选中、下钻和返回，随后在 101 个矩形上连续点击 40 次，采集 Flutter FrameTiming 和 100 节点布局的平均 CPU 耗时。帧采样在截图转换前结束，避免截图影响记录。帧报告是固定设备和这组交互的基线，不能替代其他设备或复杂目录的性能矩阵。
+
+输出：
+
+- `.local/phase7/device-verify.log`、`drive.log`：构建、安装和测试结果。
+- `.local/phase7/frame-report.json`：帧数、build/raster/total P95、查询耗时、布局均值、矩形数与有界查询条数。
+- `.local/phase7/treemap.png`：profile 样本截图。截图先写入应用自有 external files 目录，再由 ADB shell 读取，兼容不可 `run-as` 的 profile 包。
+- `.local/phase7/app-debug.apk`：恢复用正常入口 APK。
+
+测试正常结束会清理自己的临时目录。若宿主中断或安装恢复提前终止了测试，应根据测试会话的精确根路径检查遗留样本，只清理该次创建的 `files/disksize-phase7-*` 目录，不清理应用扫描记录或其他目录。
+
+独立 SQLite 回归包括 1,003 个直接子项、稀疏文件、共享硬链接、未知元数据、跳过挂载、两种口径与非法查询；每个测试使用独立数据库，不覆盖真实索引：
+
+```powershell
+./android/gradlew.bat -p android :app:assembleDebugAndroidTest :app:testDebugUnitTest
+./tools/install-android-apk.ps1 -Serial '<device-id>' -Apk build/app/outputs/apk/androidTest/debug/app-debug-androidTest.apk -UseRoot
+adb -s '<device-id>' shell am instrument -w -r -e class com.example.disksize.index.IndexStoreTest com.example.disksize.test/androidx.test.runner.AndroidJUnitRunner
+```
+
+运行前先安装当前正常入口 APK，确保测试 APK 与目标应用的 Kotlin 实现一致。Flutter 测试覆盖几何面积、边界、不重叠、点击命中、极大计数、像素聚合、口径切换、迟到响应、revision 变化、状态提示，以及 360×800 双倍字号和 1280×900 分栏布局。

@@ -217,6 +217,45 @@ class IndexStoreTest {
         assertEquals(1000000, recent.getJSONObject(0).getJSONObject("volume").getLong("totalBytes"))
         assertEquals("not-found", query("large-files", 999).getString("status"))
     }
+    @Test fun treemapIsBoundedAndPreservesBothMetricsAndUnknownRanges() = withStore { store ->
+        val id = UUID.randomUUID().toString()
+        val queries = IndexQueries(store)
+        fun query(sort: String = "logical", parent: Long = 1, limit: Int = 100, cursor: String = "") =
+            JSONObject(queries.query(JSONObject().put("sessionId", id).put("kind", "treemap")
+                .put("parentId", parent).put("sort", sort).put("limit", limit).put("cursor", cursor).toString()))
+        store.begin(id, "/fixture", "ordinary", Process.myUid(), Process.myPid()).use {
+            it.node(node(1, 0, "", 4096, 1))
+            assertTrue(query().getBoolean("provisional")); assertFalse(query().has("treemap"))
+            it.node(node(2, 1, "sparse", 1L shl 30, 2).copy(allocated = 0))
+            for (i in 3L..1001L) it.node(node(i, 1, "file-$i", i, i))
+            it.node(node(1002, 1, "unknown", 0, 1002).copy(kind = 0, valid = false, complete = false, allocated = 0))
+            it.node(node(1003, 1, "sparse-alias", 1L shl 30, 2).copy(allocated = 0))
+            it.node(node(1004, 1, "mount", 4096, 1004).copy(kind = 1, complete = false, skip = 1))
+            it.directory(1, true, true, 0); it.flush()
+        }
+        store.finalize(id, StreamSummary("partial", 1004, 0, 1, 2, 0, 1, 1)) { false }
+        val detail = JSONObject(queries.query(JSONObject().put("kind", "detail").put("sessionId", id).put("nodeId", 1).toString())).getJSONObject("detail")
+        for (sort in listOf("logical", "allocated")) {
+            val result = query(sort)
+            assertEquals("ok", result.getString("status")); assertFalse(result.getBoolean("provisional"))
+            assertFalse(result.has("nextCursor")); assertFalse(result.has("previousCursor"))
+            val rows = result.getJSONArray("entries"); assertEquals(100, rows.length())
+            val summary = result.getJSONObject("treemap")
+            assertEquals(1003, summary.getLong("childCount")); assertTrue(summary.getLong("zeroCount") >= 3)
+            assertEquals(2, summary.getLong("unknownCount"))
+            val key = if (sort == "logical") "logicalBytes" else "allocatedBytes"
+            val represented = (0 until rows.length()).sumOf { rows.getJSONObject(it).getLong(key) }
+            assertEquals(detail.getLong(key), summary.getLong("totalBytes"))
+            assertEquals(detail.getLong(key), represented + summary.getLong("otherBytes"))
+            assertTrue(summary.getLong("otherBytes") > 0)
+        }
+        assertEquals(2, query().getJSONArray("entries").getJSONObject(0).getLong("id"))
+        assertEquals("not-found", query(parent = 99999).getString("status"))
+        assertEquals("not-found", query(parent = 2).getString("status"))
+        assertEquals("invalid-query", query(limit = 101).getString("status"))
+        assertEquals("invalid-query", query(sort = "name").getString("status"))
+        assertEquals("invalid-query", query(cursor = "unexpected").getString("status"))
+    }
     @Test fun directoryReplacementRemovesPreviouslyCountedBlocks() = withStore { store ->
         val id = UUID.randomUUID().toString()
         store.begin(id, "/fixture", "ordinary", Process.myUid(), Process.myPid()).use {

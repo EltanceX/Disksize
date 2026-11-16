@@ -7,6 +7,7 @@ import '../../platform/scan_client.dart';
 import 'explorer_controller.dart';
 import 'explorer_detail.dart';
 import 'explorer_format.dart';
+import 'treemap_panel.dart';
 
 class ExplorerPage extends StatefulWidget {
   const ExplorerPage({
@@ -39,11 +40,13 @@ class _ExplorerPageState extends State<ExplorerPage>
 
   void _changed() {
     if (!mounted) return;
-    setState(() {});
+    setState(() {
+      if (c.treemap && c.loading) _selected = null;
+    });
     _poll?.cancel();
     if (_resumed &&
         !c.loading &&
-        (c.page?.session.active == true || c.message != null)) {
+        (c.page?.session.active == true || c.retryAutomatically)) {
       _poll = Timer(const Duration(seconds: 2), () => unawaited(c.refresh()));
     }
   }
@@ -243,24 +246,41 @@ class _ExplorerPageState extends State<ExplorerPage>
                                   runSpacing: 8,
                                   crossAxisAlignment: WrapCrossAlignment.center,
                                   children: [
-                                    SegmentedButton<bool>(
+                                    SegmentedButton<IndexQueryKind>(
                                       segments: const [
                                         ButtonSegment(
-                                          value: false,
+                                          value: IndexQueryKind.children,
                                           label: Text('目录'),
                                         ),
                                         ButtonSegment(
-                                          value: true,
+                                          value: IndexQueryKind.largeFiles,
                                           label: Text('大文件'),
                                         ),
+                                        ButtonSegment(
+                                          value: IndexQueryKind.treemap,
+                                          label: Text('树图'),
+                                        ),
                                       ],
-                                      selected: {c.largeFiles},
+                                      selected: {
+                                        c.treemap
+                                            ? IndexQueryKind.treemap
+                                            : c.largeFiles
+                                            ? IndexQueryKind.largeFiles
+                                            : IndexQueryKind.children,
+                                      },
                                       onSelectionChanged: c.loading
                                           ? null
                                           : (v) {
                                               _selected = null;
                                               unawaited(
-                                                c.setLargeFiles(v.single),
+                                                v.single ==
+                                                        IndexQueryKind.treemap
+                                                    ? c.setTreemap()
+                                                    : c.setLargeFiles(
+                                                        v.single ==
+                                                            IndexQueryKind
+                                                                .largeFiles,
+                                                      ),
                                               );
                                             },
                                     ),
@@ -282,42 +302,47 @@ class _ExplorerPageState extends State<ExplorerPage>
                                               c.setMetric(v.single),
                                             ),
                                     ),
-                                    DropdownButton<IndexSort>(
-                                      key: const Key('explorer-sort'),
-                                      value: c.sort,
-                                      items: [
-                                        const DropdownMenuItem(
-                                          value: IndexSort.logical,
-                                          child: Text('逻辑大小 ↓'),
-                                        ),
-                                        const DropdownMenuItem(
-                                          value: IndexSort.allocated,
-                                          child: Text('报告占用 ↓'),
-                                        ),
-                                        if (!c.largeFiles)
+                                    if (!c.treemap)
+                                      DropdownButton<IndexSort>(
+                                        key: const Key('explorer-sort'),
+                                        value: c.sort,
+                                        items: [
                                           const DropdownMenuItem(
-                                            value: IndexSort.name,
-                                            child: Text('名称 ↑'),
+                                            value: IndexSort.logical,
+                                            child: Text('逻辑大小 ↓'),
                                           ),
-                                      ],
-                                      onChanged: c.loading
-                                          ? null
-                                          : (v) {
-                                              if (v != null) {
-                                                unawaited(c.setSort(v));
-                                              }
-                                            },
-                                    ),
+                                          const DropdownMenuItem(
+                                            value: IndexSort.allocated,
+                                            child: Text('报告占用 ↓'),
+                                          ),
+                                          if (!c.largeFiles)
+                                            const DropdownMenuItem(
+                                              value: IndexSort.name,
+                                              child: Text('名称 ↑'),
+                                            ),
+                                        ],
+                                        onChanged: c.loading
+                                            ? null
+                                            : (v) {
+                                                if (v != null) {
+                                                  unawaited(c.setSort(v));
+                                                }
+                                              },
+                                      ),
                                   ],
                                 ),
                                 const SizedBox(height: 8),
                                 Text(
-                                  c.largeFiles
+                                  c.treemap
+                                      ? '当前目录的矩形树图 · 面积随容量变化'
+                                      : c.largeFiles
                                       ? '当前目录及其子目录中的普通文件 · 容量从大到小'
                                       : '当前目录的直接子项 · 点击文件夹进入',
                                 ),
-                                const Text(
-                                  '容量条表示所选口径占当前目录的比例；未知容量不视为零。',
+                                Text(
+                                  c.treemap
+                                      ? '点击色块选中项目；通过下方按钮进入目录，返回键逐级返回。'
+                                      : '容量条表示所选口径占当前目录的比例；未知容量不视为零。',
                                   style: TextStyle(fontSize: 12),
                                 ),
                                 if (c.message != null)
@@ -334,7 +359,26 @@ class _ExplorerPageState extends State<ExplorerPage>
                             ),
                           ),
                         ),
-                        if (c.page != null &&
+                        if (c.treemap &&
+                            c.page != null &&
+                            c.directory != null &&
+                            !c.loading)
+                          SliverToBoxAdapter(
+                            child: TreemapPanel(
+                              key: ValueKey('treemap-${c.directoryId}'),
+                              page: c.page!,
+                              directory: c.directory!,
+                              allocated: c.allocated,
+                              onSelect: (entry) =>
+                                  setState(() => _selected = entry?.id),
+                              onOpen: (entry) => _navigate(entry.id),
+                              onDetail: (entry) => _detail(entry.id, wide),
+                              onShowList: () =>
+                                  unawaited(c.setLargeFiles(false)),
+                            ),
+                          ),
+                        if (!c.treemap &&
+                            c.page != null &&
                             c.page!.entries.isEmpty &&
                             !c.loading)
                           SliverToBoxAdapter(
@@ -347,36 +391,37 @@ class _ExplorerPageState extends State<ExplorerPage>
                               ),
                             ),
                           ),
-                        SliverList.builder(
-                          itemCount: c.page?.entries.length ?? 0,
-                          itemBuilder: (context, i) {
-                            final entry = c.page!.entries[i];
-                            final total = c.allocated
-                                ? c.directory?.entry.allocatedBytes
-                                : c.directory?.entry.logicalBytes;
-                            final amount = c.allocated
-                                ? entry.allocatedBytes
-                                : entry.logicalBytes;
-                            final fraction =
-                                total != null &&
-                                    total > 0 &&
-                                    !c.page!.provisional &&
-                                    entry.metadataValid
-                                ? amount / total
-                                : null;
-                            return _EntryRow(
-                              entry: entry,
-                              allocated: c.allocated,
-                              fraction: fraction,
-                              index: i,
-                              selected: entry.id == _selected,
-                              onTap: () => entry.kind == 'directory'
-                                  ? _navigate(entry.id)
-                                  : _detail(entry.id, wide),
-                              onDetail: () => _detail(entry.id, wide),
-                            );
-                          },
-                        ),
+                        if (!c.treemap)
+                          SliverList.builder(
+                            itemCount: c.page?.entries.length ?? 0,
+                            itemBuilder: (context, i) {
+                              final entry = c.page!.entries[i];
+                              final total = c.allocated
+                                  ? c.directory?.entry.allocatedBytes
+                                  : c.directory?.entry.logicalBytes;
+                              final amount = c.allocated
+                                  ? entry.allocatedBytes
+                                  : entry.logicalBytes;
+                              final fraction =
+                                  total != null &&
+                                      total > 0 &&
+                                      !c.page!.provisional &&
+                                      entry.metadataValid
+                                  ? amount / total
+                                  : null;
+                              return _EntryRow(
+                                entry: entry,
+                                allocated: c.allocated,
+                                fraction: fraction,
+                                index: i,
+                                selected: entry.id == _selected,
+                                onTap: () => entry.kind == 'directory'
+                                    ? _navigate(entry.id)
+                                    : _detail(entry.id, wide),
+                                onDetail: () => _detail(entry.id, wide),
+                              );
+                            },
+                          ),
                         if (session != null && c.root != null)
                           SliverToBoxAdapter(
                             child: _VolumeComparison(
@@ -387,8 +432,7 @@ class _ExplorerPageState extends State<ExplorerPage>
                       ],
                     ),
                   ),
-                  const Divider(height: 1),
-                  _pagination(),
+                  if (!c.treemap) ...[const Divider(height: 1), _pagination()],
                 ],
               );
               if (!wide) return list;
