@@ -26,6 +26,28 @@ class ExplorerController extends ChangeNotifier {
 
   Future<void> refresh() => load(cursor: _cursor, number: pageNumber);
 
+  /// Completed indexes are immutable. Revalidate after backgrounding without
+  /// discarding selection, scroll position or pagination when nothing changed.
+  Future<void> resume() async {
+    if (loading || _disposed) return;
+    final current = page;
+    if (current == null || current.session.active || retryAutomatically) {
+      await refresh();
+      return;
+    }
+    final generation = _generation;
+    try {
+      final metadata = await client.query(request(IndexQueryKind.session));
+      if (_disposed || generation != _generation) return;
+      if (metadata.status == 'ok' && metadata.revision == current.revision) {
+        return;
+      }
+    } catch (_) {
+      if (_disposed || generation != _generation) return;
+    }
+    await refresh();
+  }
+
   IndexRequest request(IndexQueryKind kind, {int nodeId = 0, String? cursor}) =>
       IndexRequest(
         sessionId: sessionId,

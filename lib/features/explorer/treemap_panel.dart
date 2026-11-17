@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/semantics.dart';
 
 import '../../platform/index_client.dart';
@@ -31,7 +32,7 @@ class TreemapPanel extends StatefulWidget {
 
 class _TreemapPanelState extends State<TreemapPanel> {
   int? _selected;
-  int? _previousTapId, _tapId;
+  int? _tapId;
 
   @override
   void didUpdateWidget(TreemapPanel oldWidget) {
@@ -41,7 +42,7 @@ class _TreemapPanelState extends State<TreemapPanel> {
         oldWidget.allocated != widget.allocated ||
         oldWidget.depth != widget.depth) {
       _selected = null;
-      _previousTapId = _tapId = null;
+      _tapId = null;
     }
   }
 
@@ -59,6 +60,7 @@ class _TreemapPanelState extends State<TreemapPanel> {
         : displayScanPath(entry.nameHex);
     final selected = entries[_selected];
     void select(int id) {
+      if (_selected == id) return;
       setState(() => _selected = id);
       widget.onSelect(entries[id]);
     }
@@ -117,36 +119,44 @@ class _TreemapPanelState extends State<TreemapPanel> {
                     rootLabel: entryLabel(widget.directory.entry),
                   );
                   return RepaintBoundary(
-                    child: GestureDetector(
+                    child: RawGestureDetector(
                       key: const Key('treemap-canvas'),
                       behavior: HitTestBehavior.opaque,
-                      onTapUp: (event) {
-                        final tile = hitTreemap(tiles, event.localPosition);
-                        if (tile != null) select(tile.item.id);
+                      gestures: {
+                        SerialTapGestureRecognizer:
+                            GestureRecognizerFactoryWithHandlers<
+                              SerialTapGestureRecognizer
+                            >(
+                              () => SerialTapGestureRecognizer(
+                                allowedButtonsFilter: (buttons) =>
+                                    buttons == kPrimaryButton,
+                              ),
+                              (recognizer) => recognizer
+                                ..onSerialTapCancel = (_) {
+                                  _tapId = null;
+                                }
+                                ..onSerialTapUp = (event) {
+                                  final id = hitTreemap(
+                                    tiles,
+                                    event.localPosition,
+                                  )?.item.id;
+                                  final previous = _tapId;
+                                  _tapId = id;
+                                  if (id == null) return;
+                                  // Select on every completed tap, without waiting
+                                  // for the double-tap timeout. Drags still cancel.
+                                  select(id);
+                                  final entry = entries[id];
+                                  if (event.count > 1 &&
+                                      previous == id &&
+                                      entry?.kind == 'directory' &&
+                                      entry!.id != widget.directory.entry.id) {
+                                    widget.onOpen(entry);
+                                  }
+                                },
+                            ),
                       },
-                      onDoubleTap: () {
-                        final id = _tapId;
-                        if (id == null) return;
-                        select(id);
-                        final entry = entries[id];
-                        if (_previousTapId == id &&
-                            entry?.kind == 'directory' &&
-                            entry!.id != widget.directory.entry.id) {
-                          widget.onOpen(entry);
-                        }
-                      },
-                      child: Listener(
-                        // The canvas shares one recognizer across all tiles.
-                        // Both taps must hit the same tile before opening it.
-                        onPointerDown: (event) {
-                          _previousTapId = _tapId;
-                          _tapId = hitTreemap(
-                            tiles,
-                            event.localPosition,
-                          )?.item.id;
-                        },
-                        child: CustomPaint(size: size, painter: painter),
-                      ),
+                      child: CustomPaint(size: size, painter: painter),
                     ),
                   );
                 },

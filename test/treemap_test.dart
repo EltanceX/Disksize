@@ -7,7 +7,6 @@ import 'package:disksize/features/explorer/treemap_layout.dart';
 import 'package:disksize/features/explorer/treemap_panel.dart';
 import 'package:disksize/platform/index_client.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/gestures.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'explorer_test.dart' show ExplorerFixture;
@@ -162,9 +161,9 @@ void main() {
       tester.getTopLeft(find.byKey(const Key('treemap-canvas'))) +
           tile.rect.center,
     );
-    await tester.pump(kDoubleTapTimeout);
-    await tester.pumpAndSettle();
+    await tester.pump();
     expect(painter(tester).selected, 2);
+    await tester.pumpAndSettle();
     await tester.ensureVisible(find.byKey(const Key('treemap-open')));
     await tester.pumpAndSettle();
     await tester.tap(find.byKey(const Key('treemap-open')));
@@ -190,7 +189,6 @@ void main() {
       tester.getTopLeft(find.byKey(const Key('treemap-canvas'))) +
           child.rect.center,
     );
-    await tester.pump(kDoubleTapTimeout);
     await tester.pumpAndSettle();
     await tester.ensureVisible(find.byKey(const Key('treemap-detail')));
     await tester.pumpAndSettle();
@@ -211,6 +209,67 @@ void main() {
     expect(tester.takeException(), isNull);
     await tester.pumpWidget(const SizedBox());
   });
+
+  testWidgets(
+    'focus loss preserves selection and scroll; background only checks revision',
+    (tester) async {
+      final f = ExplorerFixture();
+      await tester.pumpWidget(
+        MaterialApp(
+          home: ExplorerPage(client: f, sessionId: 'fixture'),
+        ),
+      );
+      await tester.pumpAndSettle();
+      await tester.ensureVisible(find.text('树图'));
+      await tester.tap(find.text('树图'));
+      await tester.pumpAndSettle();
+      final canvas = find.byKey(const Key('treemap-canvas'));
+      await tester.ensureVisible(canvas);
+      await tester.pumpAndSettle();
+      final tile = painter(tester).tiles
+          .firstWhere((tile) => tile.item.id == 3);
+      await tester.tapAt(tester.getTopLeft(canvas) + tile.hitRect.center);
+      await tester.pump();
+      expect(painter(tester).selected, 3);
+      await tester.pumpAndSettle();
+      final element = canvas.evaluate().single;
+      final offset = tester.getTopLeft(canvas);
+      f.requests.clear();
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+      await tester.pump(const Duration(seconds: 1));
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+      await tester.pumpAndSettle();
+      expect(f.requests, isEmpty);
+      expect(painter(tester).selected, 3);
+      expect(identical(canvas.evaluate().single, element), isTrue);
+      expect(tester.getTopLeft(canvas), offset);
+      for (final state in [
+        AppLifecycleState.inactive,
+        AppLifecycleState.hidden,
+        AppLifecycleState.paused,
+        AppLifecycleState.hidden,
+        AppLifecycleState.inactive,
+        AppLifecycleState.resumed,
+      ]) {
+        tester.binding.handleAppLifecycleStateChanged(state);
+      }
+      await tester.pumpAndSettle();
+      expect(f.requests.single.kind, IndexQueryKind.session);
+      expect(painter(tester).selected, 3);
+      expect(identical(canvas.evaluate().single, element), isTrue);
+      expect(tester.getTopLeft(canvas), offset);
+      final gesture = await tester.startGesture(
+        tester.getTopLeft(canvas) + tile.hitRect.center,
+      );
+      await gesture.moveBy(const Offset(0, -60));
+      await gesture.moveBy(const Offset(0, -40));
+      await gesture.up();
+      await tester.pumpAndSettle();
+      expect(painter(tester).selected, 3);
+      expect(tester.getTopLeft(canvas).dy, lessThan(offset.dy));
+      await tester.pumpWidget(const SizedBox());
+    },
+  );
 
   for (final state in ['provisional', 'zero', 'partial', 'expired']) {
     testWidgets('tree state is explicit: $state', (tester) async {

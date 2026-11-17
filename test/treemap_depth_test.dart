@@ -258,9 +258,9 @@ void main() {
         tester.getTopLeft(find.byKey(const Key('treemap-canvas'))) +
             leaf.rect.center,
       );
-      await tester.pump(kDoubleTapTimeout);
-      await tester.pumpAndSettle();
+      await tester.pump();
       expect(painter(tester).selected, 5);
+      await tester.pumpAndSettle();
       await tester.scrollUntilVisible(
         find.byKey(const Key('treemap-depth')),
         -200,
@@ -283,9 +283,9 @@ void main() {
         tester.getTopLeft(find.byKey(const Key('treemap-canvas'))) +
             painter(tester).tiles.single.rect.center,
       );
-      await tester.pump(kDoubleTapTimeout);
-      await tester.pumpAndSettle();
+      await tester.pump();
       expect(painter(tester).selected, 1);
+      await tester.pumpAndSettle();
       expect(
         find.descendant(
           of: find.byType(TreemapPanel),

@@ -16,14 +16,19 @@ class _UnusedDiagnostics implements DiagnosticsClient {
 }
 
 class _Library implements IndexClient {
+  int reads = 0;
   @override
-  Future<List<IndexSession>> recent() async => [
-    IndexSession.fromJson({
-      'sessionId': 'previous',
-      'rootPath': '/previous',
-      'state': 'completed',
-    }),
-  ];
+  Future<List<IndexSession>> recent() async {
+    reads++;
+    return [
+      IndexSession.fromJson({
+        'sessionId': 'previous',
+        'rootPath': '/previous',
+        'state': 'completed',
+      }),
+    ];
+  }
+
   @override
   Future<List<StorageEntry>> volumes() async => [
     StorageEntry.fromJson({
@@ -87,6 +92,9 @@ ScanSnapshot view(String state, {bool active = false}) => ScanSnapshot(
 class _Client implements ScanClient {
   ScanSnapshot? value;
   int reads = 0;
+  int accessReads = 0;
+  bool notificationGranted = false;
+  Future<void> Function()? notificationRequest;
   bool fail = false;
   String? startedPath;
   String? startedSource;
@@ -99,14 +107,18 @@ class _Client implements ScanClient {
   );
   Completer<ScanSnapshot?>? pending;
   @override
-  Future<ScanAccessStatus> accessStatus() async => ScanAccessStatus(
-    apiLevel: 36,
-    ownPath: '/own',
-    sharedPath: '/shared',
-    sharedAccessGranted: false,
-    legacyStorage: false,
-    notificationGranted: false,
-  );
+  Future<ScanAccessStatus> accessStatus() async {
+    accessReads++;
+    return ScanAccessStatus(
+      apiLevel: 36,
+      ownPath: '/own',
+      sharedPath: '/shared',
+      sharedAccessGranted: false,
+      legacyStorage: false,
+      notificationGranted: notificationGranted,
+    );
+  }
+
   @override
   Future<ScanSnapshot?> snapshot() async {
     reads++;
@@ -130,7 +142,10 @@ class _Client implements ScanClient {
   }
 
   @override
-  Future<void> requestNotificationAccess() async {}
+  Future<void> requestNotificationAccess() async {
+    await notificationRequest?.call();
+  }
+
   @override
   Future<void> requestStorageAccess() async {}
   @override
@@ -150,6 +165,71 @@ Widget _page(_Client client) => MaterialApp(
 );
 
 void main() {
+  testWidgets(
+    'permission results received while inactive refresh once on resume',
+    (tester) async {
+      final client = _Client()..value = view('completed');
+      client.notificationRequest = () async {
+        tester.binding.handleAppLifecycleStateChanged(
+          AppLifecycleState.inactive,
+        );
+        client.notificationGranted = true;
+      };
+      await tester.pumpWidget(
+        MaterialApp(
+          home: ScanDashboardPage(
+            client: client,
+            diagnosticsClient: _UnusedDiagnostics(),
+            indexClient: _Library(),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      await tester.scrollUntilVisible(
+        find.byKey(const Key('notification-permission')),
+        200,
+        scrollable: find.byType(Scrollable).first,
+      );
+      final reads = client.accessReads;
+      await tester.ensureVisible(
+        find.byKey(const Key('notification-permission')),
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const Key('notification-permission')));
+      await tester.pumpAndSettle();
+      expect(client.accessReads, reads);
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+      await tester.pumpAndSettle();
+      expect(client.accessReads, reads + 1);
+      expect(find.byKey(const Key('notification-permission')), findsNothing);
+      await tester.pumpWidget(const SizedBox());
+    },
+  );
+  testWidgets('notification shade does not reread idle dashboard or library', (
+    tester,
+  ) async {
+    final client = _Client()..value = view('completed');
+    final library = _Library();
+    await tester.pumpWidget(
+      MaterialApp(
+        home: ScanDashboardPage(
+          client: client,
+          diagnosticsClient: _UnusedDiagnostics(),
+          indexClient: library,
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    final reads = client.reads;
+    final libraryReads = library.reads;
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+    await tester.pump(const Duration(seconds: 1));
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+    await tester.pumpAndSettle();
+    expect(client.reads, reads);
+    expect(library.reads, libraryReads);
+    await tester.pumpWidget(const SizedBox());
+  });
   testWidgets(
     'volume selection preserves permission checks and recent sessions open',
     (tester) async {

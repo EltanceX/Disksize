@@ -14,13 +14,15 @@ String hex(String value) =>
 
 class ExplorerFixture implements IndexClient {
   final requests = <IndexRequest>[];
+  int revision = 1;
+  String state = 'completed';
   Future<IndexPage>? Function(IndexRequest)? intercept;
   Map<String, dynamic> metadata() => {
     'status': 'ok',
     'sessionId': 'fixture',
-    'revision': 1,
+    'revision': revision,
     'provisional': false,
-    'state': 'completed',
+    'state': state,
     'rootPath': '/data/fixture',
     'startedAtMillis': 1000,
     'endedAtMillis': 2000,
@@ -124,6 +126,76 @@ class ExplorerFixture implements IndexClient {
 }
 
 void main() {
+  test('resume preserves an unchanged page and refreshes changed or deleted indexes', () async {
+    final client = ExplorerFixture();
+    final c = ExplorerController(client, 'fixture');
+    await c.load(cursor: 'next', number: 2);
+    final page = c.page;
+    var changes = 0;
+    c.addListener(() => changes++);
+    client.requests.clear();
+    await c.resume();
+    expect(client.requests.single.kind, IndexQueryKind.session);
+    expect(identical(c.page, page), isTrue);
+    expect(changes, 0);
+    expect(c.pageNumber, 2);
+    client.revision++;
+    await c.resume();
+    expect(c.page!.revision, 2);
+    expect(c.pageNumber, 2);
+    expect(client.requests.any((r) => r.cursor == 'next'), isTrue);
+    client.intercept = (_) =>
+        Future.value(IndexPage.fromJson({'status': 'not-found'}));
+    await c.resume();
+    expect(c.page, isNull);
+    expect(c.message, contains('已不可用'));
+    c.dispose();
+  });
+  test(
+    'a late resume check cannot refresh a newly navigated directory',
+    () async {
+      final client = ExplorerFixture();
+      final c = ExplorerController(client, 'fixture');
+      await c.load();
+      final pending = Completer<IndexPage>();
+      client.intercept = (r) =>
+          r.kind == IndexQueryKind.session ? pending.future : null;
+      final resumed = c.resume();
+      await c.navigate(2);
+      final reads = client.requests.length;
+      pending.complete(
+        IndexPage.fromJson({...client.metadata(), 'revision': 2}),
+      );
+      await resumed;
+      expect(c.directoryId, 2);
+      expect(c.page!.entries.single.id, 4);
+      expect(client.requests.length, reads);
+      c.dispose();
+    },
+  );
+  testWidgets('active index polling restarts after transient focus loss', (
+    tester,
+  ) async {
+    final client = ExplorerFixture()..state = 'running';
+    await tester.pumpWidget(
+      MaterialApp(
+        home: ExplorerPage(client: client, sessionId: 'fixture'),
+      ),
+    );
+    await tester.pump();
+    await tester.pump();
+    final reads = client.requests.length;
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+    await tester.pump(const Duration(seconds: 3));
+    expect(client.requests.length, reads);
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+    await tester.pump();
+    expect(client.requests.length, reads);
+    await tester.pump(const Duration(seconds: 2));
+    await tester.pump();
+    expect(client.requests.length, greaterThan(reads));
+    await tester.pumpWidget(const SizedBox());
+  });
   test('a late directory response cannot replace newer navigation', () async {
     final client = ExplorerFixture();
     final pending = Completer<IndexPage>();

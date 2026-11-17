@@ -28,6 +28,7 @@ class _ExplorerPageState extends State<ExplorerPage>
   Timer? _poll;
   final _scroll = ScrollController();
   bool _resumed = true;
+  bool _backgrounded = false;
 
   @override
   void initState() {
@@ -43,6 +44,10 @@ class _ExplorerPageState extends State<ExplorerPage>
     setState(() {
       if (c.treemap && c.loading) _selected = null;
     });
+    _schedulePoll();
+  }
+
+  void _schedulePoll() {
     _poll?.cancel();
     if (_resumed &&
         !c.loading &&
@@ -54,8 +59,18 @@ class _ExplorerPageState extends State<ExplorerPage>
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     _resumed = state == AppLifecycleState.resumed;
+    if (state == AppLifecycleState.hidden ||
+        state == AppLifecycleState.paused) {
+      _backgrounded = true;
+    }
     _poll?.cancel();
-    if (_resumed) unawaited(c.load());
+    if (!_resumed) return;
+    if (_backgrounded) {
+      _backgrounded = false;
+      unawaited(c.resume());
+    } else {
+      _schedulePoll();
+    }
   }
 
   void _navigate(int id) {

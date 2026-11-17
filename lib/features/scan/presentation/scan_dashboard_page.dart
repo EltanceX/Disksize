@@ -41,6 +41,7 @@ class _ScanDashboardPageState extends State<ScanDashboardPage>
   bool _busy = false;
   bool _refreshing = false;
   bool _resumed = true;
+  bool _refreshAfterResume = false;
   Timer? _poll;
   late final IndexClient _index;
   List<IndexSession> _recent = const [];
@@ -62,10 +63,18 @@ class _ScanDashboardPageState extends State<ScanDashboardPage>
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     _resumed = state == AppLifecycleState.resumed;
+    if (state == AppLifecycleState.hidden ||
+        state == AppLifecycleState.paused) {
+      _refreshAfterResume = true;
+    }
     _poll?.cancel();
-    if (_resumed) {
+    if (!_resumed) return;
+    if (_refreshAfterResume) {
+      _refreshAfterResume = false;
       unawaited(_refresh());
       unawaited(_refreshLibrary());
+    } else {
+      _schedulePoll();
     }
   }
 
@@ -105,7 +114,11 @@ class _ScanDashboardPageState extends State<ScanDashboardPage>
   }
 
   Future<void> _refresh() async {
-    if (_refreshing || !mounted || !_resumed) return;
+    if (_refreshing || !mounted) return;
+    if (!_resumed) {
+      _refreshAfterResume = true;
+      return;
+    }
     _refreshing = true;
     try {
       final values = await Future.wait<Object?>([

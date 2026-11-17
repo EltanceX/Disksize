@@ -7,10 +7,30 @@ import 'package:disksize/features/explorer/treemap_panel.dart';
 import 'package:disksize/platform/index_client.dart';
 import 'package:disksize/platform/scan_client.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/gestures.dart';
 import 'package:flutter/scheduler.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:integration_test/integration_test.dart';
+
+class _RecordedIndex implements IndexClient {
+  final IndexClient delegate = AndroidIndexClient();
+  final requests = <IndexQueryKind>[];
+  @override
+  Future<IndexPage> query(IndexRequest request) {
+    requests.add(request.kind);
+    return delegate.query(request);
+  }
+
+  @override
+  Future<List<IndexSession>> recent() => delegate.recent();
+  @override
+  Future<List<StorageEntry>> volumes() => delegate.volumes();
+}
+
+class _LifecycleObserver with WidgetsBindingObserver {
+  final states = <AppLifecycleState>[];
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) => states.add(state);
+}
 
 void main() {
   final binding = IntegrationTestWidgetsFlutterBinding.ensureInitialized();
@@ -18,7 +38,9 @@ void main() {
     tester,
   ) async {
     final scan = AndroidScanClient();
-    final index = AndroidIndexClient();
+    final index = _RecordedIndex();
+    final lifecycle = _LifecycleObserver();
+    binding.addObserver(lifecycle);
     await tester.pumpWidget(
       const MaterialApp(home: Scaffold(body: Text('Preparing treemap'))),
     );
@@ -133,6 +155,47 @@ void main() {
                   )
                   .painter!
               as TreemapPainter;
+      final lifecycleResults = <String, Object>{};
+      Future<void> deviceRoundTrip(String action) async {
+        final ack = File('${access.externalOwnPath!}/phase7-$action.done');
+        if (await ack.exists()) await ack.delete();
+        final canvas = find.byKey(const Key('treemap-canvas'));
+        final element = canvas.evaluate().single;
+        final offset = tester.getTopLeft(canvas);
+        final selected = painter().selected;
+        final reads = index.requests.length;
+        lifecycle.states.clear();
+        debugPrint('PHASE7_${action.toUpperCase()}_READY');
+        final deadline = DateTime.now().add(const Duration(seconds: 25));
+        while (!await ack.exists() ||
+            binding.lifecycleState != AppLifecycleState.resumed) {
+          if (DateTime.now().isAfter(deadline)) {
+            throw StateError('Host did not complete $action');
+          }
+          await Future<void>.delayed(const Duration(milliseconds: 100));
+        }
+        await tester.pumpAndSettle();
+        debugPrint(
+          'PHASE7_${action.toUpperCase()}_STATES ${lifecycle.states.map((s) => s.name).toList()}',
+        );
+        expect(lifecycle.states, contains(AppLifecycleState.inactive));
+        expect(lifecycle.states.last, AppLifecycleState.resumed);
+        if (action == 'background') {
+          expect(lifecycle.states, contains(AppLifecycleState.paused));
+        }
+        final queries = index.requests.skip(reads).toList();
+        expect(queries.every((kind) => kind == IndexQueryKind.session), isTrue);
+        expect(queries.length, lessThanOrEqualTo(1));
+        expect(identical(canvas.evaluate().single, element), isTrue);
+        expect(painter().selected, selected);
+        expect(tester.getTopLeft(canvas), offset);
+        lifecycleResults['${action}Lifecycle'] = lifecycle.states
+            .map((s) => s.name)
+            .toList();
+        lifecycleResults['${action}MetadataQueries'] = queries.length;
+        await ack.delete();
+      }
+
       await tester.pumpAndSettle();
       await reveal(find.text('树图'));
       await tester.tap(find.text('树图'));
@@ -150,8 +213,13 @@ void main() {
         tester.getTopLeft(find.byKey(const Key('treemap-canvas'))) +
             folder.hitRect.center,
       );
-      await tester.pump(kDoubleTapTimeout);
+      await tester.pump();
+      expect(painter().selected, folder.item.id);
       await tester.pumpAndSettle();
+      if (const bool.fromEnvironment('PHASE7_LIFECYCLE')) {
+        await deviceRoundTrip('shade');
+        await deviceRoundTrip('background');
+      }
       await reveal(find.byKey(const Key('treemap-open')));
       await tester.tap(find.byKey(const Key('treemap-open')));
       await tester.pumpAndSettle();
@@ -174,8 +242,8 @@ void main() {
           tester.getTopLeft(find.byKey(const Key('treemap-canvas'))) +
               tile.hitRect.center,
         );
-        await tester.pump(kDoubleTapTimeout);
         await tester.pump();
+        expect(painter().selected, tile.item.id);
         await Future<void>.delayed(const Duration(milliseconds: 25));
       }
       await tester.pumpAndSettle();
@@ -188,6 +256,8 @@ void main() {
       }
 
       binding.reportData = {
+        ...lifecycleResults,
+        'immediateSelection': true,
         'sessionId': id,
         'frames': frames.length,
         'buildP95Micros': percentile(
@@ -284,9 +354,14 @@ void main() {
       debugPrint('PHASE7_TREEMAP_OK ${binding.reportData}');
       expect(tester.takeException(), isNull);
     } finally {
+      binding.removeObserver(lifecycle);
       SchedulerBinding.instance.removeTimingsCallback(record);
       await tester.pumpWidget(const SizedBox());
       await fixture.delete(recursive: true);
+      for (final action in ['shade', 'background']) {
+        final ack = File('${access.externalOwnPath!}/phase7-$action.done');
+        if (await ack.exists()) await ack.delete();
+      }
     }
   });
 }
