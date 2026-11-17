@@ -230,6 +230,7 @@ class _SnapshotsPageState extends State<SnapshotsPage> {
                   const Text(
                     '完成及部分完成的扫描会自动保存为快照。保留标记可防止误删；取消保留后才能删除。扫描记录反映一段时间内的观察，并非文件系统原子快照。',
                   ),
+                  const Text('快照大小为本地保存记录的估算占用；删除后空间可复用，不代表立即释放的空间。'),
                   if (!_selecting)
                     Align(
                       alignment: Alignment.centerLeft,
@@ -338,6 +339,10 @@ class _SnapshotsPageState extends State<SnapshotsPage> {
                             ),
                             Text(
                               '逻辑 ${formatBytes(item.logical)} · 报告占用 ${formatBytes(item.allocated)}${item.complete ? '' : '（已知量）'}',
+                            ),
+                            Text(
+                              '快照大小（估算）：${item.estimatedStorageBytes == null ? '暂不可用' : formatBytes(item.estimatedStorageBytes!)}',
+                              key: ValueKey('snapshot-size-${item.id}'),
                             ),
                             if (!item.available) const Text('索引不可用，请重新扫描。'),
                             if (!_selecting)

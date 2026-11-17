@@ -131,12 +131,22 @@ void main() {
     await tapVisible(tester, find.text('更早快照'));
     await tapVisible(tester, find.byKey(const Key('snapshot-select-b')));
     await tapVisible(tester, find.text('回到最新'));
+    await tester.scrollUntilVisible(
+      find.byKey(const Key('snapshot-select-d')),
+      -300,
+    );
+    await tester.pumpAndSettle();
     expect(
       tester
           .widget<CheckboxListTile>(find.byKey(const Key('snapshot-select-d')))
           .value,
       isFalse,
     );
+    await tester.scrollUntilVisible(
+      find.byKey(const Key('snapshot-select-all')),
+      -300,
+    );
+    await tester.pumpAndSettle();
     expect(
       tester
           .widget<CheckboxListTile>(

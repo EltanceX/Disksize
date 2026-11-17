@@ -4,6 +4,7 @@ import android.database.sqlite.SQLiteDatabase
 import android.util.Base64
 import org.json.JSONArray
 import org.json.JSONObject
+import kotlin.math.roundToLong
 
 /** One disposable on-disk comparison. Each call merges at most 512 raw-byte paths. */
 internal class SnapshotQueries(private val store: IndexStore) {
@@ -53,18 +54,33 @@ internal class SnapshotQueries(private val store: IndexStore) {
             args.add(c.getLong("created").toString()); args.add(uuid(c, "snapshotId")); "WHERE (created,id)<(?,?)"
         }
         args.add((limit + 1).toString())
+        val storage = storageEstimate(db)
         val result = JSONArray(); var next: String? = null
         db.rawQuery("SELECT id,created FROM snapshots $after ORDER BY created DESC,id DESC LIMIT ?", args.toTypedArray()).use {
             while (it.moveToNext()) {
                 if (result.length() == limit) break
-                snapshot(db, it.getString(0))?.let(result::put)
+                snapshot(db, it.getString(0), storage)?.let(result::put)
                 if (result.length() == limit && !it.isLast) next = encode(JSONObject().put("version", 1).put("kind", "snapshots")
                     .put("created", it.getLong(1)).put("snapshotId", it.getString(0)))
             }
         }
         return response("ok").put("snapshots", result).put("nextCursor", next)
     }
-    private fun snapshot(db: SQLiteDatabase, id: String): JSONObject? = db.rawQuery("""SELECT p.*,s.root,s.backend,s.state,s.started,s.ended,s.identity,
+    // All sessions share table/index pages. Attribute used pages by stored
+    // node/issue counts, including unfinished sessions; this is not reclaimable
+    // filesystem space or an exact measurement of an individual snapshot.
+    private data class StorageEstimate(val usedBytes: Long, val records: Long) {
+        fun bytes(nodes: Long, issues: Long): Long =
+            if (records == 0L) 0L else (usedBytes * ((nodes + issues + 1).toDouble() / records)).roundToLong().coerceIn(0, usedBytes)
+    }
+    private fun storageEstimate(db: SQLiteDatabase): StorageEstimate {
+        fun pragma(name: String) = db.rawQuery("PRAGMA $name", null).use { it.moveToFirst(); it.getLong(0) }
+        val used = (pragma("page_count") - pragma("freelist_count")).coerceAtLeast(0) * pragma("page_size")
+        val records = db.rawQuery("SELECT COALESCE(SUM(nodes+issues+1),0) FROM sessions", null).use { it.moveToFirst(); it.getLong(0) }
+        return StorageEstimate(used, records)
+    }
+    private fun snapshot(db: SQLiteDatabase, id: String, storage: StorageEstimate? = null): JSONObject? = db.rawQuery("""SELECT p.*,s.root,s.backend,s.state,s.started,s.ended,s.identity,
+        s.nodes AS stored_nodes,s.issues AS stored_issues,
         s.revision AS current_revision,s.provisional,s.metrics,n.device,n.valid FROM snapshots p JOIN sessions s ON s.id=p.sid
         LEFT JOIN nodes n ON n.sid=s.id AND n.id=1 WHERE p.id=?""", arrayOf(id)).use { c ->
         if (!c.moveToFirst()) return null
@@ -78,6 +94,7 @@ internal class SnapshotQueries(private val store: IndexStore) {
         JSONObject().put("id", id).put("sessionId", text("sid")).put("rootPath", text("root")).put("backend", text("backend"))
             .put("state", text("state")).put("startedAtMillis", number("started")).put("endedAtMillis", number("ended"))
             .put("createdAtMillis", number("created")).put("logicalBytes", number("logical")).put("allocatedBytes", number("allocated"))
+            .put("estimatedStorageBytes", storage?.bytes(number("stored_nodes"), number("stored_issues")) ?: JSONObject.NULL)
             .put("complete", number("complete") == 1L && text("state") == "completed").put("retained", number("retained") == 1L)
             .put("revision", number("revision")).put("identity", identity)
             .put("available", number("revision") == number("current_revision") && number("provisional") == 0L && text("state") in setOf("completed", "partial"))

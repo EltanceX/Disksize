@@ -12,11 +12,13 @@ final class DiskSnapshot {
       ended = json['endedAtMillis'] as int,
       logical = json['logicalBytes'] as int,
       allocated = json['allocatedBytes'] as int,
+      estimatedStorageBytes = json['estimatedStorageBytes'] as int?,
       complete = json['complete'] as bool,
       retained = json['retained'] as bool,
       available = json['available'] as bool;
   final String id, rootPath, backend, state;
   final int started, ended, logical, allocated;
+  final int? estimatedStorageBytes;
   final bool complete, retained, available;
 }
 

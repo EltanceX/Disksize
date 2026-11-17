@@ -14,6 +14,7 @@ Map<String, dynamic> snapshot(String id, {bool retained = false}) => {
   'endedAtMillis': 2000,
   'logicalBytes': 10,
   'allocatedBytes': 4096,
+  'estimatedStorageBytes': 32768,
   'complete': true,
   'retained': retained,
   'available': true,
@@ -101,6 +102,8 @@ void main() {
       ),
     );
     await tester.pumpAndSettle();
+    expect(find.text('快照大小（估算）：32.0 KiB'), findsNWidgets(2));
+    expect(find.text('逻辑 10 B · 报告占用 4.0 KiB'), findsNWidgets(2));
     await tester.tap(find.text('保留快照').first);
     await tester.pumpAndSettle();
     expect(fixture.retained, isTrue);
@@ -131,6 +134,7 @@ void main() {
     await tester.tap(find.text('设为基准').first);
     await tester.pumpAndSettle();
     await tester.ensureVisible(find.text('作为新快照对比').last);
+    await tester.pumpAndSettle();
     await tester.tap(find.text('作为新快照对比').last);
     await tester.pumpAndSettle();
     expect(find.text('总差额：未知'), findsOneWidget);

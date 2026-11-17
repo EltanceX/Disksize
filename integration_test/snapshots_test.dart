@@ -35,6 +35,7 @@ class _FixtureSnapshotClient implements SnapshotClient {
                 'endedAtMillis': item.ended,
                 'logicalBytes': item.logical,
                 'allocatedBytes': item.allocated,
+                'estimatedStorageBytes': item.estimatedStorageBytes,
                 'complete': item.complete,
                 'retained': item.retained,
                 'available': item.available,
@@ -153,6 +154,11 @@ void main() {
       await File('${fixture.path}/new\n文件').writeAsString('1234567');
       await File('${folder.path}/grow').writeAsString('12345678');
       final b = await capture();
+      final saved = await _FixtureSnapshotClient(client, ids).list();
+      expect(saved.snapshots.length, 2);
+      for (final snapshot in saved.snapshots) {
+        expect(snapshot.estimatedStorageBytes, greaterThan(0));
+      }
       final page = await compare(a, b);
       expect(page.status, 'ok');
       expect(page.logicalDelta, 8);
@@ -198,6 +204,9 @@ void main() {
       );
       await tester.pumpAndSettle();
       expect(find.text('快照与增长对比'), findsOneWidget);
+      expect(find.byKey(ValueKey('snapshot-size-$a')), findsOneWidget);
+      expect(find.byKey(ValueKey('snapshot-size-$b')), findsOneWidget);
+      expect(find.textContaining('快照大小（估算）：暂不可用'), findsNothing);
       await tester.tap(find.byKey(const Key('snapshot-batch-delete')));
       await tester.pumpAndSettle();
       expect(
@@ -254,6 +263,10 @@ void main() {
         'batchDefaultSelection': true,
         'batchRetainedPreserved': true,
         'batchDeletedCount': 1,
+        'snapshotStorageSizes': {
+          for (final snapshot in saved.snapshots)
+            snapshot.id: snapshot.estimatedStorageBytes,
+        },
       };
     } finally {
       for (final id in ids) {

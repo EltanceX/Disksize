@@ -173,6 +173,37 @@ class SnapshotStoreTest {
         } while (token.isNotEmpty())
         assertEquals(ids, seen); assertEquals(4, pages)
     }
+    @Test fun snapshotStorageEstimatesReflectSavedRecordsAndExcludeFreePages() = withStore { store ->
+        // Keep reusable pages in this test database even on devices whose
+        // SQLite configuration otherwise vacuums automatically.
+        store.writableDatabase.execSQL("PRAGMA auto_vacuum=NONE")
+        store.writableDatabase.execSQL("VACUUM")
+        // A huge scanned file costs one metadata record; many empty files cost
+        // more local index storage despite having no scanned file content.
+        val small = fixture(store, listOf(Item("huge", 1L shl 40)))
+        val large = fixture(store, (1..80).map { Item("empty-$it") })
+        fun sizes(): Map<String, Long> {
+            val list = call(store, "snapshot-list").getJSONArray("snapshots")
+            return (0 until list.length()).associate { list.getJSONObject(it).let { it.getString("id") to it.getLong("estimatedStorageBytes") } }
+        }
+        val before = sizes()
+        assertTrue(before.getValue(small) > 0)
+        assertTrue(before.getValue(large) > before.getValue(small))
+        assertTrue(before.getValue(small) < (1L shl 40))
+        val db = store.writableDatabase
+        db.execSQL("CREATE TABLE disposable_size_test(payload BLOB)")
+        db.execSQL("INSERT INTO disposable_size_test VALUES(zeroblob(1048576))")
+        db.execSQL("DROP TABLE disposable_size_test")
+        val free = db.rawQuery("PRAGMA freelist_count", null).use { it.moveToFirst(); it.getLong(0) }
+        val pageSize = db.rawQuery("PRAGMA page_size", null).use { it.moveToFirst(); it.getLong(0) }
+        assertTrue("Fixture should leave reusable database pages", free > 0)
+        val after = sizes()
+        for ((id, bytes) in before) assertTrue(kotlin.math.abs(after.getValue(id) - bytes) <= pageSize)
+        // Non-snapshot sessions still own their share of database storage.
+        store.begin(UUID.randomUUID().toString(), "/unfinished", "ordinary", Process.myUid(), Process.myPid()).use { it.flush() }
+        val currentFree = db.rawQuery("PRAGMA freelist_count", null).use { it.moveToFirst(); it.getLong(0) }
+        assertTrue(sizes().values.sum() < db.rawQuery("PRAGMA page_count", null).use { it.moveToFirst(); (it.getLong(0) - currentFree) * pageSize })
+    }
     @Test fun unknownPagesKeepNullDeltasAndStableOrdering() = withStore { store ->
         val a = fixture(store, emptyList()); val b = fixture(store, (1..45).map { Item("unknown-$it", known = false) })
         for (sort in listOf("logical", "allocated")) {
@@ -265,6 +296,7 @@ class SnapshotStoreTest {
                 assertEquals(4, store.readableDatabase.version)
                 val snapshot = call(store, "snapshot-list").getJSONArray("snapshots").getJSONObject(0)
                 assertEquals(id, snapshot.getString("id")); assertFalse(snapshot.getBoolean("retained"))
+                assertTrue(snapshot.getLong("estimatedStorageBytes") > 0)
                 val other = fixture(store, emptyList(), root = "/old")
                 assertEquals("incompatible", compare(store, id, other).getString("status"))
             }
