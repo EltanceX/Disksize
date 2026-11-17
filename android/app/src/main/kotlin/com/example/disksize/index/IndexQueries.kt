@@ -14,6 +14,7 @@ internal class IndexQueries(private val store: IndexStore) {
 
     private fun execute(q: JSONObject): JSONObject {
         val kind = q.getString("kind")
+        if (kind.startsWith("snapshot-")) return store.snapshots.execute(q)
         val db = store.readableDatabase
         if (kind == "recent") {
             val sessions = JSONArray()

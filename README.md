@@ -2,9 +2,11 @@
 
 面向开发者的 Android 存储分析工具，采用 Flutter、Kotlin 和 C++，支持普通权限与可选 root 模式。
 
-阶段 0～6 已完成。应用支持普通/root 模式的只读扫描、权限引导、进度/取消和中断恢复，并提供 TreeSize 风格的目录与大文件列表、容量条、最近会话、详情及卷差额说明。Flutter 经 Pigeon、独立 `:scanner` 服务和 JNI 调用共用 C++ 核心；libsu 6.0.0 RootService 负责可选 root 访问，普通 UID 的 SQLite 索引负责硬链接归属、最终聚合和稳定分页。手机使用单列和详情抽屉，宽屏提供详情分栏。运行环境检查保留在首页右上角。
+阶段 0～8 已完成。应用支持普通/root 模式的只读扫描、权限引导、进度/取消和中断恢复，并提供 TreeSize 风格的目录与大文件列表、矩形树图、快照及增长对比。Flutter 经 Pigeon、独立 `:scanner` 服务和 JNI 调用共用 C++ 核心；libsu 6.0.0 RootService 负责可选 root 访问，普通 UID 的 SQLite 索引负责硬链接归属、最终聚合和稳定分页。手机使用单列和详情抽屉，宽屏提供详情分栏。运行环境检查保留在首页右上角。
 
 当前为只读原型，Android 入口最多 2,000,000 节点、512 层深度。首页保留 64 条有界预览；完整浏览每页 50 项，API 每页最多 100 条。点击最近会话或“浏览目录与大文件”进入索引；大文件列表限定当前目录范围。卷差额显示采样时间和统计范围，不能当作可清理空间。使用 root 时点击“请求 root 访问”并按管理器授权；若显示拒绝，在管理器中允许 DiskSize 后重试，再切换后端。应用不会在普通启动时自动请求 root。
+
+首页右上角“快照与增长对比”可选择基准和另一份快照，查看新增、删除、容量变化和增长目录。最终聚合结果自动保存，部分扫描保留未知范围；保留标记防止误删，删除只清理应用自己的索引。重命名按删除和新增展示。稳定卷 UUID 支持跨启动对比；系统无法确认卷身份或旧索引缺少规则信息时会拒绝对比，需要重新扫描。
 
 ## 开发环境
 
@@ -32,6 +34,7 @@ flutter test
 flutter test integration_test/diagnostics_test.dart -d <device-id>
 flutter test integration_test/scanning_test.dart -d <device-id>
 ./tools/phase6/verify.ps1 -Serial '<device-id>'
+./tools/phase8/verify.ps1 -Serial '<device-id>' -RootInstall
 flutter build apk --debug --target-platform 'android-arm64,android-x64'
 ./tools/lint-android.ps1
 ```
@@ -48,6 +51,8 @@ Root 真机验证和协议单元测试见[阶段 4 工具说明](tools/phase4/RE
 
 目录、大文件界面和真实索引交互验证见[阶段 6 工具说明](tools/phase6/README.md)。本阶段将 schema 升级至 3、增量协议升级至 v3，保留旧数据库数据；验收与范围说明见[阶段 6 文档](docs/phase6-explorer.md)。
 
+矩形树图见[阶段 7 验收](docs/phase7-treemap.md)。快照与增长对比将 schema 升至 4，原生协议继续使用 v3，旧索引保留；兼容性、未知范围与删除边界见[阶段 8 验收](docs/phase8-snapshots.md)，复现步骤见[阶段 8 工具说明](tools/phase8/README.md)。
+
 修改 `pigeons/scanner_api.dart` 后运行 `tools/generate-bridge.ps1`，将 Dart 与 Kotlin 生成文件一同提交。应用的 `pubspec.lock`、Gradle Wrapper 和生成桥接代码均纳入版本管理。
 
 本机路径、原始设备日志及临时构建验证工程放在忽略提交的 `.local/`；构建输出、签名材料和 `android/local.properties` 也已忽略。
@@ -63,3 +68,5 @@ Root 真机验证和协议单元测试见[阶段 4 工具说明](tools/phase4/RE
 - [阶段 4 Root 后端与验收](docs/phase4-root-backend.md)
 - [阶段 5 索引、聚合与分页验收](docs/phase5-index.md)
 - [阶段 6 目录与大文件界面](docs/phase6-explorer.md)
+- [阶段 7 矩形树图](docs/phase7-treemap.md)
+- [阶段 8 快照与增长对比](docs/phase8-snapshots.md)

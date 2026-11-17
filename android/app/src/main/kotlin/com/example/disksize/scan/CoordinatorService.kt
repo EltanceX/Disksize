@@ -141,10 +141,35 @@ class CoordinatorService : Service() {
             val query = try { JSONObject(requestJson) } catch (_: org.json.JSONException) {
                 return JSONObject().put("status", "invalid-query").toString()
             }
+            synchronized(lock) {
+                val id = active?.id
+                if (id != null && query.optString("kind").startsWith("snapshot-") &&
+                    listOf("snapshotId", "baseId", "targetId").any { query.optString(it) == id }) {
+                    return JSONObject().put("status", "index-finalizing").toString()
+                }
+            }
             val result = JSONObject(IndexQueries(index).query(requestJson))
+            if (query.optString("kind") == "snapshot-delete" && result.optString("status") == "ok") {
+                journalExecutor.submit {
+                    synchronized(lock) {
+                        if (active == null && current?.optString("sessionId") == query.optString("snapshotId")) {
+                            pendingWrite.set(null); journal.clear(); current = null; encoded = ""
+                        }
+                    }
+                }.get(5, TimeUnit.SECONDS)
+            }
             // The journal must be durable before a public query can expose a
             // terminal index. SQLite may finish just ahead of that write.
             synchronized(lock) {
+                val snapshots = result.optJSONArray("snapshots")
+                if (snapshots != null) {
+                    val visible = JSONArray()
+                    for (i in 0 until snapshots.length()) {
+                        val item = snapshots.getJSONObject(i)
+                        if (item.optString("id") != active?.id) visible.put(item)
+                    }
+                    result.put("snapshots", visible)
+                }
                 val recent = result.optJSONArray("sessions")
                 for (i in 0 until (recent?.length() ?: 0)) {
                     val session = recent!!.getJSONObject(i)

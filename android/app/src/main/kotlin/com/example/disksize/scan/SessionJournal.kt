@@ -39,6 +39,7 @@ internal class SessionJournal(context: Context) {
             throw error
         }
     }
+    fun clear() { file.delete() }
 
     companion object { const val MAX_BYTES = 256 * 1024 }
 }

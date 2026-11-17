@@ -7,6 +7,8 @@ import '../../../platform/diagnostics_client.dart';
 import '../../../platform/generated/scanner_api.g.dart';
 import '../../../platform/scan_client.dart';
 import '../../../platform/index_client.dart';
+import '../../../platform/snapshot_client.dart';
+import '../../snapshots/snapshots_page.dart';
 import '../../explorer/explorer_page.dart';
 import '../../explorer/explorer_format.dart';
 import 'scan_home_page.dart';
@@ -206,6 +208,22 @@ class _ScanDashboardPageState extends State<ScanDashboardPage>
       appBar: AppBar(
         title: const Text('DiskSize'),
         actions: [
+          IconButton(
+            key: const Key('open-snapshots'),
+            tooltip: '快照与增长对比',
+            onPressed: () async {
+              await Navigator.of(context).push(
+                MaterialPageRoute<void>(
+                  builder: (_) => SnapshotsPage(
+                    client: AndroidSnapshotClient(),
+                    indexClient: _index,
+                  ),
+                ),
+              );
+              if (mounted) unawaited(_refreshLibrary());
+            },
+            icon: const Icon(Icons.compare_arrows),
+          ),
           IconButton(
             key: const Key('open-diagnostics'),
             tooltip: '运行环境',

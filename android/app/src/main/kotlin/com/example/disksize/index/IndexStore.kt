@@ -13,6 +13,16 @@ import java.util.concurrent.CancellationException
 /** Owned by the ordinary scanner process. Import/finalize are confined to its single worker. */
 internal class IndexStore(context: Context, filename: String = "scan-index.db") : SQLiteOpenHelper(
     context, File(context.noBackupFilesDir, filename).absolutePath, null, SCHEMA_VERSION) {
+    private val scanIdentity = JSONObject().put("rules", "native-v3:path-min-hardlink:blocks512:no-follow:one-mount:2000000:512")
+        .put("user", android.os.Process.myUid() / 100000)
+        .put("boot", try { File("/proc/sys/kernel/random/boot_id").readText().trim() } catch (_: Exception) {
+            android.provider.Settings.Global.getString(context.contentResolver, "boot_count") ?: ""
+        }).toString()
+    private val storage = context.getSystemService(android.os.storage.StorageManager::class.java)
+    private fun identity(root: String) = JSONObject(scanIdentity).put("volumeUuid", try {
+        storage.getUuidForPath(File(root)).toString()
+    } catch (_: Exception) { "" }).toString()
+    val snapshots by lazy { SnapshotQueries(this) }
     init { setWriteAheadLoggingEnabled(true) }
     override fun onConfigure(db: SQLiteDatabase) {
         db.setForeignKeyConstraintsEnabled(true)
@@ -25,7 +35,7 @@ internal class IndexStore(context: Context, filename: String = "scan-index.db") 
             provisional INTEGER NOT NULL DEFAULT 1, started INTEGER NOT NULL, ended INTEGER NOT NULL DEFAULT 0,
             nodes INTEGER NOT NULL DEFAULT 0, issues INTEGER NOT NULL DEFAULT 0, reason TEXT NOT NULL DEFAULT '',
             scanner_uid INTEGER NOT NULL, scanner_pid INTEGER NOT NULL, metrics TEXT NOT NULL DEFAULT '{}',
-            volume TEXT NOT NULL DEFAULT '{}')""")
+            volume TEXT NOT NULL DEFAULT '{}', identity TEXT NOT NULL DEFAULT '{}')""")
         db.execSQL("CREATE INDEX sessions_recent ON sessions(started DESC,id DESC)")
         db.execSQL("""CREATE TABLE nodes(sid TEXT NOT NULL REFERENCES sessions(id), id INTEGER NOT NULL,
             parent INTEGER NOT NULL, depth INTEGER NOT NULL, name BLOB NOT NULL, name_key TEXT NOT NULL,
@@ -58,26 +68,41 @@ internal class IndexStore(context: Context, filename: String = "scan-index.db") 
         db.execSQL("CREATE INDEX issue_node ON issues(sid,node,id)")
         db.execSQL("""CREATE TABLE snapshots(id TEXT PRIMARY KEY, sid TEXT NOT NULL UNIQUE REFERENCES sessions(id),
             revision INTEGER NOT NULL, created INTEGER NOT NULL, logical INTEGER NOT NULL, allocated INTEGER NOT NULL,
-            complete INTEGER NOT NULL)""")
+            complete INTEGER NOT NULL, retained INTEGER NOT NULL DEFAULT 0)""")
+        createDiffSchema(db)
     }
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        require(oldVersion in 1..2 && newVersion == SCHEMA_VERSION) {
+        require(oldVersion in 1..3 && newVersion == SCHEMA_VERSION) {
             "Unsupported index migration $oldVersion -> $newVersion; existing data preserved"
         }
         if (oldVersion == 1) {
             db.execSQL("CREATE INDEX aggregate_incomplete ON aggregates(sid,parent,complete)")
         }
-        db.execSQL("ALTER TABLE sessions ADD COLUMN volume TEXT NOT NULL DEFAULT '{}'")
-        db.execSQL("CREATE INDEX sessions_recent ON sessions(started DESC,id DESC)")
+        if (oldVersion < 3) {
+            db.execSQL("ALTER TABLE sessions ADD COLUMN volume TEXT NOT NULL DEFAULT '{}'")
+            db.execSQL("CREATE INDEX sessions_recent ON sessions(started DESC,id DESC)")
+        }
+        db.execSQL("ALTER TABLE sessions ADD COLUMN identity TEXT NOT NULL DEFAULT '{}'")
+        db.execSQL("ALTER TABLE snapshots ADD COLUMN retained INTEGER NOT NULL DEFAULT 0")
+        createDiffSchema(db)
     }
-    companion object { const val SCHEMA_VERSION = 3 }
+    private fun createDiffSchema(db: SQLiteDatabase) {
+        db.execSQL("CREATE TABLE diff_cache(id INTEGER PRIMARY KEY CHECK(id=1), signature TEXT NOT NULL, ready INTEGER NOT NULL)")
+        db.execSQL("""CREATE TABLE diff_rows(path BLOB PRIMARY KEY, old_kind INTEGER NOT NULL, new_kind INTEGER NOT NULL,
+            old_logical INTEGER, new_logical INTEGER, old_allocated INTEGER, new_allocated INTEGER,
+            status TEXT NOT NULL, logical_delta INTEGER, allocated_delta INTEGER, row_id INTEGER NOT NULL UNIQUE) WITHOUT ROWID""")
+        db.execSQL("CREATE INDEX diff_logical ON diff_rows(COALESCE(logical_delta,-9223372036854775808) DESC,path DESC)")
+        db.execSQL("CREATE INDEX diff_allocated ON diff_rows(COALESCE(allocated_delta,-9223372036854775808) DESC,path DESC)")
+        db.execSQL("CREATE INDEX diff_status ON diff_rows(status,path)")
+    }
+    companion object { const val SCHEMA_VERSION = 4 }
     fun recover() {
         writableDatabase.execSQL("""UPDATE sessions SET state='interrupted', phase='interrupted',
             reason='process-interrupted', revision=revision+1, ended=? WHERE state IN ('running','finalizing')""", arrayOf(now()))
     }
     fun begin(id: String, root: String, backend: String, uid: Int, pid: Int): Import {
-        writableDatabase.execSQL("INSERT INTO sessions(id,root,backend,state,phase,started,scanner_uid,scanner_pid) VALUES(?,?,?,'running','scanning',?,?,?)",
-            arrayOf<Any>(id, root, backend, now(), uid, pid))
+        writableDatabase.execSQL("INSERT INTO sessions(id,root,backend,state,phase,started,scanner_uid,scanner_pid,identity) VALUES(?,?,?,'running','scanning',?,?,?,?)",
+            arrayOf<Any>(id, root, backend, now(), uid, pid, identity(root)))
         return Import(id)
     }
     inner class Import internal constructor(val id: String) : AutoCloseable {
@@ -171,14 +196,15 @@ internal class IndexStore(context: Context, filename: String = "scan-index.db") 
     }
     fun interrupt(id: String, state: String, reason: String) {
         transaction(id) { db ->
+            db.execSQL("DELETE FROM snapshots WHERE sid=?", arrayOf(id))
             db.execSQL("UPDATE sessions SET state=?,phase=?,reason=?,ended=?,provisional=1 WHERE id=?",
                 arrayOf<Any>(state, state, reason, now(), id))
-            db.execSQL("DELETE FROM snapshots WHERE sid=?", arrayOf(id))
         }
     }
     fun finalize(id: String, summary: StreamSummary, signal: CancellationSignal = CancellationSignal(), cancelled: () -> Boolean): JSONObject {
         val start = android.os.SystemClock.elapsedRealtime()
         val db = writableDatabase
+        db.rawQuery("SELECT 1 FROM snapshots WHERE sid=?", arrayOf(id)).use { check(!it.moveToFirst()) { "Snapshot is immutable" } }
         fun check() { if (cancelled()) throw CancellationException("Index finalization cancelled") }
         check()
         transaction(id) { it.execSQL("UPDATE sessions SET state='finalizing',phase='deduplicating' WHERE id=?", arrayOf(id)) }
@@ -260,7 +286,7 @@ internal class IndexStore(context: Context, filename: String = "scan-index.db") 
         transaction(id) {
             it.execSQL("""UPDATE sessions SET state=?,phase='final',provisional=0,ended=?,metrics=?,
                 issues=(SELECT COUNT(*) FROM issues WHERE sid=?) WHERE id=?""", arrayOf<Any>(state, now(), metrics.toString(), id, id))
-            if (state in setOf("completed", "partial")) it.execSQL("""INSERT INTO snapshots
+            if (state in setOf("completed", "partial")) it.execSQL("""INSERT INTO snapshots(id,sid,revision,created,logical,allocated,complete)
                 SELECT id,id,revision+1,?,COALESCE((SELECT logical FROM aggregates WHERE sid=? AND id=1),0),
                 COALESCE((SELECT allocated FROM aggregates WHERE sid=? AND id=1),0),? FROM sessions WHERE id=?""",
                 arrayOf<Any>(now(), id, id, if (complete) 1 else 0, id))

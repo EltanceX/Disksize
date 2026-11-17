@@ -167,7 +167,7 @@ class IndexStoreTest {
                     old.version = version
                 }
                 IndexStore(context, name).use { migrated ->
-                    assertEquals(3, migrated.readableDatabase.version)
+                    assertEquals(4, migrated.readableDatabase.version)
                     migrated.readableDatabase.rawQuery("SELECT name FROM nodes WHERE sid=?", arrayOf(id)).use {
                         assertTrue(it.moveToFirst()); assertEquals("old-node", it.getBlob(0).toString(Charsets.UTF_8))
                     }
