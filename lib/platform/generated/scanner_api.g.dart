@@ -1052,4 +1052,23 @@ class ScannerHostApi {
     );
     return pigeonVar_replyValue! as String;
   }
+
+  Future<void> openIndexedEntry(String sessionId, int nodeId) async {
+    final pigeonVar_channelName =
+        'dev.flutter.pigeon.disksize.ScannerHostApi.openIndexedEntry$pigeonVar_messageChannelSuffix';
+    final pigeonVar_channel = BasicMessageChannel<Object?>(
+      pigeonVar_channelName,
+      pigeonChannelCodec,
+      binaryMessenger: pigeonVar_binaryMessenger,
+    );
+    final Future<Object?> pigeonVar_sendFuture = pigeonVar_channel.send(
+      <Object?>[sessionId, nodeId],
+    );
+    final pigeonVar_replyList = await pigeonVar_sendFuture as List<Object?>?;
+    _extractReplyValueOrThrow(
+      pigeonVar_replyList,
+      pigeonVar_channelName,
+      isNullValid: true,
+    );
+  }
 }

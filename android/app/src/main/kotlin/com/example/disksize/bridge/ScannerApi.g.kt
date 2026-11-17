@@ -801,6 +801,7 @@ interface ScannerHostApi {
   suspend fun getScanSnapshot(): ScanSnapshot?
   suspend fun cancelScan(sessionId: String)
   suspend fun queryIndex(requestJson: String): String
+  suspend fun openIndexedEntry(sessionId: String, nodeId: Long)
 
   companion object {
     /** The codec used by ScannerHostApi. */
@@ -982,6 +983,27 @@ interface ScannerHostApi {
             CoroutineScope(Dispatchers.Main).launch {
               val wrapped: List<Any?> = try {
                 listOf(api.queryIndex(requestJsonArg))
+              } catch (exception: Throwable) {
+                ScannerApiPigeonUtils.wrapError(exception)
+              }
+              reply.reply(wrapped)
+            }
+          }
+        } else {
+          channel.setMessageHandler(null)
+        }
+      }
+      run {
+        val channel = BasicMessageChannel<Any?>(binaryMessenger, "dev.flutter.pigeon.disksize.ScannerHostApi.openIndexedEntry$separatedMessageChannelSuffix", codec)
+        if (api != null) {
+          channel.setMessageHandler { message, reply ->
+            val args = message as List<Any?>
+            val sessionIdArg = args[0] as String
+            val nodeIdArg = args[1] as Long
+            CoroutineScope(Dispatchers.Main).launch {
+              val wrapped: List<Any?> = try {
+                api.openIndexedEntry(sessionIdArg, nodeIdArg)
+                listOf(null)
               } catch (exception: Throwable) {
                 ScannerApiPigeonUtils.wrapError(exception)
               }

@@ -6,6 +6,7 @@ import '../../platform/index_client.dart';
 import '../../platform/scan_client.dart';
 import 'explorer_format.dart';
 import 'treemap_layout.dart';
+import 'external_open_button.dart';
 
 class TreemapPanel extends StatefulWidget {
   const TreemapPanel({
@@ -16,6 +17,7 @@ class TreemapPanel extends StatefulWidget {
     required this.onSelect,
     required this.onOpen,
     this.onDoubleTapOpen,
+    this.onOpenExternal,
     required this.onDetail,
     required this.onShowList,
     required this.depth,
@@ -27,6 +29,7 @@ class TreemapPanel extends StatefulWidget {
   final ValueChanged<IndexedEntry?> onSelect;
   final ValueChanged<IndexedEntry> onOpen, onDetail;
   final ValueChanged<IndexedEntry>? onDoubleTapOpen;
+  final Future<void> Function(IndexedEntry)? onOpenExternal;
   final ValueChanged<int> onShowList;
   @override
   State<TreemapPanel> createState() => _TreemapPanelState();
@@ -233,6 +236,13 @@ class _TreemapPanelState extends State<TreemapPanel> {
                     icon: const Icon(Icons.info_outline),
                     label: const Text('查看详情'),
                   ),
+                  if (widget.onOpenExternal != null &&
+                      (selected.kind == 'directory' ||
+                          selected.kind == 'regular'))
+                    ExternalOpenButton(
+                      key: const Key('treemap-open-external'),
+                      onOpen: () => widget.onOpenExternal!(selected),
+                    ),
                 ],
               ),
             ] else

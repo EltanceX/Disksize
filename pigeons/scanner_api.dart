@@ -63,6 +63,8 @@ abstract class ScannerHostApi {
   void cancelScan(String sessionId);
   @async
   String queryIndex(String requestJson);
+  @async
+  void openIndexedEntry(String sessionId, int nodeId);
 }
 
 class RootPath {

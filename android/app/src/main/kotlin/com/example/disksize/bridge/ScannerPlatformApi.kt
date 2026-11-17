@@ -14,6 +14,7 @@ import com.example.disksize.scan.CoordinatorService
 import com.example.disksize.scan.ScanAccess
 import com.example.disksize.scan.ipc.IScanCoordinator
 import com.example.disksize.MainActivity
+import com.example.disksize.open.ExternalOpener
 import org.json.JSONObject
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -108,6 +109,21 @@ internal class ScannerPlatformApi(private val activity: MainActivity) : ScannerH
             return withContext(Dispatchers.IO) { ScanAccess.volumes(context) }
         }
         return callCoordinator { it.queryIndex(requestJson) }
+    }
+
+    override suspend fun openIndexedEntry(sessionId: String, nodeId: Long) {
+        withContext(Dispatchers.Main.immediate) { requireForeground() }
+        require(nodeId > 0)
+        val detail = JSONObject(queryIndex(JSONObject().put("kind", "detail").put("sessionId", sessionId)
+            .put("nodeId", nodeId).toString()))
+        if (detail.optString("status") != "ok" || !detail.has("detail")) {
+            throw FlutterError("entry-unavailable", "索引或条目已不可用，请刷新后重试。", null)
+        }
+        val intent = withContext(Dispatchers.IO) {
+            val entry = detail.getJSONObject("detail")
+            ExternalOpener.prepare(context, ExternalOpener.path(detail.getString("rootPath"), entry.getString("pathHex")), entry.getString("kind"))
+        }
+        withContext(Dispatchers.Main.immediate) { requireForeground(); ExternalOpener.launch(activity, intent) }
     }
 
     private fun requireForeground() {

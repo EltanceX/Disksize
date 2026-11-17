@@ -2,6 +2,7 @@
     <!-- Flutter integration_test pins AndroidX test 1.3.0. Supply the explicit
          exported flags required by current target SDKs for its test activities. -->
     <application>
+        <activity android:name="com.example.disksize.open.ExternalOpenReceiverActivity" android:exported="true" />
         <activity android:name="androidx.test.core.app.InstrumentationActivityInvoker$BootstrapActivity" android:exported="false" />
         <activity android:name="androidx.test.core.app.InstrumentationActivityInvoker$EmptyActivity" android:exported="false" />
         <activity android:name="androidx.test.core.app.InstrumentationActivityInvoker$EmptyFloatingActivity" android:exported="false" />

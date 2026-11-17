@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 
 import '../../platform/index_client.dart';
+import '../../platform/entry_opener.dart';
 import '../../platform/scan_client.dart';
 import 'explorer_controller.dart';
 import 'explorer_detail.dart';
@@ -14,9 +15,11 @@ class ExplorerPage extends StatefulWidget {
     super.key,
     required this.client,
     required this.sessionId,
+    this.opener,
   });
   final IndexClient client;
   final String sessionId;
+  final EntryOpener? opener;
   @override
   State<ExplorerPage> createState() => _ExplorerPageState();
 }
@@ -24,6 +27,7 @@ class ExplorerPage extends StatefulWidget {
 class _ExplorerPageState extends State<ExplorerPage>
     with WidgetsBindingObserver {
   late final ExplorerController c;
+  late final EntryOpener _opener;
   int? _selected;
   Timer? _poll;
   final _scroll = ScrollController();
@@ -37,6 +41,7 @@ class _ExplorerPageState extends State<ExplorerPage>
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    _opener = widget.opener ?? AndroidEntryOpener();
     c = ExplorerController(widget.client, widget.sessionId)
       ..addListener(_changed);
     unawaited(c.load());
@@ -138,6 +143,7 @@ class _ExplorerPageState extends State<ExplorerPage>
               ),
               Expanded(
                 child: ExplorerDetail(
+                  opener: _opener,
                   client: widget.client,
                   sessionId: widget.sessionId,
                   nodeId: id,
@@ -461,6 +467,8 @@ class _ExplorerPageState extends State<ExplorerPage>
                               onDoubleTapOpen: (entry) =>
                                   _navigate(entry.id, preserveScroll: true),
                               onDetail: (entry) => _detail(entry.id, wide),
+                              onOpenExternal: (entry) =>
+                                  _opener.open(widget.sessionId, entry.id),
                               onShowList: (id) {
                                 _selected = null;
                                 c.directoryId = id;
@@ -535,6 +543,7 @@ class _ExplorerPageState extends State<ExplorerPage>
                   SizedBox(
                     width: 360,
                     child: ExplorerDetail(
+                      opener: _opener,
                       key: ValueKey(
                         '${_selected ?? c.directoryId}-${c.page?.revision}',
                       ),

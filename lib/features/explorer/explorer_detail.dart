@@ -4,8 +4,10 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../../platform/index_client.dart';
+import '../../platform/entry_opener.dart';
 import '../../platform/scan_client.dart';
 import 'explorer_format.dart';
+import 'external_open_button.dart';
 
 class ExplorerDetail extends StatefulWidget {
   const ExplorerDetail({
@@ -14,11 +16,13 @@ class ExplorerDetail extends StatefulWidget {
     required this.sessionId,
     required this.nodeId,
     required this.onLocate,
+    this.opener,
   });
   final IndexClient client;
   final String sessionId;
   final int nodeId;
   final ValueChanged<int> onLocate;
+  final EntryOpener? opener;
   @override
   State<ExplorerDetail> createState() => _ExplorerDetailState();
 }
@@ -160,6 +164,23 @@ class _ExplorerDetailState extends State<ExplorerDetail> {
             icon: const Icon(Icons.copy, size: 18),
             label: const Text('复制完整路径'),
           ),
+          if (detail.entry.kind == 'regular' ||
+              detail.entry.kind == 'directory') ...[
+            Align(
+              alignment: Alignment.centerLeft,
+              child: ExternalOpenButton(
+                key: const Key('open-indexed-entry'),
+                onOpen: () => (widget.opener ?? AndroidEntryOpener()).open(
+                  widget.sessionId,
+                  detail.entry.id,
+                ),
+              ),
+            ),
+            const Text(
+              '打开设备上的当前位置；历史快照中的原文件可能已变化。',
+              style: TextStyle(fontSize: 12),
+            ),
+          ],
           if (detail.entry.parentId > 0)
             TextButton.icon(
               key: const Key('locate-indexed-parent'),

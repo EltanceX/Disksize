@@ -10,6 +10,8 @@
 
 快照库的“一键删除快照”默认选中所有非保留快照，包含更早快照；可取消勾选或自行选择，确认后批量删除。已保留快照受保护，原文件不受影响。
 
+文件和目录详情、树图选中区域提供“使用其他应用打开”，可交给系统文件管理器或兼容查看器。打开设备上的当前内容，返回后保留浏览位置；Root 私有路径仍受目标应用权限限制。临时只读授权及限制见[功能说明](docs/external-open.md)。
+
 ## 开发环境
 
 Flutter 3.47.9 / Dart 3.13.7，JDK 21，Android compileSdk/targetSdk 36、minSdk 29，NDK 28.2.13676358，CMake 3.22.1。支持 arm64-v8a 和 x86_64。
@@ -37,6 +39,7 @@ flutter test integration_test/diagnostics_test.dart -d <device-id>
 flutter test integration_test/scanning_test.dart -d <device-id>
 ./tools/phase6/verify.ps1 -Serial '<device-id>'
 ./tools/phase8/verify.ps1 -Serial '<device-id>' -RootInstall
+./tools/external-open/verify.ps1 -Serial '<device-id>' -RootInstall
 flutter build apk --debug --target-platform 'android-arm64,android-x64'
 ./tools/lint-android.ps1
 ```
@@ -72,3 +75,4 @@ Root 真机验证和协议单元测试见[阶段 4 工具说明](tools/phase4/RE
 - [阶段 6 目录与大文件界面](docs/phase6-explorer.md)
 - [阶段 7 矩形树图](docs/phase7-treemap.md)
 - [阶段 8 快照与增长对比](docs/phase8-snapshots.md)
+- [使用其他应用打开](docs/external-open.md)
