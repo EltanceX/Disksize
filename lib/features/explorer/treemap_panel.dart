@@ -31,6 +31,7 @@ class TreemapPanel extends StatefulWidget {
 
 class _TreemapPanelState extends State<TreemapPanel> {
   int? _selected;
+  int? _previousTapId, _tapId;
 
   @override
   void didUpdateWidget(TreemapPanel oldWidget) {
@@ -40,6 +41,7 @@ class _TreemapPanelState extends State<TreemapPanel> {
         oldWidget.allocated != widget.allocated ||
         oldWidget.depth != widget.depth) {
       _selected = null;
+      _previousTapId = _tapId = null;
     }
   }
 
@@ -122,7 +124,29 @@ class _TreemapPanelState extends State<TreemapPanel> {
                         final tile = hitTreemap(tiles, event.localPosition);
                         if (tile != null) select(tile.item.id);
                       },
-                      child: CustomPaint(size: size, painter: painter),
+                      onDoubleTap: () {
+                        final id = _tapId;
+                        if (id == null) return;
+                        select(id);
+                        final entry = entries[id];
+                        if (_previousTapId == id &&
+                            entry?.kind == 'directory' &&
+                            entry!.id != widget.directory.entry.id) {
+                          widget.onOpen(entry);
+                        }
+                      },
+                      child: Listener(
+                        // The canvas shares one recognizer across all tiles.
+                        // Both taps must hit the same tile before opening it.
+                        onPointerDown: (event) {
+                          _previousTapId = _tapId;
+                          _tapId = hitTreemap(
+                            tiles,
+                            event.localPosition,
+                          )?.item.id;
+                        },
+                        child: CustomPaint(size: size, painter: painter),
+                      ),
                     ),
                   );
                 },
@@ -198,7 +222,7 @@ class _TreemapPanelState extends State<TreemapPanel> {
                 ],
               ),
             ] else
-              const Text('点击色块选中项目，再进入目录或查看详情。'),
+              const Text('单击色块选中项目，双击目录色块或标题栏进入目录；也可通过按钮进入目录或查看详情。'),
           ],
           TextButton.icon(
             key: const Key('treemap-list'),

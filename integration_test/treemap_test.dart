@@ -7,6 +7,7 @@ import 'package:disksize/features/explorer/treemap_panel.dart';
 import 'package:disksize/platform/index_client.dart';
 import 'package:disksize/platform/scan_client.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/scheduler.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:integration_test/integration_test.dart';
@@ -110,6 +111,16 @@ void main() {
         await tester.pumpAndSettle();
       }
 
+      Future<void> doubleTap(TreemapRect tile) async {
+        final point =
+            tester.getTopLeft(find.byKey(const Key('treemap-canvas'))) +
+            tile.hitRect.center;
+        await tester.tapAt(point);
+        await tester.pump(const Duration(milliseconds: 80));
+        await tester.tapAt(point);
+        await tester.pumpAndSettle();
+      }
+
       TreemapPainter painter() =>
           tester
                   .widget<CustomPaint>(
@@ -139,6 +150,7 @@ void main() {
         tester.getTopLeft(find.byKey(const Key('treemap-canvas'))) +
             folder.hitRect.center,
       );
+      await tester.pump(kDoubleTapTimeout);
       await tester.pumpAndSettle();
       await reveal(find.byKey(const Key('treemap-open')));
       await tester.tap(find.byKey(const Key('treemap-open')));
@@ -151,15 +163,9 @@ void main() {
         final entry = painter().entries[tile.item.id];
         return entry != null && displayScanPath(entry.nameHex) == 'Stress';
       });
-      await tester.tapAt(
-        tester.getTopLeft(find.byKey(const Key('treemap-canvas'))) +
-            stressTile.hitRect.center,
-      );
-      await tester.pumpAndSettle();
-      await reveal(find.byKey(const Key('treemap-open')));
-      await tester.tap(find.byKey(const Key('treemap-open')));
-      await tester.pumpAndSettle();
+      await doubleTap(stressTile);
       await reveal(find.byKey(const Key('treemap-canvas')));
+      expect(painter().tiles.first.item.id, stressTile.item.id);
       expect(painter().tiles.length, 102);
       SchedulerBinding.instance.addTimingsCallback(record);
       for (var i = 0; i < 40; i++) {
@@ -168,6 +174,7 @@ void main() {
           tester.getTopLeft(find.byKey(const Key('treemap-canvas'))) +
               tile.hitRect.center,
         );
+        await tester.pump(kDoubleTapTimeout);
         await tester.pump();
         await Future<void>.delayed(const Duration(milliseconds: 25));
       }
@@ -204,6 +211,34 @@ void main() {
       };
       await tester.tap(find.byType(BackButton).first);
       await tester.pumpAndSettle();
+      await reveal(find.byKey(const Key('treemap-canvas')));
+      final deepDirectory = painter().tiles.firstWhere(
+        (tile) =>
+            tile.level == 3 &&
+            painter().entries[tile.item.id]?.kind == 'directory',
+      );
+      final parent = painter().entries[deepDirectory.item.id]!.parentId;
+      final grandparent = painter().entries[parent]!.parentId;
+      await doubleTap(deepDirectory);
+      await reveal(find.byKey(const Key('treemap-canvas')));
+      expect(painter().tiles.first.item.id, deepDirectory.item.id);
+      expect(painter().tiles.first.level, 0);
+      await tester.scrollUntilVisible(
+        find.byKey(ValueKey('crumb-${deepDirectory.item.id}')),
+        -200,
+        scrollable: find.byType(Scrollable).first,
+      );
+      await tester.pumpAndSettle();
+      expect(
+        find.byKey(ValueKey('crumb-${deepDirectory.item.id}')),
+        findsOneWidget,
+      );
+      for (final ancestor in [parent, grandparent, 1]) {
+        await tester.tap(find.byType(BackButton).first);
+        await tester.pumpAndSettle();
+        await reveal(find.byKey(const Key('treemap-canvas')));
+        expect(painter().tiles.first.item.id, ancestor);
+      }
       await tester.scrollUntilVisible(
         find.byKey(const Key('treemap-depth')),
         -200,
@@ -240,6 +275,7 @@ void main() {
       expect(painter().tiles.every((tile) => tile.level <= 3), isTrue);
       binding.reportData!['depth'] = 3;
       binding.reportData!['nestedRectangles'] = painter().tiles.length;
+      binding.reportData!['doubleTapNavigation'] = true;
       await binding.convertFlutterSurfaceToImage();
       await tester.pumpAndSettle();
       await File('${access.externalOwnPath!}/phase7-treemap.png')

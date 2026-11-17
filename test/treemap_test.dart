@@ -7,6 +7,7 @@ import 'package:disksize/features/explorer/treemap_layout.dart';
 import 'package:disksize/features/explorer/treemap_panel.dart';
 import 'package:disksize/platform/index_client.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'explorer_test.dart' show ExplorerFixture;
@@ -161,6 +162,7 @@ void main() {
       tester.getTopLeft(find.byKey(const Key('treemap-canvas'))) +
           tile.rect.center,
     );
+    await tester.pump(kDoubleTapTimeout);
     await tester.pumpAndSettle();
     expect(painter(tester).selected, 2);
     await tester.ensureVisible(find.byKey(const Key('treemap-open')));
@@ -188,6 +190,7 @@ void main() {
       tester.getTopLeft(find.byKey(const Key('treemap-canvas'))) +
           child.rect.center,
     );
+    await tester.pump(kDoubleTapTimeout);
     await tester.pumpAndSettle();
     await tester.ensureVisible(find.byKey(const Key('treemap-detail')));
     await tester.pumpAndSettle();

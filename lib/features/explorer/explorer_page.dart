@@ -366,7 +366,7 @@ class _ExplorerPageState extends State<ExplorerPage>
                                 ),
                                 Text(
                                   c.treemap
-                                      ? '点击色块选中项目；通过下方按钮进入目录，返回键逐级返回。'
+                                      ? '单击色块选中项目，双击目录进入；也可通过下方按钮进入，返回键逐级返回。'
                                       : '容量条表示所选口径占当前目录的比例；未知容量不视为零。',
                                   style: TextStyle(fontSize: 12),
                                 ),

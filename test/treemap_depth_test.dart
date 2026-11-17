@@ -6,6 +6,7 @@ import 'package:disksize/features/explorer/treemap_layout.dart';
 import 'package:disksize/features/explorer/treemap_panel.dart';
 import 'package:disksize/platform/index_client.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'explorer_test.dart' show ExplorerFixture, hex;
@@ -257,6 +258,7 @@ void main() {
         tester.getTopLeft(find.byKey(const Key('treemap-canvas'))) +
             leaf.rect.center,
       );
+      await tester.pump(kDoubleTapTimeout);
       await tester.pumpAndSettle();
       expect(painter(tester).selected, 5);
       await tester.scrollUntilVisible(
@@ -281,6 +283,7 @@ void main() {
         tester.getTopLeft(find.byKey(const Key('treemap-canvas'))) +
             painter(tester).tiles.single.rect.center,
       );
+      await tester.pump(kDoubleTapTimeout);
       await tester.pumpAndSettle();
       expect(painter(tester).selected, 1);
       expect(
@@ -295,4 +298,150 @@ void main() {
       await tester.pumpWidget(const SizedBox());
     });
   }
+  testWidgets('double tap opens nested directories and folder title bands', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(1000, 900));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final fixture = DepthFixture();
+    final opened = <int>[];
+    Future<void> show(int depth) async {
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: SingleChildScrollView(
+              child: TreemapPanel(
+                page: fixture.response(
+                  const IndexRequest(
+                    sessionId: 'fixture',
+                    kind: IndexQueryKind.treemap,
+                  ),
+                ),
+                directory: IndexDetail.fromJson(fixture.entry(1)),
+                allocated: false,
+                depth: depth,
+                onSelect: (_) {},
+                onOpen: (entry) => opened.add(entry.id),
+                onDetail: (_) {},
+                onShowList: (_) {},
+              ),
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+    }
+
+    Future<void> doubleTap(TreemapRect tile) async {
+      final point =
+          tester.getTopLeft(find.byKey(const Key('treemap-canvas'))) +
+          tile.hitRect.center;
+      await tester.tapAt(point);
+      await tester.pump(const Duration(milliseconds: 80));
+      await tester.tapAt(point);
+      await tester.pumpAndSettle();
+    }
+
+    await show(2);
+    final nested = painter(tester).tiles
+        .firstWhere((tile) => tile.item.id == 4);
+    expect(nested.expanded, isFalse);
+    await doubleTap(nested);
+    expect(opened, [4]);
+    await tester.pump(kDoubleTapTimeout);
+    final parent = painter(tester).tiles
+        .firstWhere((tile) => tile.item.id == 2);
+    expect(parent.expanded, isTrue);
+    await doubleTap(parent);
+    expect(opened, [4, 2]);
+    expect(tester.takeException(), isNull);
+  });
+  testWidgets(
+    'double taps do not open files, remainders, root or different tiles',
+    (tester) async {
+      await tester.binding.setSurfaceSize(const Size(1000, 900));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      final fixture = DepthFixture();
+      final opened = <int>[];
+      final page = IndexPage.fromJson({
+        ...fixture.metadata(),
+        'entries': [fixture.entry(2)],
+        'treemap': {
+          'totalBytes': 100000,
+          'otherBytes': 20000,
+          'childCount': 2,
+          'zeroCount': 0,
+          'unknownCount': 0,
+          'groups': [
+            {
+              'parentId': 2,
+              'totalBytes': 80000,
+              'childCount': 2,
+              'entries': [fixture.entry(3), fixture.entry(4)],
+            },
+            {
+              'parentId': 4,
+              'totalBytes': 50000,
+              'childCount': 1,
+              'entries': [fixture.entry(5)],
+            },
+          ],
+        },
+      });
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: SingleChildScrollView(
+              child: TreemapPanel(
+                page: page,
+                directory: IndexDetail.fromJson(fixture.entry(1)),
+                allocated: false,
+                depth: 3,
+                onSelect: (_) {},
+                onOpen: (entry) => opened.add(entry.id),
+                onDetail: (_) {},
+                onShowList: (_) {},
+              ),
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      Offset point(int id) =>
+          tester.getTopLeft(find.byKey(const Key('treemap-canvas'))) +
+          painter(tester).tiles
+              .firstWhere((tile) => tile.item.id == id)
+              .hitRect
+              .center;
+      for (final id in [1, 5, -1]) {
+        await tester.tapAt(point(id));
+        await tester.pump(const Duration(milliseconds: 80));
+        await tester.tapAt(point(id));
+        await tester.pumpAndSettle();
+        expect(painter(tester).selected, id);
+        expect(opened, isEmpty);
+        await tester.pump(kDoubleTapTimeout);
+      }
+      // Adjacent title bands are inside Flutter's double-tap slop, but are
+      // separate directories and must not navigate when tapped consecutively.
+      final childPoint = point(4);
+      final parentPoint = Offset(childPoint.dx, point(2).dy);
+      expect((parentPoint - childPoint).distance, lessThan(kDoubleTapSlop));
+      await tester.tapAt(parentPoint);
+      await tester.pump(const Duration(milliseconds: 80));
+      await tester.tapAt(childPoint);
+      await tester.pumpAndSettle();
+      expect(opened, isEmpty);
+      expect(painter(tester).selected, 4);
+      await tester.pump(kDoubleTapTimeout);
+      await tester.tapAt(childPoint);
+      await tester.pump(const Duration(milliseconds: 80));
+      final canceled = await tester.startGesture(childPoint);
+      await canceled.cancel();
+      await tester.pump(kDoubleTapTimeout);
+      await tester.pumpAndSettle();
+      expect(opened, isEmpty);
+      expect(tester.takeException(), isNull);
+    },
+  );
 }
