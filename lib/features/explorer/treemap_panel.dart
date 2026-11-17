@@ -16,13 +16,15 @@ class TreemapPanel extends StatefulWidget {
     required this.onOpen,
     required this.onDetail,
     required this.onShowList,
+    required this.depth,
   });
   final IndexPage page;
   final IndexDetail directory;
   final bool allocated;
+  final int depth;
   final ValueChanged<IndexedEntry?> onSelect;
   final ValueChanged<IndexedEntry> onOpen, onDetail;
-  final VoidCallback onShowList;
+  final ValueChanged<int> onShowList;
   @override
   State<TreemapPanel> createState() => _TreemapPanelState();
 }
@@ -35,7 +37,8 @@ class _TreemapPanelState extends State<TreemapPanel> {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.page.revision != widget.page.revision ||
         oldWidget.directory.entry.id != widget.directory.entry.id ||
-        oldWidget.allocated != widget.allocated) {
+        oldWidget.allocated != widget.allocated ||
+        oldWidget.depth != widget.depth) {
       _selected = null;
     }
   }
@@ -44,8 +47,14 @@ class _TreemapPanelState extends State<TreemapPanel> {
   Widget build(BuildContext context) {
     final summary = widget.page.treemap;
     final entries = {
+      widget.directory.entry.id: widget.directory.entry,
       for (final e in widget.page.entries.take(treemapEntryLimit)) e.id: e,
+      for (final group in summary?.groups ?? <TreemapGroup>[])
+        for (final entry in group.entries) entry.id: entry,
     };
+    String entryLabel(IndexedEntry entry) => entry.nameHex.isEmpty
+        ? widget.page.session.rootPath
+        : displayScanPath(entry.nameHex);
     final selected = entries[_selected];
     void select(int id) {
       setState(() => _selected = id);
@@ -83,13 +92,17 @@ class _TreemapPanelState extends State<TreemapPanel> {
                     constraints.maxWidth,
                     (constraints.maxWidth * .62).clamp(260.0, 520.0),
                   );
-                  final weights = treemapWeights(
-                    widget.page.entries,
-                    summary.totalBytes,
-                    widget.allocated,
-                    size,
+                  final tiles = nestedTreemap(
+                    root: widget.directory.entry,
+                    children: widget.page.entries,
+                    groups: summary.groups,
+                    total: summary.totalBytes,
+                    depth: widget.depth,
+                    allocated: widget.allocated,
+                    size: size,
+                    headerHeight:
+                        MediaQuery.textScalerOf(context).scale(14) * 1.25 + 10,
                   );
-                  final tiles = squarify(weights, size);
                   final painter = TreemapPainter(
                     tiles: tiles,
                     entries: entries,
@@ -98,6 +111,8 @@ class _TreemapPanelState extends State<TreemapPanel> {
                     textScaler: MediaQuery.textScalerOf(context),
                     direction: Directionality.of(context),
                     onSelect: select,
+                    rootId: widget.directory.entry.id,
+                    rootLabel: entryLabel(widget.directory.entry),
                   );
                   return RepaintBoundary(
                     child: GestureDetector(
@@ -116,20 +131,44 @@ class _TreemapPanelState extends State<TreemapPanel> {
             Text(
               '${summary.childCount} 个直接子项 · ${summary.zeroCount} 个零贡献条目 · ${summary.unknownCount} 个含未知范围',
             ),
+            Wrap(
+              spacing: 6,
+              children: [
+                for (var level = 0; level <= widget.depth; level++)
+                  Chip(
+                    visualDensity: VisualDensity.compact,
+                    backgroundColor: TreemapPainter.levelColor(level),
+                    label: Text(
+                      '级别 $level',
+                      style: TextStyle(
+                        color: TreemapPainter.levelTextColor(level),
+                      ),
+                    ),
+                  ),
+              ],
+            ),
             const Text(
-              '颜色区分项目，面积表示所选口径的已知容量。小项、其余子项与目录自身占用合并为灰色区域；零贡献条目不绘制面积。',
+              '当前目录为级别 0，下钻后重新计级。颜色表示深度；同一目录内容区域的面积按所选容量分配，标题栏用于表示层级。灰色为小项、其余子项与目录自身占用，零贡献条目不绘制。',
               style: TextStyle(fontSize: 12),
             ),
+            if (summary.truncated)
+              const Text('已达到部分目录的显示预算，未展开的子树保留为整体；可选中目录继续下钻。'),
             const SizedBox(height: 8),
-            if (_selected == -1) ...[
+            if (_selected != null && _selected! < 0) ...[
               const Text(
                 '其余小项 / 目录自身',
                 style: TextStyle(fontWeight: FontWeight.bold),
               ),
-              const Text('此区域合并了未单独绘制的已知容量。切换目录列表可查看子项，目录自身 blocks 可在目录详情查看。'),
+              Text(
+                '所属目录：${entryLabel(entries[-_selected!]!)}。此区域合并了未单独绘制的已知容量。',
+              ),
+              TextButton(
+                onPressed: () => widget.onShowList(-_selected!),
+                child: const Text('查看所属目录列表'),
+              ),
             ] else if (selected != null) ...[
               Text(
-                displayScanPath(selected.nameHex),
+                entryLabel(selected),
                 maxLines: 2,
                 overflow: TextOverflow.ellipsis,
                 style: const TextStyle(fontWeight: FontWeight.bold),
@@ -142,7 +181,8 @@ class _TreemapPanelState extends State<TreemapPanel> {
               Wrap(
                 spacing: 8,
                 children: [
-                  if (selected.kind == 'directory')
+                  if (selected.kind == 'directory' &&
+                      selected.id != widget.directory.entry.id)
                     FilledButton.icon(
                       key: const Key('treemap-open'),
                       onPressed: () => widget.onOpen(selected),
@@ -162,7 +202,7 @@ class _TreemapPanelState extends State<TreemapPanel> {
           ],
           TextButton.icon(
             key: const Key('treemap-list'),
-            onPressed: widget.onShowList,
+            onPressed: () => widget.onShowList(widget.directory.entry.id),
             icon: const Icon(Icons.list),
             label: const Text('查看目录列表'),
           ),
@@ -181,6 +221,8 @@ class TreemapPainter extends CustomPainter {
     required this.textScaler,
     required this.direction,
     required this.onSelect,
+    required this.rootId,
+    required this.rootLabel,
   });
   final List<TreemapRect> tiles;
   final Map<int, IndexedEntry> entries;
@@ -189,20 +231,26 @@ class TreemapPainter extends CustomPainter {
   final TextScaler textScaler;
   final TextDirection direction;
   final ValueChanged<int> onSelect;
+  final int rootId;
+  final String rootLabel;
   static const _palette = [
-    Color(0xFF087F8C),
-    Color(0xFF3D6585),
-    Color(0xFF8C5F34),
-    Color(0xFF6B578B),
-    Color(0xFF39735C),
-    Color(0xFF8D4D60),
-    Color(0xFF5165A0),
+    Color(0xFF174F78),
+    Color(0xFF176C96),
+    Color(0xFF2A82AB),
+    Color(0xFF439ABD),
+    Color(0xFF60AEC9),
+    Color(0xFF7DC0D4),
+    Color(0xFF9AD1DF),
   ];
-  Color color(TreemapRect tile) => tile.item.grouped
-      ? const Color(0xFF65717A)
-      : _palette[tile.item.id % _palette.length];
+  static Color levelColor(int level) => _palette[level.clamp(0, 6)];
+  static Color levelTextColor(int level) =>
+      levelColor(level).computeLuminance() > .3 ? Colors.black87 : Colors.white;
+  Color color(TreemapRect tile) =>
+      tile.item.grouped ? const Color(0xFF65717A) : levelColor(tile.level);
   String label(TreemapRect tile) => tile.item.grouped
       ? '其余小项 / 目录自身'
+      : tile.item.id == rootId
+      ? rootLabel
       : displayScanPath(entries[tile.item.id]!.nameHex);
 
   @override
@@ -231,25 +279,22 @@ class TreemapPainter extends CustomPainter {
           Paint()..color = const Color(0xFFFFD978),
         );
       }
-      if (tile.item.id == selected) {
-        canvas.drawRect(
-          rect.deflate(2),
-          Paint()
-            ..color = const Color(0xFFFFE29A)
-            ..style = PaintingStyle.stroke
-            ..strokeWidth = 4,
-        );
-      }
+      final labelRect = tile.hitRect;
       if (labels >= treemapLabelLimit ||
-          rect.width < 72 ||
-          rect.height < textScaler.scale(32) + 12) {
+          labelRect.width < 56 ||
+          labelRect.height < textScaler.scale(14) + 8) {
         continue;
       }
+      final foreground = tile.item.grouped
+          ? Colors.white
+          : levelTextColor(tile.level);
       final text = TextPainter(
         text: TextSpan(
-          text: label(tile),
-          style: const TextStyle(
-            color: Colors.white,
+          text: tile.expanded
+              ? '${label(tile)} · ${formatBytes(tile.item.bytes)}'
+              : label(tile),
+          style: TextStyle(
+            color: foreground,
             fontSize: 12,
             fontWeight: FontWeight.w600,
           ),
@@ -258,27 +303,39 @@ class TreemapPainter extends CustomPainter {
         textScaler: textScaler,
         maxLines: 1,
         ellipsis: '…',
-      )..layout(maxWidth: rect.width - 16);
+      )..layout(maxWidth: labelRect.width - 16);
       final amount = TextPainter(
         text: TextSpan(
           text: formatBytes(tile.item.bytes),
-          style: const TextStyle(color: Colors.white, fontSize: 12),
+          style: TextStyle(color: foreground, fontSize: 12),
         ),
         textDirection: direction,
         textScaler: textScaler,
         maxLines: 1,
         ellipsis: '…',
-      )..layout(maxWidth: rect.width - 16);
-      if (text.height + amount.height + 2 <= rect.height - 12) {
+      )..layout(maxWidth: labelRect.width - 16);
+      if (text.height <= labelRect.height - 8) {
         canvas.save();
-        canvas.clipRect(rect.deflate(4));
-        text.paint(canvas, rect.topLeft + const Offset(8, 6));
-        amount.paint(canvas, rect.topLeft + Offset(8, 8 + text.height));
+        canvas.clipRect(labelRect.deflate(2));
+        text.paint(canvas, labelRect.topLeft + const Offset(8, 4));
+        if (!tile.expanded &&
+            text.height + amount.height + 2 <= labelRect.height - 12) {
+          amount.paint(canvas, labelRect.topLeft + Offset(8, 6 + text.height));
+        }
         canvas.restore();
         labels++;
       }
       text.dispose();
       amount.dispose();
+    }
+    for (final tile in tiles.where((tile) => tile.item.id == selected)) {
+      canvas.drawRect(
+        tile.rect.deflate(2),
+        Paint()
+          ..color = const Color(0xFFFFE29A)
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 4,
+      );
     }
   }
 
@@ -287,10 +344,10 @@ class TreemapPainter extends CustomPainter {
       (size) => [
         for (final tile in tiles)
           CustomPainterSemantics(
-            rect: tile.rect,
+            rect: tile.hitRect,
             properties: SemanticsProperties(
               label:
-                  '${label(tile)}，${formatBytes(tile.item.bytes)}'
+                  '级别 ${tile.level}，${label(tile)}，${formatBytes(tile.item.bytes)}'
                   '${entries[tile.item.id]?.complete == false ? '，有未知范围' : ''}',
               textDirection: direction,
               button: true,

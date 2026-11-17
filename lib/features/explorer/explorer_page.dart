@@ -302,6 +302,31 @@ class _ExplorerPageState extends State<ExplorerPage>
                                               c.setMetric(v.single),
                                             ),
                                     ),
+                                    if (c.treemap)
+                                      DropdownButton<int>(
+                                        key: const Key('treemap-depth'),
+                                        value: c.treemapDepth,
+                                        items: [
+                                          for (
+                                            var level = 0;
+                                            level <= 6;
+                                            level++
+                                          )
+                                            DropdownMenuItem(
+                                              value: level,
+                                              child: Text('显示到级别 $level'),
+                                            ),
+                                        ],
+                                        onChanged: c.loading
+                                            ? null
+                                            : (value) {
+                                                if (value != null) {
+                                                  unawaited(
+                                                    c.setTreemapDepth(value),
+                                                  );
+                                                }
+                                              },
+                                      ),
                                     if (!c.treemap)
                                       DropdownButton<IndexSort>(
                                         key: const Key('explorer-sort'),
@@ -369,12 +394,16 @@ class _ExplorerPageState extends State<ExplorerPage>
                               page: c.page!,
                               directory: c.directory!,
                               allocated: c.allocated,
+                              depth: c.treemapDepth,
                               onSelect: (entry) =>
                                   setState(() => _selected = entry?.id),
                               onOpen: (entry) => _navigate(entry.id),
                               onDetail: (entry) => _detail(entry.id, wide),
-                              onShowList: () =>
-                                  unawaited(c.setLargeFiles(false)),
+                              onShowList: (id) {
+                                _selected = null;
+                                c.directoryId = id;
+                                unawaited(c.setLargeFiles(false));
+                              },
                             ),
                           ),
                         if (!c.treemap &&

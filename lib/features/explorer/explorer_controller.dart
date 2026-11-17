@@ -10,6 +10,7 @@ class ExplorerController extends ChangeNotifier {
   int directoryId = 1;
   bool largeFiles = false;
   bool treemap = false;
+  int treemapDepth = 3;
   bool allocated = false;
   IndexSort sort = IndexSort.logical;
   IndexPage? page;
@@ -35,6 +36,7 @@ class ExplorerController extends ChangeNotifier {
             ? (allocated ? IndexSort.allocated : IndexSort.logical)
             : sort,
         limit: treemap ? 100 : 50,
+        depth: treemapDepth,
         cursor: cursor,
       );
 
@@ -151,6 +153,13 @@ class ExplorerController extends ChangeNotifier {
     if (sort != IndexSort.name) {
       sort = value ? IndexSort.allocated : IndexSort.logical;
     }
+    await load();
+  }
+
+  Future<void> setTreemapDepth(int value) async {
+    if (value < 0 || value > 6 || value == treemapDepth) return;
+    treemapDepth = value;
+    page = null;
     await load();
   }
 

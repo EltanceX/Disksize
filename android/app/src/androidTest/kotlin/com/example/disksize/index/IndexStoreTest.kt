@@ -269,4 +269,63 @@ class IndexStoreTest {
         assertEquals("partial", result.getString("state")); assertEquals(3, result.getLong("logicalBytes"))
         assertEquals(8192, result.getLong("allocatedBytes"))
     }
+    @Test fun treemapDepthUsesRelativeLevelsAndKeepsBothMetricsAdditive() = withStore { store ->
+        val id = UUID.randomUUID().toString()
+        store.begin(id, "/fixture", "ordinary", Process.myUid(), Process.myPid()).use {
+            it.node(node(1, 0, "", 4096, 1))
+            it.node(node(2, 1, "one", 4096, 2).copy(kind = 1))
+            it.node(node(3, 2, "two", 4096, 3).copy(kind = 1, depth = 2))
+            it.node(node(4, 3, "three", 4096, 4).copy(kind = 1, depth = 3))
+            it.node(node(5, 4, "four", 8192, 5).copy(depth = 4, allocated = 0))
+            it.node(node(6, 1, "file", 100, 6))
+            for (n in 1L..4) it.directory(n, true, true, 0)
+            it.flush()
+        }
+        store.finalize(id, StreamSummary("completed", 6, 0, 1, 2, 0, 1, 1)) { false }
+        fun query(depth: Int? = null, parent: Long = 1, sort: String = "logical"): JSONObject {
+            val request = JSONObject().put("kind", "treemap").put("sessionId", id).put("parentId", parent).put("sort", sort)
+            if (depth != null) request.put("depth", depth)
+            return JSONObject(IndexQueries(store).query(request.toString()))
+        }
+        assertEquals(3, query().getJSONObject("treemap").getInt("depth"))
+        for (sort in listOf("logical", "allocated")) for (depth in 0..6) {
+            val result = query(depth, sort = sort); assertEquals("ok", result.getString("status"))
+            val summary = result.getJSONObject("treemap"); val groups = summary.getJSONArray("groups")
+            assertEquals(if (depth == 0) 0 else 2, result.getJSONArray("entries").length())
+            val expected = when (depth) { 0, 1 -> emptyList(); 2 -> listOf(2L); 3 -> listOf(2L, 3L); else -> listOf(2L, 3L, 4L) }
+            assertEquals(expected, (0 until groups.length()).map { groups.getJSONObject(it).getLong("parentId") })
+            assertFalse(summary.getBoolean("truncated"))
+            val key = if (sort == "logical") "logicalBytes" else "allocatedBytes"
+            for (i in 0 until groups.length()) {
+                val group = groups.getJSONObject(i); val rows = group.getJSONArray("entries")
+                assertTrue((0 until rows.length()).sumOf { rows.getJSONObject(it).getLong(key) } <= group.getLong("totalBytes"))
+            }
+        }
+        assertEquals(0, query(0).getJSONArray("entries").length())
+        assertEquals(5, query(3, parent = 2).getJSONObject("treemap").getJSONArray("groups").getJSONObject(1).getJSONArray("entries").getJSONObject(0).getLong("id"))
+    }
+    @Test fun hierarchicalTreemapHasGlobalBudgetsAcrossWideDirectories() = withStore { store ->
+        val id = UUID.randomUUID().toString(); var next = 2L
+        store.begin(id, "/fixture", "ordinary", Process.myUid(), Process.myPid()).use { writer ->
+            writer.node(node(1, 0, "", 4096, 1))
+            repeat(100) { branch ->
+                val parent = next++; writer.node(node(parent, 1, "dir-$branch", 4096, parent).copy(kind = 1))
+                repeat(100) { leaf -> val current = next++; writer.node(node(current, parent, "file-$leaf", 100, current).copy(depth = 2)) }
+                writer.directory(parent, true, true, 0)
+            }
+            writer.directory(1, true, true, 0); writer.flush()
+        }
+        store.finalize(id, StreamSummary("completed", next - 1, 0, 1, 2, 0, 1, 1)) { false }
+        for (sort in listOf("logical", "allocated")) {
+            val result = JSONObject(IndexQueries(store).query(JSONObject().put("kind", "treemap").put("sessionId", id)
+                .put("parentId", 1).put("sort", sort).put("depth", 6).toString()))
+            val summary = result.getJSONObject("treemap"); val groups = summary.getJSONArray("groups")
+            assertTrue(summary.getBoolean("truncated")); assertTrue(groups.length() <= 48)
+            var count = result.getJSONArray("entries").length()
+            for (i in 0 until groups.length()) count += groups.getJSONObject(i).getJSONArray("entries").length()
+            assertEquals(300, count); assertEquals(count, summary.getInt("nodeCount")); assertTrue(result.toString().length < 310000)
+        }
+        for (depth in listOf(-1, 7)) assertEquals("invalid-query", JSONObject(IndexQueries(store).query(JSONObject().put("kind", "treemap")
+            .put("sessionId", id).put("parentId", 1).put("depth", depth).toString())).getString("status"))
+    }
 }

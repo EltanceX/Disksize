@@ -47,6 +47,12 @@ void main() {
       for (var i = 0; i < 120; i++) {
         await File('${stress.path}/tile-$i').writeAsBytes(List.filled(4096, 1));
       }
+      final nested = await Directory('${fixture.path}/Projects/Build/Cache')
+          .create(recursive: true);
+      for (var i = 0; i < 6; i++) {
+        await File('${nested.path}/artifact-$i')
+            .writeAsBytes(List.filled(2 * 1024 * 1024, 1));
+      }
       final sparse = await File('${fixture.path}/sparse-64MiB')
           .open(mode: FileMode.write);
       await sparse.truncate(64 * 1024 * 1024);
@@ -66,7 +72,9 @@ void main() {
       );
       queryTime.stop();
       expect(map.entries.length, 100);
-      expect(map.treemap!.childCount, 210);
+      expect(map.treemap!.childCount, 211);
+      expect(map.treemap!.depth, 3);
+      expect(map.treemap!.groups, isNotEmpty);
       expect(map.treemap!.otherBytes, greaterThan(0));
       final weights = treemapWeights(
         map.entries,
@@ -123,11 +131,13 @@ void main() {
       await tester.pumpAndSettle();
       await reveal(find.byKey(const Key('treemap-canvas')));
       final folder = painter().tiles.firstWhere(
-        (tile) => painter().entries[tile.item.id]?.kind == 'directory',
+        (tile) =>
+            tile.level == 1 &&
+            painter().entries[tile.item.id]?.kind == 'directory',
       );
       await tester.tapAt(
         tester.getTopLeft(find.byKey(const Key('treemap-canvas'))) +
-            folder.rect.center,
+            folder.hitRect.center,
       );
       await tester.pumpAndSettle();
       await reveal(find.byKey(const Key('treemap-open')));
@@ -143,20 +153,20 @@ void main() {
       });
       await tester.tapAt(
         tester.getTopLeft(find.byKey(const Key('treemap-canvas'))) +
-            stressTile.rect.center,
+            stressTile.hitRect.center,
       );
       await tester.pumpAndSettle();
       await reveal(find.byKey(const Key('treemap-open')));
       await tester.tap(find.byKey(const Key('treemap-open')));
       await tester.pumpAndSettle();
       await reveal(find.byKey(const Key('treemap-canvas')));
-      expect(painter().tiles.length, 101);
+      expect(painter().tiles.length, 102);
       SchedulerBinding.instance.addTimingsCallback(record);
       for (var i = 0; i < 40; i++) {
-        final tile = painter().tiles[i % 2];
+        final tile = painter().tiles[1 + i % 2];
         await tester.tapAt(
           tester.getTopLeft(find.byKey(const Key('treemap-canvas'))) +
-              tile.rect.center,
+              tile.hitRect.center,
         );
         await tester.pump();
         await Future<void>.delayed(const Duration(milliseconds: 25));
@@ -192,6 +202,44 @@ void main() {
         'queryEntries': map.entries.length,
         'childCount': map.treemap!.childCount,
       };
+      await tester.tap(find.byType(BackButton).first);
+      await tester.pumpAndSettle();
+      await tester.scrollUntilVisible(
+        find.byKey(const Key('treemap-depth')),
+        -200,
+        scrollable: find.byType(Scrollable).first,
+      );
+      await tester.pumpAndSettle();
+      expect(
+        tester
+            .widget<DropdownButton<int>>(find.byKey(const Key('treemap-depth')))
+            .value,
+        3,
+      );
+      Future<void> chooseDepth(int level) async {
+        await tester.scrollUntilVisible(
+          find.byKey(const Key('treemap-depth')),
+          -200,
+          scrollable: find.byType(Scrollable).first,
+        );
+        await tester.pumpAndSettle();
+        await tester.tap(find.byKey(const Key('treemap-depth')));
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('显示到级别 $level').last);
+        await tester.pumpAndSettle();
+        await reveal(find.byKey(const Key('treemap-canvas')));
+      }
+
+      await chooseDepth(0);
+      expect(painter().tiles.single.level, 0);
+      await chooseDepth(6);
+      expect(painter().tiles.any((tile) => tile.level >= 3), isTrue);
+      expect(painter().tiles.length, lessThanOrEqualTo(treemapRectangleLimit));
+      await chooseDepth(3);
+      expect(painter().tiles.any((tile) => tile.level == 3), isTrue);
+      expect(painter().tiles.every((tile) => tile.level <= 3), isTrue);
+      binding.reportData!['depth'] = 3;
+      binding.reportData!['nestedRectangles'] = painter().tiles.length;
       await binding.convertFlutterSurfaceToImage();
       await tester.pumpAndSettle();
       await File('${access.externalOwnPath!}/phase7-treemap.png')

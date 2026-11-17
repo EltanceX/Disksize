@@ -26,7 +26,7 @@ try {
     $vm = $null
     $deadline = [DateTime]::UtcNow.AddSeconds(30)
     do {
-        $appPid = ([string](& $adb -s $Serial shell pidof com.example.disksize)).Trim()
+        $appPid = ([string]::Join(' ', @(& $adb -s $Serial shell pidof com.example.disksize))).Trim()
         if ($appPid -match '^\d+$') {
             $output = (& $adb -s $Serial logcat -d --pid=$appPid) -join "`n"
             if ($output -match 'Dart VM service is listening on http://127\.0\.0\.1:(\d+)(/\S*)') {

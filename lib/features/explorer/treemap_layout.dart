@@ -5,17 +5,31 @@ import '../../platform/index_client.dart';
 
 const treemapEntryLimit = 100;
 const treemapLabelLimit = 48;
+const treemapNodeLimit = 300;
+const treemapRectangleLimit = 350;
 
 final class TreemapWeight {
   const TreemapWeight(this.id, this.bytes);
   final int id, bytes;
-  bool get grouped => id == -1;
+  bool get grouped => id < 0;
 }
 
 final class TreemapRect {
-  const TreemapRect(this.item, this.rect);
+  const TreemapRect(
+    this.item,
+    this.rect, {
+    this.level = 1,
+    this.parentId = 0,
+    this.headerHeight = 0,
+  });
   final TreemapWeight item;
   final Rect rect;
+  final int level, parentId;
+  final double headerHeight;
+  bool get expanded => headerHeight > 0;
+  Rect get hitRect => expanded
+      ? Rect.fromLTWH(rect.left, rect.top, rect.width, headerHeight)
+      : rect;
 }
 
 /// Only the current directory's largest entries reach Dart. Everything omitted,
@@ -128,9 +142,93 @@ List<TreemapRect> squarify(List<TreemapWeight> items, Size size) {
   return List.unmodifiable(output);
 }
 
+/// Children overlap their ancestor's frame, so the deepest painted item wins.
 TreemapRect? hitTreemap(List<TreemapRect> tiles, Offset point) {
-  for (final tile in tiles) {
+  for (final tile in tiles.reversed) {
     if (tile.rect.contains(point)) return tile;
   }
   return null;
+}
+
+/// A bounded hierarchy of paint records, with a title band on expanded folders.
+/// Sibling proportions refer to their parent's content area, excluding its band.
+List<TreemapRect> nestedTreemap({
+  required IndexedEntry root,
+  required List<IndexedEntry> children,
+  required List<TreemapGroup> groups,
+  required int total,
+  required int depth,
+  required bool allocated,
+  required Size size,
+  required double headerHeight,
+  double minimumArea = 900,
+}) {
+  if (total <= 0 || size.isEmpty || !size.isFinite) return const [];
+  final branches = {for (final group in groups.take(48)) group.parentId: group};
+  final output = <TreemapRect>[];
+  var nodes = 0;
+  void visit(
+    IndexedEntry entry,
+    Rect rect,
+    int level,
+    int parentId,
+    int bytes,
+  ) {
+    if (output.length >= treemapRectangleLimit) return;
+    final branch = branches[entry.id];
+    final items = level == 0 ? children : branch?.entries;
+    final canExpand =
+        entry.kind == 'directory' &&
+        level < depth &&
+        items != null &&
+        items.isNotEmpty &&
+        rect.width >= 48 &&
+        rect.height >= headerHeight + 28 &&
+        nodes < treemapNodeLimit;
+    final band = canExpand ? headerHeight : 0.0;
+    output.add(
+      TreemapRect(
+        TreemapWeight(entry.id, bytes),
+        rect,
+        level: level,
+        parentId: parentId,
+        headerHeight: band,
+      ),
+    );
+    if (!canExpand) return;
+    final content = Rect.fromLTRB(
+      rect.left + 2,
+      rect.top + band,
+      rect.right - 2,
+      rect.bottom - 2,
+    );
+    final available = (treemapNodeLimit - nodes).clamp(0, treemapEntryLimit);
+    final weights = treemapWeights(
+      items.take(available).toList(),
+      bytes,
+      allocated,
+      content.size,
+      minimumArea: minimumArea,
+    );
+    for (final tile in squarify(weights, content.size)) {
+      final positioned = tile.rect.shift(content.topLeft);
+      if (tile.item.grouped) {
+        output.add(
+          TreemapRect(
+            TreemapWeight(-entry.id, tile.item.bytes),
+            positioned,
+            level: level + 1,
+            parentId: entry.id,
+          ),
+        );
+      } else {
+        final child = items.firstWhere((item) => item.id == tile.item.id);
+        nodes++;
+        visit(child, positioned, level + 1, entry.id, tile.item.bytes);
+      }
+    }
+  }
+
+  visit(root, Offset.zero & size, 0, 0, total);
+  return List.unmodifiable(output);
 }

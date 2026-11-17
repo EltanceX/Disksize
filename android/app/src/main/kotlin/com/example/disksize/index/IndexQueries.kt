@@ -59,19 +59,22 @@ internal class IndexQueries(private val store: IndexStore) {
             }
             "issues" -> issues(db, id, node, limit, cursor, signature, revision, result)
             "children", "large-files" -> entries(db, id, kind, parent, sort, limit, cursor, signature, revision, result)
-            "treemap" -> treemap(db, id, parent, sort, limit, signature, revision, result)
+            "treemap" -> {
+                val depth = q.optInt("depth", 3); require(depth in 0..6)
+                treemap(db, id, parent, sort, limit, depth, signature, revision, result)
+            }
         }
         // Every indexed write advances revision atomically. Only accept a stable read interval.
         if (metadata(db, id)?.getLong("revision") != revision) return JSONObject().put("status", "stale-cursor")
         return result
     }
-    private fun treemap(db: SQLiteDatabase, id: String, parent: Long, sort: String, limit: Int, signature: String, revision: Long, result: JSONObject) {
+    private fun treemap(db: SQLiteDatabase, id: String, parent: Long, sort: String, limit: Int, depth: Int, signature: String, revision: Long, result: JSONObject) {
         // In-progress aggregates are not additive yet. Never draw them as proportions.
         if (result.getBoolean("provisional")) return
         val total = db.rawQuery("SELECT $sort FROM aggregates WHERE sid=? AND id=? AND kind=1", arrayOf(id, parent.toString())).use {
             if (!it.moveToFirst()) { result.put("status", "not-found"); return }; it.getLong(0)
         }
-        entries(db, id, "children", parent, sort, limit, null, signature, revision, result)
+        if (depth > 0) entries(db, id, "children", parent, sort, limit, null, signature, revision, result)
         result.remove("nextCursor"); result.remove("previousCursor")
         val rows = result.getJSONArray("entries")
         var represented = 0L
@@ -85,6 +88,42 @@ internal class IndexQueries(private val store: IndexStore) {
             result.put("treemap", JSONObject().put("totalBytes", total).put("otherBytes", total - represented)
                 .put("childCount", it.getLong(0)).put("zeroCount", it.getLong(1)).put("unknownCount", it.getLong(2)))
         }
+        val summary = result.getJSONObject("treemap").put("depth", depth)
+        val groups = JSONArray()
+        data class Candidate(val node: Long, val level: Int, val bytes: Long)
+        val pending = java.util.PriorityQueue<Candidate>(compareByDescending<Candidate> { it.bytes }.thenBy { it.node })
+        fun enqueue(items: JSONArray, level: Int) {
+            if (level >= depth) return
+            for (i in 0 until items.length()) {
+                val row = items.getJSONObject(i)
+                if (row.getString("kind") == "directory" && row.getLong(key) > 0)
+                    pending.add(Candidate(row.getLong("id"), level, row.getLong(key)))
+            }
+        }
+        enqueue(rows, 1)
+        var count = rows.length(); var budget = rows.toString().length
+        var truncated = depth > 0 && summary.getLong("childCount") > rows.length()
+        // Global node, branch and serialized-text budgets apply to the entire hierarchy.
+        // The existing children indexes keep each expansion bounded independently.
+        while (pending.isNotEmpty() && count < 300 && groups.length() < 48 && budget < 300000) {
+            val candidate = pending.remove()
+            val branch = JSONObject()
+            entries(db, id, "children", candidate.node, sort, minOf(limit, 300 - count), null, signature, revision, branch)
+            val children = branch.getJSONArray("entries")
+            branch.remove("nextCursor"); branch.remove("previousCursor")
+            val representedBytes = (0 until children.length()).fold(0L) { sum, i -> Math.addExact(sum, children.getJSONObject(i).getLong(key)) }
+            if (representedBytes > candidate.bytes) { result.put("status", "inconsistent-index"); return }
+            val childCount = db.rawQuery("SELECT COUNT(*) FROM aggregates WHERE sid=? AND parent=?", arrayOf(id, candidate.node.toString())).use {
+                it.moveToFirst(); it.getLong(0)
+            }
+            branch.put("parentId", candidate.node).put("totalBytes", candidate.bytes).put("childCount", childCount)
+            val branchSize = branch.toString().length
+            if (budget + branchSize > 300000) { truncated = true; break }
+            groups.put(branch); budget += branchSize; count += children.length()
+            if (childCount > children.length()) truncated = true
+            enqueue(children, candidate.level + 1)
+        }
+        summary.put("groups", groups).put("nodeCount", count).put("truncated", truncated || pending.isNotEmpty())
     }
     private data class Row(val value: JSONObject, val id: Long, val key: String)
     private fun pages(rows: MutableList<Row>, limit: Int, cursor: JSONObject?, signature: String, revision: Long, result: JSONObject, field: String) {

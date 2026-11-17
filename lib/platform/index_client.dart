@@ -22,11 +22,12 @@ final class IndexRequest {
     this.nodeId = 0,
     this.sort = IndexSort.logical,
     this.limit = 100,
+    this.depth = 3,
     this.cursor,
   });
   final String sessionId;
   final IndexQueryKind kind;
-  final int parentId, nodeId, limit;
+  final int parentId, nodeId, limit, depth;
   final IndexSort sort;
   final String? cursor;
 
@@ -37,6 +38,7 @@ final class IndexRequest {
     'nodeId': nodeId,
     'sort': sort.name,
     'limit': limit,
+    if (kind == IndexQueryKind.treemap) 'depth': depth,
     'cursor': cursor ?? '',
   };
 }
@@ -155,8 +157,32 @@ final class TreemapSummary {
       otherBytes = value['otherBytes'] as int,
       childCount = value['childCount'] as int,
       zeroCount = value['zeroCount'] as int,
-      unknownCount = value['unknownCount'] as int;
+      unknownCount = value['unknownCount'] as int,
+      depth = value['depth'] as int? ?? 1,
+      truncated = value['truncated'] as bool? ?? false,
+      groups = List.unmodifiable(
+        (value['groups'] as List? ?? []).map(
+          (e) => TreemapGroup.fromJson(e as Map<String, dynamic>),
+        ),
+      );
   final int totalBytes, otherBytes, childCount, zeroCount, unknownCount;
+  final int depth;
+  final bool truncated;
+  final List<TreemapGroup> groups;
+}
+
+final class TreemapGroup {
+  TreemapGroup.fromJson(Map<String, dynamic> value)
+    : parentId = value['parentId'] as int,
+      totalBytes = value['totalBytes'] as int,
+      childCount = value['childCount'] as int,
+      entries = List.unmodifiable(
+        (value['entries'] as List).map(
+          (e) => IndexedEntry.fromJson(e as Map<String, dynamic>),
+        ),
+      );
+  final int parentId, totalBytes, childCount;
+  final List<IndexedEntry> entries;
 }
 
 final class IndexAncestor {

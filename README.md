@@ -51,7 +51,7 @@ Root 真机验证和协议单元测试见[阶段 4 工具说明](tools/phase4/RE
 
 目录、大文件界面和真实索引交互验证见[阶段 6 工具说明](tools/phase6/README.md)。本阶段将 schema 升级至 3、增量协议升级至 v3，保留旧数据库数据；验收与范围说明见[阶段 6 文档](docs/phase6-explorer.md)。
 
-矩形树图见[阶段 7 验收](docs/phase7-treemap.md)。快照与增长对比将 schema 升至 4，原生协议继续使用 v3，旧索引保留；兼容性、未知范围与删除边界见[阶段 8 验收](docs/phase8-snapshots.md)，复现步骤见[阶段 8 工具说明](tools/phase8/README.md)。
+矩形树图支持 0～6 级深度，默认级别 3；当前目录为级别 0，下钻后重新计级。目录标题栏、嵌套色块和层级图例显示父子关系，旧索引可直接使用。范围与实测见[阶段 7 验收](docs/phase7-treemap.md)。快照与增长对比将 schema 升至 4，原生协议继续使用 v3，旧索引保留；兼容性、未知范围与删除边界见[阶段 8 验收](docs/phase8-snapshots.md)，复现步骤见[阶段 8 工具说明](tools/phase8/README.md)。
 
 修改 `pigeons/scanner_api.dart` 后运行 `tools/generate-bridge.ps1`，将 Dart 与 Kotlin 生成文件一同提交。应用的 `pubspec.lock`、Gradle Wrapper 和生成桥接代码均纳入版本管理。
 
