@@ -68,6 +68,19 @@ internal object ExternalOpener {
         return null
     }
 
+    private fun isOtherAppData(context: Context, file: File): Boolean {
+        val parts = file.toPath().normalize().map { it.toString() }
+        val owner = when {
+            parts.size >= 3 && parts[0] == "data" && parts[1] == "data" -> 0 to parts[2]
+            parts.size >= 4 && parts[0] == "data" && parts[1] in setOf("user", "user_de") ->
+                parts[2].toIntOrNull()?.let { it to parts[3] }
+            parts.size >= 6 && parts[0] == "mnt" && parts[1] == "expand" && parts[3] in setOf("user", "user_de") ->
+                parts[4].toIntOrNull()?.let { it to parts[5] }
+            else -> null
+        } ?: return false
+        return owner.first != Process.myUid() / 100000 || owner.second != context.packageName
+    }
+
     fun prepare(context: Context, selectedFile: File, kind: String): Intent {
         if (kind !in setOf("regular", "directory")) throw FlutterError("unsupported-entry", "符号链接和特殊文件暂不支持直接打开。", null)
         // Root scans see primary shared storage below /data/media, which an
@@ -94,6 +107,11 @@ internal object ExternalOpener {
                     DocumentsContract.buildTreeDocumentUri(uri.authority, DocumentsContract.getDocumentId(uri)) else uri)
             }
         } catch (error: ErrnoException) {
+            // App-data isolation can hide another package from this process's
+            // mount namespace with ENOENT even when root just scanned it.
+            if (error.errno == OsConstants.ENOENT && isOtherAppData(context, file)) {
+                throw FlutterError("entry-inaccessible", "此路径属于其他应用的私有数据，当前应用无法访问或确认是否存在。可复制路径到支持 Root 的文件管理器。", null)
+            }
             throw FlutterError(if (error.errno == OsConstants.ENOENT) "entry-not-found" else "entry-inaccessible",
                 if (error.errno == OsConstants.ENOENT) "文件或目录已不存在，快照仅保留扫描时的记录。"
                 else "当前应用无法访问此路径。Root 扫描权限不能传给其他应用；可复制路径到支持 Root 的文件管理器。", null)

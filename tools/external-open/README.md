@@ -25,6 +25,8 @@ profile 测试在应用自己的目录中创建独立样本，真实扫描后分
 adb -s '<device-id>' shell am instrument -w -r -e class com.example.disksize.open.ExternalOpenTest com.example.disksize.test/androidx.test.runner.AndroidJUnitRunner
 ```
 
-应看到 `OK (6 tests)`，不能只依据 adb 命令退出码判断。测试要求设备安装兼容的系统 Files/DocumentsUI。独立测试 Activity 在测试 APK 的普通 UID 下读取授权 URI；通过测试驱动启动，避免设备厂商跨应用启动提示影响权限断言。样本位于应用缓存目录，完成后清理，不访问用户文件。
+应看到 `OK (7 tests)`，不能只依据 adb 命令退出码判断。测试要求设备安装兼容的系统 Files/DocumentsUI。独立测试 Activity 在测试 APK 的普通 UID 下读取授权 URI；通过测试驱动启动，避免设备厂商跨应用启动提示影响权限断言。样本位于应用缓存目录，完成后清理，不访问用户文件。
+
+私有目录隔离回归默认使用独立包名验证无法确认目标是否存在时的提示。可在 `am instrument` 命令的测试组件名前添加 `-e privateDataPackage '<已安装且当前应用不可访问的包名>'`，验证真实隔离目录；只检查该路径的元数据错误及打开提示，不读取其他应用的文件内容。
 
 功能范围与权限说明见[使用其他应用打开](../../docs/external-open.md)。
