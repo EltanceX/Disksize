@@ -9,6 +9,79 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:integration_test/integration_test.dart';
 
+// Exercise the real deletion flow against this run's fixtures only. Historical
+// snapshots must never be selected by the integration test's default select-all.
+class _FixtureSnapshotClient implements SnapshotClient {
+  _FixtureSnapshotClient(this.client, Iterable<String> ids) : ids = ids.toSet();
+  final SnapshotClient client;
+  final Set<String> ids;
+
+  @override
+  Future<SnapshotList> list({String? cursor}) async {
+    while (true) {
+      final page = await client.list(cursor: cursor);
+      final items = page.snapshots.where((item) => ids.contains(item.id));
+      if (items.isNotEmpty || page.nextCursor == null) {
+        return SnapshotList.fromJson({
+          'nextCursor': page.nextCursor,
+          'snapshots': [
+            for (final item in items)
+              {
+                'id': item.id,
+                'rootPath': item.rootPath,
+                'backend': item.backend,
+                'state': item.state,
+                'startedAtMillis': item.started,
+                'endedAtMillis': item.ended,
+                'logicalBytes': item.logical,
+                'allocatedBytes': item.allocated,
+                'complete': item.complete,
+                'retained': item.retained,
+                'available': item.available,
+              },
+          ],
+        });
+      }
+      cursor = page.nextCursor;
+    }
+  }
+
+  void _check(String id) {
+    if (!ids.contains(id)) throw StateError('Not a snapshot fixture: $id');
+  }
+
+  @override
+  Future<void> delete(String id) {
+    _check(id);
+    return client.delete(id);
+  }
+
+  @override
+  Future<void> retain(String id, bool retained) {
+    _check(id);
+    return client.retain(id, retained);
+  }
+
+  @override
+  Future<SnapshotComparison> compare(
+    String base,
+    String target, {
+    String sort = 'logical',
+    String filter = 'all',
+    String? cursor,
+  }) {
+    _check(base);
+    _check(target);
+    return client.compare(
+      base,
+      target,
+      sort: sort,
+      filter: filter,
+      cursor: cursor,
+    );
+  }
+}
+
 void main() {
   final binding = IntegrationTestWidgetsFlutterBinding.ensureInitialized();
   testWidgets('real scans, frozen snapshots, growth, retention and deletion', (
@@ -117,7 +190,7 @@ void main() {
       await tester.pumpWidget(
         MaterialApp(
           home: SnapshotsPage(
-            client: client,
+            client: _FixtureSnapshotClient(client, ids),
             indexClient: index,
             initialBase: a,
           ),
@@ -125,6 +198,45 @@ void main() {
       );
       await tester.pumpAndSettle();
       expect(find.text('快照与增长对比'), findsOneWidget);
+      await tester.tap(find.byKey(const Key('snapshot-batch-delete')));
+      await tester.pumpAndSettle();
+      expect(
+        tester
+            .widget<CheckboxListTile>(
+              find.byKey(const Key('snapshot-select-all')),
+            )
+            .value,
+        isTrue,
+      );
+      final retained = tester.widget<CheckboxListTile>(
+        find.byKey(ValueKey('snapshot-select-$a')),
+      );
+      expect(retained.value, isFalse);
+      expect(retained.onChanged, isNull);
+      expect(
+        tester
+            .widget<CheckboxListTile>(
+              find.byKey(ValueKey('snapshot-select-$b')),
+            )
+            .value,
+        isTrue,
+      );
+      if (external != null) {
+        await File(
+          '$external/phase8-batch-selection.png',
+        ).writeAsBytes(await binding.takeScreenshot('phase8-batch-selection'));
+      }
+      await tester.tap(find.byKey(const Key('snapshot-delete-selected')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.widgetWithText(FilledButton, '删除'));
+      await tester.pumpAndSettle();
+      expect(find.text('已删除 1 份快照，原文件不受影响。'), findsOneWidget);
+      ids.remove(b);
+      expect(await scan.snapshot(), isNull);
+      final remaining = await _FixtureSnapshotClient(client, [a, b]).list();
+      expect(remaining.snapshots.map((item) => item.id), [a]);
+      expect(remaining.snapshots.single.retained, isTrue);
+      expect(await File('${folder.path}/grow').readAsString(), '12345678');
       await tester.pumpWidget(
         const MaterialApp(
           home: Scaffold(body: Text('Cleaning snapshot fixtures')),
@@ -134,13 +246,14 @@ void main() {
       await client.delete(a);
       ids.remove(a);
       expect(await File('${folder.path}/grow').readAsString(), '12345678');
-      await client.delete(b);
-      ids.remove(b);
       expect(await scan.snapshot(), isNull);
       binding.reportData = {
         'logicalDelta': page.logicalDelta,
         'counts': page.counts,
         'targetFilesPreserved': true,
+        'batchDefaultSelection': true,
+        'batchRetainedPreserved': true,
+        'batchDeletedCount': 1,
       };
     } finally {
       for (final id in ids) {

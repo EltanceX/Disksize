@@ -51,6 +51,8 @@ try {
     if ($androidUser -notmatch '^\d+$') { throw 'Invalid Android user ID.' }
     & $adb -s $Serial exec-out cat "/storage/emulated/$androidUser/Android/data/com.example.disksize/files/phase8-comparison.png" > (Join-Path $logs 'comparison.png')
     if ($LASTEXITCODE -ne 0) { throw 'Snapshot screenshot extraction failed.' }
+    & $adb -s $Serial exec-out cat "/storage/emulated/$androidUser/Android/data/com.example.disksize/files/phase8-batch-selection.png" > (Join-Path $logs 'batch-selection.png')
+    if ($LASTEXITCODE -ne 0) { throw 'Batch selection screenshot extraction failed.' }
     Get-Content -LiteralPath (Join-Path $logs 'comparison-report.json')
 } catch {
     Write-Output $_.ScriptStackTrace
