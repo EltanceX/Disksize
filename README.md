@@ -77,4 +77,5 @@ Root 真机验证和协议单元测试见[阶段 4 工具说明](tools/phase4/RE
 - [阶段 6 目录与大文件界面](docs/phase6-explorer.md)
 - [阶段 7 矩形树图](docs/phase7-treemap.md)
 - [阶段 8 快照与增长对比](docs/phase8-snapshots.md)
+- [扫描性能测量、优化方案与实施步骤](docs/scan-performance-optimization-plan.md)
 - [使用其他应用打开](docs/external-open.md)
