@@ -133,14 +133,29 @@ void main() {
         await tester.pumpAndSettle();
       }
 
+      final doubleTapScrollOffsets = <Map<String, double>>[];
       Future<void> doubleTap(TreemapRect tile) async {
         final point =
             tester.getTopLeft(find.byKey(const Key('treemap-canvas'))) +
             tile.hitRect.center;
         await tester.tapAt(point);
         await tester.pump(const Duration(milliseconds: 80));
+        final controller = tester
+            .widget<CustomScrollView>(find.byType(CustomScrollView))
+            .controller!;
+        final offset = controller.offset;
+        expect(offset, greaterThan(0));
         await tester.tapAt(point);
         await tester.pumpAndSettle();
+        // Check before reveal/ensureVisible can hide a scroll reset.
+        expect(
+          controller.offset,
+          closeTo(offset.clamp(0.0, controller.position.maxScrollExtent), .01),
+        );
+        doubleTapScrollOffsets.add({
+          'before': offset,
+          'after': controller.offset,
+        });
       }
 
       TreemapPainter painter() =>
@@ -346,6 +361,8 @@ void main() {
       binding.reportData!['depth'] = 3;
       binding.reportData!['nestedRectangles'] = painter().tiles.length;
       binding.reportData!['doubleTapNavigation'] = true;
+      binding.reportData!['doubleTapPreservesScroll'] = true;
+      binding.reportData!['doubleTapScrollOffsets'] = doubleTapScrollOffsets;
       await binding.convertFlutterSurfaceToImage();
       await tester.pumpAndSettle();
       await File('${access.externalOwnPath!}/phase7-treemap.png')

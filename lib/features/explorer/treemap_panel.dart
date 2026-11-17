@@ -15,6 +15,7 @@ class TreemapPanel extends StatefulWidget {
     required this.allocated,
     required this.onSelect,
     required this.onOpen,
+    this.onDoubleTapOpen,
     required this.onDetail,
     required this.onShowList,
     required this.depth,
@@ -25,6 +26,7 @@ class TreemapPanel extends StatefulWidget {
   final int depth;
   final ValueChanged<IndexedEntry?> onSelect;
   final ValueChanged<IndexedEntry> onOpen, onDetail;
+  final ValueChanged<IndexedEntry>? onDoubleTapOpen;
   final ValueChanged<int> onShowList;
   @override
   State<TreemapPanel> createState() => _TreemapPanelState();
@@ -151,7 +153,9 @@ class _TreemapPanelState extends State<TreemapPanel> {
                                       previous == id &&
                                       entry?.kind == 'directory' &&
                                       entry!.id != widget.directory.entry.id) {
-                                    widget.onOpen(entry);
+                                    (widget.onDoubleTapOpen ?? widget.onOpen)(
+                                      entry,
+                                    );
                                   }
                                 },
                             ),

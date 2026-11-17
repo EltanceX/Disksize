@@ -29,6 +29,9 @@ class _ExplorerPageState extends State<ExplorerPage>
   final _scroll = ScrollController();
   bool _resumed = true;
   bool _backgrounded = false;
+  int _navigation = 0;
+  double? _preservedScrollOffset;
+  double _preservedContentExtent = 0;
 
   @override
   void initState() {
@@ -73,10 +76,36 @@ class _ExplorerPageState extends State<ExplorerPage>
     }
   }
 
-  void _navigate(int id) {
+  void _navigate(int id, {bool preserveScroll = false}) {
+    final navigation = ++_navigation;
+    _preservedScrollOffset = preserveScroll && _scroll.hasClients
+        ? _scroll.offset
+        : null;
+    _preservedContentExtent = _preservedScrollOffset == null
+        ? 0
+        : _scroll.position.maxScrollExtent + _scroll.position.viewportDimension;
     _selected = null;
-    unawaited(c.navigate(id));
-    if (_scroll.hasClients) _scroll.jumpTo(0);
+    unawaited(
+      c.navigate(id).then((_) {
+        if (!mounted ||
+            navigation != _navigation ||
+            _preservedScrollOffset == null) {
+          return;
+        }
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (!mounted || navigation != _navigation) return;
+          final offset = _preservedScrollOffset!;
+          _preservedScrollOffset = null;
+          if (_scroll.hasClients && c.treemap && c.directoryId == id) {
+            final position = _scroll.position;
+            _scroll.jumpTo(
+              offset.clamp(position.minScrollExtent, position.maxScrollExtent),
+            );
+          }
+        });
+      }),
+    );
+    if (!preserveScroll && _scroll.hasClients) _scroll.jumpTo(0);
   }
 
   void _locate(int id) {
@@ -399,6 +428,22 @@ class _ExplorerPageState extends State<ExplorerPage>
                             ),
                           ),
                         ),
+                        if (c.loading && _preservedScrollOffset != null)
+                          SliverLayoutBuilder(
+                            builder: (context, constraints) =>
+                                SliverToBoxAdapter(
+                                  // Keep the old extent while data is absent so
+                                  // loading cannot clamp the scroll offset to zero.
+                                  child: SizedBox(
+                                    height:
+                                        (_preservedContentExtent -
+                                                constraints
+                                                    .precedingScrollExtent)
+                                            .clamp(0.0, double.infinity),
+                                    child: const Center(child: Text('正在读取目录…')),
+                                  ),
+                                ),
+                          ),
                         if (c.treemap &&
                             c.page != null &&
                             c.directory != null &&
@@ -413,6 +458,8 @@ class _ExplorerPageState extends State<ExplorerPage>
                               onSelect: (entry) =>
                                   setState(() => _selected = entry?.id),
                               onOpen: (entry) => _navigate(entry.id),
+                              onDoubleTapOpen: (entry) =>
+                                  _navigate(entry.id, preserveScroll: true),
                               onDetail: (entry) => _detail(entry.id, wide),
                               onShowList: (id) {
                                 _selected = null;

@@ -211,6 +211,153 @@ void main() {
   });
 
   testWidgets(
+    'a late double-tap navigation cannot restore scroll after going back',
+    (tester) async {
+      final f = ExplorerFixture();
+      await tester.pumpWidget(
+        MaterialApp(
+          home: ExplorerPage(client: f, sessionId: 'fixture'),
+        ),
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('树图'));
+      await tester.pumpAndSettle();
+      final canvas = find.byKey(const Key('treemap-canvas'));
+      await tester.ensureVisible(canvas);
+      await tester.pumpAndSettle();
+      final controller = tester
+          .widget<CustomScrollView>(find.byType(CustomScrollView))
+          .controller!;
+      expect(controller.offset, greaterThan(0));
+      final pending = Completer<IndexPage>();
+      f.intercept = (r) => r.kind == IndexQueryKind.treemap && r.parentId == 2
+          ? pending.future
+          : null;
+      final tile = painter(tester).tiles.firstWhere((e) => e.item.id == 2);
+      final point = tester.getTopLeft(canvas) + tile.hitRect.center;
+      await tester.tapAt(point);
+      await tester.pump(const Duration(milliseconds: 80));
+      await tester.tapAt(point);
+      await tester.pump(const Duration(milliseconds: 500));
+      expect(find.byType(LinearProgressIndicator), findsOneWidget);
+      await tester.tap(find.byType(BackButton).first);
+      await tester.pumpAndSettle();
+      expect(controller.offset, 0);
+      final request = f.requests.lastWhere(
+        (r) => r.kind == IndexQueryKind.treemap && r.parentId == 2,
+      );
+      pending.complete(f.response(request));
+      await tester.pumpAndSettle();
+      expect(controller.offset, 0);
+      expect(painter(tester).rootId, 1);
+      expect(find.text('正在读取目录…'), findsNothing);
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox());
+    },
+  );
+
+  for (final config in [
+    (const Size(360, 800), 2.0, 'directory'),
+    (const Size(1280, 900), 1.0, 'directory'),
+    (const Size(360, 800), 2.0, 'empty'),
+    (const Size(360, 800), 2.0, 'missing'),
+  ]) {
+    testWidgets(
+      'double-tap preserves scroll while loading and after navigation '
+      '${config.$1}, scale ${config.$2}, ${config.$3}',
+      (tester) async {
+        await tester.binding.setSurfaceSize(config.$1);
+        addTearDown(() => tester.binding.setSurfaceSize(null));
+        final f = ExplorerFixture();
+        await tester.pumpWidget(
+          MaterialApp(
+            builder: (context, child) => MediaQuery(
+              data: MediaQuery.of(context)
+                  .copyWith(textScaler: TextScaler.linear(config.$2)),
+              child: child!,
+            ),
+            home: ExplorerPage(client: f, sessionId: 'fixture'),
+          ),
+        );
+        await tester.pumpAndSettle();
+        await tester.ensureVisible(find.text('树图'));
+        await tester.tap(find.text('树图'));
+        await tester.pumpAndSettle();
+        final canvas = find.byKey(const Key('treemap-canvas'));
+        await tester.ensureVisible(canvas);
+        await tester.pumpAndSettle();
+        final controller = tester
+            .widget<CustomScrollView>(find.byType(CustomScrollView))
+            .controller!;
+        final tile = painter(tester).tiles.firstWhere((e) => e.item.id == 2);
+        final point = tester.getTopLeft(canvas) + tile.hitRect.center;
+        await tester.tapAt(point);
+        await tester.pump(const Duration(milliseconds: 80));
+        expect(painter(tester).selected, 2);
+        final offset = controller.offset;
+        expect(offset, greaterThan(0));
+        final pending = Completer<IndexPage>();
+        f.intercept = (r) => r.kind == IndexQueryKind.treemap && r.parentId == 2
+            ? pending.future
+            : null;
+        await tester.tapAt(point);
+        await tester.pump();
+        expect(controller.offset, closeTo(offset, .01));
+        await tester.pump(const Duration(milliseconds: 500));
+        expect(controller.offset, closeTo(offset, .01));
+        expect(find.byType(LinearProgressIndicator), findsOneWidget);
+        final request = f.requests.lastWhere(
+          (r) => r.kind == IndexQueryKind.treemap && r.parentId == 2,
+        );
+        pending.complete(switch (config.$3) {
+          'missing' => IndexPage.fromJson({
+            ...f.metadata(),
+            'status': 'not-found',
+          }),
+          'empty' => IndexPage.fromJson({
+            ...f.metadata(),
+            'treemap': {
+              'totalBytes': 0,
+              'otherBytes': 0,
+              'childCount': 0,
+              'zeroCount': 0,
+              'unknownCount': 0,
+            },
+          }),
+          _ => f.response(request),
+        });
+        await tester.pumpAndSettle();
+        if (config.$3 != 'missing') {
+          expect(
+            find.byKey(const ValueKey('crumb-2'), skipOffstage: false),
+            findsOneWidget,
+          );
+        }
+        expect(find.byType(LinearProgressIndicator), findsNothing);
+        expect(find.text('正在读取目录…'), findsNothing);
+        expect(
+          controller.offset,
+          closeTo(offset.clamp(0.0, controller.position.maxScrollExtent), .01),
+        );
+        if (config.$3 == 'missing') {
+          expect(controller.position.maxScrollExtent, lessThan(offset));
+          expect(find.textContaining('已不可用'), findsOneWidget);
+        } else if (config.$3 == 'empty') {
+          expect(find.textContaining('没有可绘制的面积'), findsOneWidget);
+        } else {
+          expect(controller.offset, closeTo(offset, .01));
+          expect(painter(tester).rootId, 2);
+        }
+        await tester.tap(find.byType(BackButton).first);
+        await tester.pumpAndSettle();
+        expect(controller.offset, 0);
+        expect(tester.takeException(), isNull);
+        await tester.pumpWidget(const SizedBox());
+      },
+    );
+  }
+
+  testWidgets(
     'focus loss preserves selection and scroll; background only checks revision',
     (tester) async {
       final f = ExplorerFixture();
