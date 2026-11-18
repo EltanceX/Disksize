@@ -1,5 +1,7 @@
 # 扫描性能基准
 
+首次优化构建的真机结果见[基线报告](../../docs/scan-performance-baseline.md)。
+
 在已安装开发版 DiskSize 的测试设备上运行。需要 PowerShell 7、项目的 Android 开发环境和 ADB 调试。Root 用例需要开发包已有 Root 授权；`-RootInstall` 和 `-SampleResources` 另需要 ADB shell 已有 Root 权限。两者不更改 Root 管理器策略。
 
 ```powershell
