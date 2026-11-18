@@ -12,7 +12,8 @@ import java.io.File
 import java.util.concurrent.CancellationException
 
 /** Owned by the ordinary scanner process. Import/finalize are confined to its single worker. */
-internal class IndexStore(context: Context, filename: String = "scan-index.db", private val policy: ImportPolicy = ImportPolicy.DEFAULT) : SQLiteOpenHelper(
+internal class IndexStore(context: Context, filename: String = "scan-index.db", private val policy: ImportPolicy = ImportPolicy.DEFAULT,
+    private val finalizePolicy: FinalizePolicy = FinalizePolicy.DEFAULT) : SQLiteOpenHelper(
     context, File(context.noBackupFilesDir, filename).absolutePath, null, SCHEMA_VERSION) {
     private val scanIdentity = JSONObject().put("rules", "native-v3:path-min-hardlink:blocks512:no-follow:one-mount:2000000:512")
         .put("user", android.os.Process.myUid() / 100000)
@@ -285,14 +286,7 @@ internal class IndexStore(context: Context, filename: String = "scan-index.db", 
                 arrayOf<Any>(state, state, reason, now(), id))
         }
     }
-    fun finalize(id: String, summary: StreamSummary, signal: CancellationSignal = CancellationSignal(), cancelled: () -> Boolean): JSONObject {
-        val start = android.os.SystemClock.elapsedRealtime()
-        val startNanos = System.nanoTime()
-        val db = writableDatabase
-        db.rawQuery("SELECT 1 FROM snapshots WHERE sid=?", arrayOf(id)).use { check(!it.moveToFirst()) { "Snapshot is immutable" } }
-        fun check() { if (cancelled()) throw CancellationException("Index finalization cancelled") }
-        check()
-        transaction(id) { it.execSQL("UPDATE sessions SET state='finalizing',phase='deduplicating' WHERE id=?", arrayOf(id)) }
+    private fun collectAllOwners(db: SQLiteDatabase, id: String, signal: CancellationSignal, check: () -> Unit) {
         // Page groups too: Android CursorWindow refills can otherwise re-run an
         // unbounded GROUP BY from its start for each window, causing quadratic work.
         var lastDevice = ""; var lastInode = ""
@@ -319,50 +313,158 @@ internal class IndexStore(context: Context, filename: String = "scan-index.db", 
                 if (rows < 1024) break
             }
         }
-        transaction(id) { it.execSQL("UPDATE sessions SET phase='aggregating' WHERE id=?", arrayOf(id)) }
-        val dedupMillis = android.os.SystemClock.elapsedRealtime() - start
-        val initializeStart = System.nanoTime()
+    }
+
+    private fun collectSharedOwners(db: SQLiteDatabase, id: String, signal: CancellationSignal, check: () -> Unit) {
+        // Count all aliases, but elect and compare only eligible members.
+        // A singleton would leave its preinitialized owner and totals intact.
+        val eligible = "valid=1 AND skip=0 AND kind<>1"
+        val path = "MIN(CASE WHEN $eligible THEN path END)"
+        val conflict = listOf("size", "allocated", "seconds", "nanos").joinToString(" OR ") { column ->
+            val value = "CASE WHEN $eligible THEN $column END"
+            "MIN($value)<>MAX($value)"
+        }
+        val fields = "device,inode,$path,($conflict)"
+        val source = "FROM nodes INDEXED BY node_identity WHERE sid=?"
+        val grouping = " GROUP BY device,inode HAVING COUNT(*)>1 AND $path IS NOT NULL"
+        val insert = "INSERT INTO hardlinks(sid,device,inode,path,changed)"
+        val key = "(device,inode)"
+        // Page by the 4096th index entry. The bulk statement stays below 4096
+        // input rows. Read the boundary group separately with a cancellation
+        // signal, since a single identity can have more than 4096 aliases.
+        db.compileStatement("$insert VALUES(?,?,?,?,?)").use { boundary ->
+            var lower = ""
+            while (true) {
+                check()
+                val upper = db.rawQuery("SELECT device,inode $source$lower ORDER BY device,inode LIMIT 1 OFFSET 4095",
+                    arrayOf(id), signal).use {
+                    if (it.moveToFirst()) "(X'${it.getBlob(0).hex()}',X'${it.getBlob(1).hex()}')" else null
+                }
+                val ceiling = if (upper == null) "" else " AND $key<$upper"
+                transaction(id) {
+                    it.execSQL("$insert SELECT ?,$fields $source$lower$ceiling$grouping", arrayOf(id, id))
+                    if (upper != null) {
+                        it.rawQuery("SELECT $fields $source AND $key=$upper$grouping", arrayOf(id), signal).use { group ->
+                            if (group.moveToFirst()) {
+                                check()
+                                boundary.bindString(1, id)
+                                boundary.bindBlob(2, group.getBlob(0))
+                                boundary.bindBlob(3, group.getBlob(1))
+                                boundary.bindBlob(4, group.getBlob(2))
+                                boundary.bindLong(5, group.getLong(3))
+                                boundary.executeInsert()
+                            }
+                        }
+                    }
+                }
+                if (upper == null) break
+                lower = " AND $key>$upper"
+            }
+        }
+    }
+
+    private fun applyOwners(db: SQLiteDatabase, id: String, nodes: Long, signal: CancellationSignal, check: () -> Unit) {
+        val sparse = finalizePolicy.sparseOwners
+        if (sparse && db.rawQuery("SELECT 1 FROM hardlinks WHERE sid=? LIMIT 1", arrayOf(id), signal).use { !it.moveToFirst() }) return
         var from = 1L
-        while (from <= summary.nodes) {
+        while (from <= nodes) {
             check(); val to = from + 4095
             transaction(id) {
-                it.execSQL("""UPDATE aggregates SET
+                val range = arrayOf<Any>(id, from, to)
+                if (sparse) {
+                    // Imported rows already carry the correct default contribution.
+                    // Update only displaced owners and members of changed identities.
+                    it.execSQL("""INSERT OR REPLACE INTO aggregates
+                        (sid,id,parent,depth,kind,name_key,owner,own_logical,own_allocated,logical,allocated,complete)
+                        SELECT a.sid,a.id,a.parent,a.depth,a.kind,a.name_key,o.id,
+                            CASE WHEN a.kind<>1 AND o.id<>a.id THEN 0 ELSE a.own_logical END,
+                            CASE WHEN a.kind<>1 AND o.id<>a.id THEN 0 ELSE a.own_allocated END,
+                            CASE WHEN a.kind<>1 AND o.id<>a.id THEN 0 ELSE a.logical END,
+                            CASE WHEN a.kind<>1 AND o.id<>a.id THEN 0 ELSE a.allocated END,
+                            a.complete AND h.changed=0
+                        FROM nodes n CROSS JOIN hardlinks h ON h.sid=n.sid AND h.device=n.device AND h.inode=n.inode
+                        CROSS JOIN nodes o ON o.sid=h.sid AND o.path=h.path
+                        CROSS JOIN aggregates a ON a.sid=n.sid AND a.id=n.id
+                        WHERE n.sid=? AND n.id BETWEEN ? AND ? AND (o.id<>a.id OR (h.changed=1 AND a.complete<>0))""", range)
+                } else {
+                    it.execSQL("""UPDATE aggregates SET
                     owner=COALESCE((SELECT o.id FROM nodes n JOIN hardlinks h ON h.sid=n.sid AND h.device=n.device AND h.inode=n.inode
                         JOIN nodes o ON o.sid=h.sid AND o.path=h.path WHERE n.sid=aggregates.sid AND n.id=aggregates.id),id),
                     complete=complete AND NOT EXISTS(SELECT 1 FROM nodes n JOIN hardlinks h ON h.sid=n.sid AND h.device=n.device AND h.inode=n.inode
                         WHERE n.sid=aggregates.sid AND n.id=aggregates.id AND h.changed=1)
-                    WHERE sid=? AND id BETWEEN ? AND ?""", arrayOf<Any>(id, from, to))
-                it.execSQL("UPDATE aggregates SET own_logical=0,own_allocated=0,logical=0,allocated=0 WHERE sid=? AND id BETWEEN ? AND ? AND kind<>1 AND owner<>id",
-                    arrayOf<Any>(id, from, to))
+                    WHERE sid=? AND id BETWEEN ? AND ?""", range)
+                    it.execSQL("UPDATE aggregates SET own_logical=0,own_allocated=0,logical=0,allocated=0 WHERE sid=? AND id BETWEEN ? AND ? AND kind<>1 AND owner<>id",
+                        range)
+                }
                 it.execSQL("""INSERT INTO issues(sid,node,code,errno,operation) SELECT n.sid,n.id,6,116,'hardlink-metadata-changed'
                     FROM nodes n JOIN hardlinks h ON h.sid=n.sid AND h.device=n.device AND h.inode=n.inode
-                    WHERE n.sid=? AND n.id BETWEEN ? AND ? AND n.kind<>1 AND h.changed=1""", arrayOf<Any>(id, from, to))
+                    WHERE n.sid=? AND n.id BETWEEN ? AND ? AND n.kind<>1 AND h.changed=1""", range)
             }
             from = to + 1
         }
-        val initializeMillis = android.os.SystemClock.elapsedRealtime() - start - dedupMillis
-        val aggregateStart = System.nanoTime()
-        val depth = db.rawQuery("SELECT COALESCE(MAX(depth),0) FROM nodes WHERE sid=?", arrayOf(id)).use { it.moveToFirst(); it.getInt(0) }
+    }
+
+    private fun aggregate(db: SQLiteDatabase, id: String, signal: CancellationSignal, check: () -> Unit) {
+        // Import requires directory parents, so every non-directory is already
+        // final after applyOwners().
+        val directories = finalizePolicy.directoriesOnly
+        val depthSql = if (directories) "SELECT depth FROM aggregates WHERE sid=? ORDER BY depth DESC LIMIT 1"
+            else "SELECT COALESCE(MAX(depth),0) FROM nodes WHERE sid=?"
+        val depth = db.rawQuery(depthSql, arrayOf(id), signal).use { if (it.moveToFirst()) it.getInt(0) else 0 }
+        val kind = if (directories) " AND kind=1" else ""
         for (level in depth downTo 0) {
             var after = 0L
             while (true) {
                 check()
-                val ids = db.rawQuery("SELECT id FROM aggregates WHERE sid=? AND depth=? AND id>? ORDER BY id LIMIT 1024",
-                    arrayOf(id, level.toString(), after.toString())).use { cursor -> buildList { while (cursor.moveToNext()) add(cursor.getLong(0)) } }
-                if (ids.isEmpty()) break
-                val last = ids.last()
+                val page = "SELECT id FROM aggregates WHERE sid=? AND depth=? AND id>?$kind ORDER BY id LIMIT 1024"
+                val last = db.rawQuery(if (directories) "SELECT MAX(id) FROM ($page)" else page,
+                    arrayOf(id, level.toString(), after.toString()), signal).use { cursor ->
+                    var last = after
+                    while (cursor.moveToNext()) if (!cursor.isNull(0)) last = cursor.getLong(0)
+                    last
+                }
+                if (last == after) break
                 transaction(id) {
-                    it.execSQL("""UPDATE aggregates SET
-                        logical=own_logical+COALESCE((SELECT SUM(c.logical) FROM aggregates c WHERE c.sid=aggregates.sid AND c.parent=aggregates.id),0),
+                    val range = arrayOf<Any>(id, level, after, last)
+                    val values = if (directories) """(logical,allocated,complete)=(
+                        SELECT aggregates.own_logical+COALESCE(SUM(c.logical),0),
+                            aggregates.own_allocated+COALESCE(SUM(c.allocated),0),
+                            aggregates.complete AND COALESCE(MIN(c.complete),1)
+                        FROM aggregates c INDEXED BY aggregate_parent WHERE c.sid=aggregates.sid AND c.parent=aggregates.id)"""
+                    else """logical=own_logical+COALESCE((SELECT SUM(c.logical) FROM aggregates c WHERE c.sid=aggregates.sid AND c.parent=aggregates.id),0),
                         allocated=own_allocated+COALESCE((SELECT SUM(c.allocated) FROM aggregates c WHERE c.sid=aggregates.sid AND c.parent=aggregates.id),0),
-                        complete=complete AND NOT EXISTS(SELECT 1 FROM aggregates c WHERE c.sid=aggregates.sid AND c.parent=aggregates.id AND c.complete=0)
-                        WHERE sid=? AND depth=? AND id>? AND id<=?""", arrayOf<Any>(id, level, after, last))
-                it.rawQuery("SELECT 1 FROM aggregates WHERE sid=? AND depth=? AND id>? AND id<=? AND (typeof(logical)<>'integer' OR typeof(allocated)<>'integer') LIMIT 1",
-                    arrayOf(id, level.toString(), after.toString(), last.toString())).use { overflow -> kotlin.check(!overflow.moveToFirst()) { "Aggregate counter overflow" } }
+                        complete=complete AND NOT EXISTS(SELECT 1 FROM aggregates c WHERE c.sid=aggregates.sid AND c.parent=aggregates.id AND c.complete=0)"""
+                    it.execSQL("UPDATE aggregates SET $values WHERE sid=? AND depth=? AND id>? AND id<=?$kind", range)
+                    it.rawQuery("""SELECT 1 FROM aggregates WHERE sid=? AND depth=? AND id>? AND id<=?$kind
+                        AND (typeof(logical)<>'integer' OR typeof(allocated)<>'integer') LIMIT 1""",
+                        arrayOf(id, level.toString(), after.toString(), last.toString()), signal).use { overflow ->
+                        kotlin.check(!overflow.moveToFirst()) { "Aggregate counter overflow" }
+                    }
                 }
                 after = last
             }
         }
+    }
+
+    fun finalize(id: String, summary: StreamSummary, signal: CancellationSignal = CancellationSignal(), cancelled: () -> Boolean): JSONObject {
+        val start = android.os.SystemClock.elapsedRealtime()
+        val startNanos = System.nanoTime()
+        val db = writableDatabase
+        db.rawQuery("SELECT 1 FROM snapshots WHERE sid=?", arrayOf(id)).use { check(!it.moveToFirst()) { "Snapshot is immutable" } }
+        fun check() {
+            if (cancelled()) throw CancellationException("Index finalization cancelled")
+            signal.throwIfCanceled()
+        }
+        check()
+        transaction(id) { it.execSQL("UPDATE sessions SET state='finalizing',phase='deduplicating' WHERE id=?", arrayOf(id)) }
+        if (finalizePolicy.sparseOwners) collectSharedOwners(db, id, signal, ::check) else collectAllOwners(db, id, signal, ::check)
+        transaction(id) { it.execSQL("UPDATE sessions SET phase='aggregating' WHERE id=?", arrayOf(id)) }
+        val dedupMillis = android.os.SystemClock.elapsedRealtime() - start
+        val initializeStart = System.nanoTime()
+        applyOwners(db, id, summary.nodes, signal, ::check)
+        val initializeMillis = android.os.SystemClock.elapsedRealtime() - start - dedupMillis
+        val aggregateStart = System.nanoTime()
+        aggregate(db, id, signal, ::check)
         check()
         val complete = db.rawQuery("SELECT complete FROM aggregates WHERE sid=? AND id=1", arrayOf(id)).use { it.moveToFirst() && it.getInt(0) == 1 }
         val state = if (summary.state == "completed" && !complete) "partial" else summary.state
@@ -375,6 +477,7 @@ internal class IndexStore(context: Context, filename: String = "scan-index.db", 
             JSONObject().put("dedupMicros", (initializeStart - startNanos) / 1000)
                 .put("initializeMicros", (aggregateStart - initializeStart) / 1000)
                 .put("aggregateMicros", (aggregateEnd - aggregateStart) / 1000)
+                .put("variant", finalizePolicy.wireName)
                 .also { timings -> metrics.put("performance", it.put("finalize", timings)) }
         }
         val commitStart = System.nanoTime()

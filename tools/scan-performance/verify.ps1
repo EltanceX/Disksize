@@ -6,6 +6,8 @@ param(
     [ValidateSet('internal','fuse','emulated-direct')][string]$View = 'internal',
     [ValidateSet(10000,100000,1000000)][int]$Size = 10000,
     [ValidatePattern('^(256|1024|4096)-(eager|paced)-(list|typed)(-lean)?$')][string[]]$ImportVariant,
+    [ValidateSet('baseline','dedup','directories','optimized')][string[]]$FinalizeVariant,
+    [ValidateSet('empty','sparse-links','dense-links','deep-wide')][string]$ReplayFixture = 'empty',
     [ValidateRange(1,30)][int]$Repeats = 5,
     [ValidateRange(0,5)][int]$Warmups = 1,
     [string]$Output,
@@ -133,6 +135,7 @@ function Run-Group([hashtable]$Group) {
     $common = @{ fixture = $id; location = $Group.location; size = $Group.size }
     $cleanup.Add($common)
     $name = $Group.name
+    $digests = @{}
     if ($Group.location -ne 'live' -and @($Group.cases | Where-Object { $_ -notmatch '/Replay(/|$)' }).Count -gt 0) {
         Write-Host "Generating $($Group.size) entries for $name"
         $setup = Invoke-Case ($common + @{ action = 'setup' }) "$name-setup"
@@ -142,14 +145,17 @@ function Run-Group([hashtable]$Group) {
         $warm = $round -lt $Group.warmups
         for ($offset = 0; $offset -lt $Group.cases.Count; $offset++) {
             $case = $Group.cases[($offset + $round) % $Group.cases.Count]
-            $source, $surface, $modeName, $variant = $case -split '/'
+            $source, $surface, $modeName, $variant, $finalizer = $case -split '/'
             $namePart = "$name-r$round-$source-$surface-$modeName"
             if ($variant) { $namePart += "-$variant" }
+            if ($finalizer) { $namePart += "-$finalizer" }
             Write-Host "Running $namePart (warmup=$warm)"
             $battery = Read-Battery
             $settings = @{ mode = $modeName; backend = $source; view = $surface
                 allowLiveAppData = ([string][bool]$LiveAppData).ToLowerInvariant() }
             if ($variant) { $settings.importVariant = $variant }
+            if ($finalizer) { $settings.finalizeVariant = $finalizer }
+            if ($modeName -eq 'Replay') { $settings.replayFixture = $ReplayFixture.ToLowerInvariant() }
             $value = Invoke-Case ($common + $settings) $namePart
             $value.group = $name
             $value.round = $round
@@ -160,6 +166,13 @@ function Run-Group([hashtable]$Group) {
                 [Math]::Round($value.nodes * 1e6 / $value.elapsedMicros, 2)
             } else { $null }
             Write-Json $value "$namePart.json"
+            if ($value.resultSha256) {
+                $recipe = $value.sample.recipeSha256
+                if ($digests.ContainsKey($recipe) -and $digests[$recipe] -ne $value.resultSha256) {
+                    throw "Finalized replay rows differ for $namePart. See $results."
+                }
+                $digests[$recipe] = $value.resultSha256
+            }
             $records.Add($value)
             Write-Host ("{0:N3}s, {1:N0} nodes" -f ($value.elapsedMicros / 1e6), $value.nodes)
         }
@@ -171,13 +184,14 @@ function Run-Group([hashtable]$Group) {
 }
 function Write-Summary {
     $summary = @($records | Where-Object { -not $_.warmup } |
-        Group-Object group, mode, backend, view, importVariant | ForEach-Object {
+        Group-Object group, mode, backend, view, importVariant, finalizeVariant | ForEach-Object {
             $samples = @($_.Group.elapsedMicros | Sort-Object)
             $n = $samples.Count
             $first = $_.Group[0]
             $median = if ($n % 2 -eq 0) { ($samples[$n / 2 - 1] + $samples[$n / 2]) / 2 } else { $samples[[int][Math]::Floor($n / 2)] }
             [ordered]@{ group = $first.group; mode = $first.mode; backend = $first.backend; view = $first.view
-                importVariant = $first.importVariant; nodes = $first.nodes; samples = $n; minMicros = $samples[0]
+                importVariant = $first.importVariant; finalizeVariant = $first.finalizeVariant
+                nodes = $first.nodes; samples = $n; minMicros = $samples[0]
                 medianMicros = $median; maxMicros = $samples[-1] }
         })
     Write-Json $summary 'summary.json'
@@ -199,6 +213,15 @@ try {
     }
     if ($ImportVariant -and @($ImportVariant | Sort-Object -Unique).Count -ne $ImportVariant.Count) {
         throw 'Use each import variant once per run.'
+    }
+    if ($FinalizeVariant -and ($Suite -ne 'Custom' -or $LiveAppData -or 'A' -in $Mode -or 'B' -in $Mode -or $ImportVariant.Count -gt 1)) {
+        throw 'Use -FinalizeVariant with -Suite Custom and mode C or Replay on a fixed fixture, with one import variant at most.'
+    }
+    if ($FinalizeVariant -and @($FinalizeVariant | Sort-Object -Unique).Count -ne $FinalizeVariant.Count) {
+        throw 'Use each finalize variant once per run.'
+    }
+    if ($ReplayFixture -ne 'empty' -and ($Suite -ne 'Custom' -or 'Replay' -notin $Mode)) {
+        throw 'Use -ReplayFixture with -Suite Custom and mode Replay.'
     }
     if (-not $SkipBuild) {
         & (Join-Path $repo 'android/gradlew.bat') -p (Join-Path $repo 'android') :app:assembleProfile :app:assembleProfileAndroidTest `
@@ -228,6 +251,7 @@ try {
         fingerprint = (Invoke-Adb @('shell','getprop','ro.build.fingerprint'))
         kernel = (Invoke-Adb @('shell','uname','-r')); abi = $abi
         onlineCpus = (Invoke-Adb @('shell','cat','/sys/devices/system/cpu/online'))
+        replayFixture = $ReplayFixture
         clockTicksPerSecond = (Invoke-Adb @('shell','getconf','CLK_TCK'))
         cache = 'warmup rounds; no cache flush; new app process and fresh benchmark DB each case'
         sampled = [bool]$SampleResources
@@ -255,7 +279,10 @@ try {
         $Mode = @($Mode | ForEach-Object { if ($_ -eq 'Replay') { 'Replay' } else { $_.ToUpperInvariant() } })
         $location = if ($View -eq 'internal') { 'internal' } else { 'external' }
         $cases = foreach ($modeName in $Mode) {
-            if ($ImportVariant) { foreach ($variant in $ImportVariant) { "$Backend/$View/$modeName/$($variant.ToLowerInvariant())" } }
+            if ($FinalizeVariant) {
+                $variant = if ($ImportVariant) { $ImportVariant[0].ToLowerInvariant() } else { '' }
+                foreach ($finalizer in $FinalizeVariant) { "$Backend/$View/$modeName/$variant/$($finalizer.ToLowerInvariant())" }
+            } elseif ($ImportVariant) { foreach ($variant in $ImportVariant) { "$Backend/$View/$modeName/$($variant.ToLowerInvariant())" } }
             else { "$Backend/$View/$modeName" }
         }
         Run-Group (New-Group 'custom' $Size $location $cases $Repeats $Warmups)

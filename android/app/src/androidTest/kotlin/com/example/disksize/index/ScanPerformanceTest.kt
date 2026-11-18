@@ -24,7 +24,6 @@ import org.json.JSONObject
 import org.junit.Test
 import org.junit.Assume.assumeTrue
 import java.io.File
-import java.nio.ByteBuffer
 import java.security.MessageDigest
 import java.util.UUID
 
@@ -107,6 +106,8 @@ class ScanPerformanceTest {
         require(action == "scan")
         val mode = requireNotNull(args.getString("mode")).also { require(it in setOf("A", "B", "C", "Replay")) }
         val policy = args.getString("importVariant")?.let(ImportPolicy::benchmark) ?: ImportPolicy.DEFAULT
+        val finalizer = args.getString("finalizeVariant")?.let(FinalizePolicy::benchmark) ?: FinalizePolicy.DEFAULT
+        val recipe = if (mode == "Replay") FinalizeReplay(args.getString("replayFixture") ?: "empty", dirs, filesPerDir) else null
         val backend = requireNotNull(args.getString("backend")).also { require(it in setOf("ordinary", "root")) }
         val view = requireNotNull(args.getString("view")).also {
             require(it in setOf("internal", "fuse", "emulated-direct", "live-app-data"))
@@ -124,13 +125,15 @@ class ScanPerformanceTest {
         }
         val windowStart = SystemClock.elapsedRealtimeNanos()
         val result = when (mode) {
-            "C" -> complete(checkNotNull(target), view, backend, policy)
-            "Replay" -> replay(policy)
+            "C" -> complete(checkNotNull(target), view, backend, policy, finalizer)
+            "Replay" -> replay(checkNotNull(recipe), policy, finalizer)
             else -> stream(checkNotNull(target), backend, mode)
         }
         if (mode == "C" || mode == "Replay") {
-            check(result.getJSONObject("performance").getJSONObject("consumer").getString("importVariant") == policy.name)
-            result.put("importVariant", policy.name)
+            val timings = result.getJSONObject("performance")
+            check(timings.getJSONObject("consumer").getString("importVariant") == policy.name)
+            check(timings.getJSONObject("finalize").getString("variant") == finalizer.wireName)
+            result.put("importVariant", policy.name).put("finalizeVariant", finalizer.wireName)
         }
         val fs = result.optLong("filesystemMagic", -1)
         if (mode != "Replay") {
@@ -144,16 +147,20 @@ class ScanPerformanceTest {
             check(result.getString("state") in setOf("completed", "partial"))
             check(result.getLong("nodes") > 4)
         } else {
-            check(result.getString("state") == "completed" && result.getLong("issues") == 0L) {
+            val issues = recipe?.issues ?: 0L
+            val state = if (issues == 0L) "completed" else "partial"
+            check(result.getString("state") == state && result.getLong("issues") == issues) {
                 "Fixed fixture did not complete"
             }
-            check(result.getLong("nodes") == size + 1L && result.getLong("logicalBytes") == 0L)
+            check(result.getLong("nodes") == size + 1L && result.getLong("logicalBytes") == (recipe?.logical ?: 0L))
+            if (recipe != null) check(result.getLong("allocatedBytes") == recipe.allocated)
             val kinds = result.getJSONObject("nodesByKind")
             check(kinds.getLong("directory") == dirs + 1L && kinds.getLong("regular") == dirs.toLong() * filesPerDir)
         }
         report(result.put("reportVersion", 1).put("schemaVersion", IndexStore.SCHEMA_VERSION)
             .put("streamProtocolVersion", IndexProtocol.VERSION).put("mode", mode).put("backend", backend)
-            .put("view", view).put("sample", if (live) JSONObject().put("kind", "live") else manifest())
+            .put("view", view).put("sample", if (live) JSONObject().put("kind", "live")
+                else if (recipe != null && recipe.name != "empty") recipe.manifest() else manifest())
             .put("consumerUid", Process.myUid()).put("testPid", Process.myPid())
             .put("deviceWindowStartNanos", windowStart).put("deviceWindowEndNanos", SystemClock.elapsedRealtimeNanos())
             .put("onlineProcessors", Runtime.getRuntime().availableProcessors()))
@@ -177,6 +184,7 @@ class ScanPerformanceTest {
         AtomicFile(journal).delete()
         File(journal.path + ".bak").let { check(!it.exists() || it.delete()) }
         File(storage.noBackupFilesDir, BenchmarkStorage.IMPORT_VARIANT).let { check(!it.exists() || it.delete()) }
+        File(storage.noBackupFilesDir, BenchmarkStorage.FINALIZE_VARIANT).let { check(!it.exists() || it.delete()) }
     }
 
     private class Counter : IndexConsumer {
@@ -244,10 +252,11 @@ class ScanPerformanceTest {
         return try { action(handle) } finally { NativeBridge.nativeReleaseScan(handle) }
     }
 
-    private fun complete(path: String, view: String, backend: String, policy: ImportPolicy): JSONObject {
+    private fun complete(path: String, view: String, backend: String, policy: ImportPolicy, finalizer: FinalizePolicy): JSONObject {
         clearIndex()
         val storage = BenchmarkStorage.context(context).noBackupFilesDir
         File(storage, BenchmarkStorage.IMPORT_VARIANT).writeText(policy.name)
+        File(storage, BenchmarkStorage.FINALIZE_VARIANT).writeText(finalizer.wireName)
         context.startActivity(Intent(context, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
         test.waitForIdleSync()
         val connect = System.nanoTime()
@@ -341,39 +350,20 @@ class ScanPerformanceTest {
     private fun namespace(pid: Int = Process.myPid()): String? =
         runCatching { Os.readlink("/proc/$pid/ns/mnt") }.getOrNull()
 
-    private fun replay(policy: ImportPolicy): JSONObject {
+    private fun replay(recipe: FinalizeReplay, policy: ImportPolicy, finalizer: FinalizePolicy): JSONObject {
         clearIndex()
         val storage = BenchmarkStorage.context(context)
         val id = UUID.randomUUID().toString()
         val directoryCount = dirs
         val fileCount = filesPerDir
         val totalNodes = size + 1L
-        val device = ByteBuffer.allocate(8).putLong(1L).array()
-        val empty = byteArrayOf()
         val cpu = Process.getElapsedCpuTime()
         val started = System.nanoTime()
-        return IndexStore(storage, BenchmarkStorage.INDEX, policy).use { store ->
+        return IndexStore(storage, BenchmarkStorage.INDEX, policy, finalizer).use { store ->
             val performance = JSONObject().put("version", 1)
             val importStarted = System.nanoTime()
             store.begin(id, "/synthetic", "ordinary", Process.myUid(), Process.myPid()).use { writer ->
-                var next = 0L
-                fun write(parent: Long, name: String, directory: Boolean, depth: Int): Long {
-                    val key = ++next
-                    writer.node(IndexNode(key, parent, name.toByteArray(), empty, if (directory) 1 else 2, depth,
-                        if (directory) 0x41ed else 0x81a4, 10000, 10000, device,
-                        ByteBuffer.allocate(8).putLong(key).array(), 1, 1,
-                        0, if (directory) 4096L else 0L, 1, 0, true, true, 0))
-                    return key
-                }
-                val fixtureRoot = write(0, "", true, 0)
-                repeat(directoryCount) { d ->
-                    val parent = write(fixtureRoot, "d$d", true, 1)
-                    repeat(fileCount) { f -> write(parent, "f$f", false, 2) }
-                    writer.directory(parent, true, true, 0)
-                }
-                writer.directory(fixtureRoot, true, true, 0)
-                writer.flush()
-                check(next == totalNodes)
+                recipe.write(writer)
                 performance.put("consumer", writer.measurements())
             }
             val importMicros = micros(importStarted)
@@ -381,15 +371,17 @@ class ScanPerformanceTest {
                 performance = performance)) { false }
             val elapsed = micros(started)
             val nodeKinds = JSONObject().put("directory", directoryCount + 1).put("regular", directoryCount * fileCount)
+            val cpuMillis = Process.getElapsedCpuTime() - cpu
             JSONObject().put("state", result.getString("state")).put("nodes", result.getLong("nodeCount"))
                 .put("issues", result.getLong("issueCount")).put("logicalBytes", result.getLong("logicalBytes"))
                 .put("allocatedBytes", result.getLong("allocatedBytes")).put("nodesByKind", nodeKinds)
                 .put("importElapsedMicros", importMicros).put("elapsedMicros", elapsed)
                 .put("scannerUid", Process.myUid()).put("scannerPid", Process.myPid())
-                .put("testProcessCpuMillis", Process.getElapsedCpuTime() - cpu)
+                .put("testProcessCpuMillis", cpuMillis)
                 .put("databaseBytes", File(storage.noBackupFilesDir, BenchmarkStorage.INDEX).length())
                 .put("walBytes", File(storage.noBackupFilesDir, BenchmarkStorage.INDEX + "-wal").length())
                 .put("performance", result.getJSONObject("performance"))
+                .also { if (recipe.name != "empty") it.put("resultSha256", recipe.resultDigest(store.readableDatabase, id)) }
         }
     }
 }

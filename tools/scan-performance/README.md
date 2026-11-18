@@ -25,6 +25,17 @@
 
 策略名称依次指定事务动作上限（`256`、`1024` 或 `4096`）、进度提交方式（`eager` 每个进度帧尝试提交，`paced` 可合并并检查 250 ms 活动窗口）和绑定方式（`list` 或 `typed`）。后缀 `-lean` 仅让本次独立测试库省略 `node_parent` 索引。`paced` 只在收到导入动作或进度帧时检查时限，不会在 pipe 无数据或 SQLite 阻塞时从另一个线程强行提交。变体记入逐次 JSON 和分组汇总，对正式库与 APK 的默认策略无影响。
 
+同一入口可对照[最终处理策略](../../docs/scan-performance-finalize.md)。`-FinalizeVariant` 支持 `baseline`（原策略）、`dedup`（仅改去重）、`directories`（仅改汇总）、`optimized`（两项启用，应用默认）。可以指定一个固定的 `-ImportVariant`，两种策略维度不会同时变化。
+
+```powershell
+./tools/scan-performance/verify.ps1 -Serial '<device-id>' -Suite Custom -Size 100000 `
+  -Mode C -FinalizeVariant baseline,dedup,directories,optimized -RootInstall
+./tools/scan-performance/verify.ps1 -Serial '<device-id>' -Suite Custom -Size 100000 `
+  -Mode Replay -FinalizeVariant baseline,optimized -ReplayFixture dense-links -RootInstall
+```
+
+`-ReplayFixture` 默认为 `empty`。`sparse-links` 和 `dense-links` 跨目录构造不同密度的硬链接、晚发现的 owner 及同 inode 元数据变动；预期状态为 `partial`。`deep-wide` 同时构造深目录链和宽目录。非空配方还会在计时结束后验证容量和状态，并校验各行 owner、容量、完整性及问题记录摘要一致。真实文件的 C 仍使用空文件树。
+
 | 模式 | 实际执行 | 主计时 `elapsedMicros` |
 | --- | --- | --- |
 | A | APK 中的 `stream_directory`，回调仅累加 kind、深度和原始容量；无 pipe/SQLite | native 核心经过时间 |

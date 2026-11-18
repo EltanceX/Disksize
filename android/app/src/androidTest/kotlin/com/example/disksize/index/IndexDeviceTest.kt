@@ -81,6 +81,7 @@ class IndexDeviceTest {
             consumer.getLong(it).also { elapsed -> assertTrue(elapsed >= 0) }
         } <= consumer.getLong("elapsedMicros"))
         val finalize = performance.getJSONObject("finalize")
+        assertEquals(FinalizePolicy.DEFAULT.wireName, finalize.getString("variant"))
         for (key in listOf("dedupMicros", "initializeMicros", "aggregateMicros", "commitMicros", "previewMicros")) {
             assertTrue(finalize.getLong(key) >= 0)
         }

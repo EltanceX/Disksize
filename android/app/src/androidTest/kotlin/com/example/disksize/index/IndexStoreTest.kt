@@ -2,6 +2,8 @@ package com.example.disksize.index
 
 import android.database.sqlite.SQLiteDatabase
 import android.os.Bundle
+import android.os.CancellationSignal
+import android.os.OperationCanceledException
 import android.os.Process
 import android.system.Os
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -26,9 +28,10 @@ import java.io.DataOutputStream
 @RunWith(AndroidJUnit4::class)
 class IndexStoreTest {
     private val context get() = InstrumentationRegistry.getInstrumentation().targetContext
-    private fun withStore(policy: ImportPolicy = ImportPolicy.DEFAULT, block: (IndexStore) -> Unit) {
+    private fun withStore(policy: ImportPolicy = ImportPolicy.DEFAULT, finalizer: FinalizePolicy = FinalizePolicy.DEFAULT,
+        block: (IndexStore) -> Unit) {
         val name = "phase5-test-${UUID.randomUUID()}.db"
-        val store = IndexStore(context, name, policy)
+        val store = IndexStore(context, name, policy, finalizer)
         try { block(store) } finally {
             store.close(); SQLiteDatabase.deleteDatabase(File(context.noBackupFilesDir, name))
         }
@@ -162,6 +165,106 @@ class IndexStoreTest {
         id, parent, name.toByteArray(), byteArrayOf(), if (id == 1L) 1 else 2, if (id == 1L) 0 else 1,
         if (id == 1L) 16832 else 33152, 10000, 10000, ByteBuffer.allocate(8).putLong(1).array(),
         ByteBuffer.allocate(8).putLong(inode).array(), 1, 2, bytes, 4096, 1, 0, true, id != 1L, 0)
+
+    @Test fun sharedOwnerKeepsIneligibleAliasesAndDoesNotSplitIdentityPages() = withStore(finalizer = FinalizePolicy.OPTIMIZED) { store ->
+        val id = UUID.randomUUID().toString()
+        var next = 0L
+        fun entry(parent: Long, name: String, inode: Long, logical: Long = 0) =
+            node(++next, parent, name, logical, inode).copy(links = 1)
+        val uid = Process.myUid()
+        val pid = Process.myPid()
+        val winner: Long
+        val valid: Long
+        val invalid: Long
+        val skipped: Long
+        val noOwner: Long
+        store.begin(id, "/fixture", "ordinary", uid, pid).use { writer ->
+            writer.node(entry(0, "", 99999))
+            writer.node(entry(1, "z", 99998).copy(kind = 1))
+            writer.node(entry(1, "a", 42).copy(kind = 1))
+            repeat(4096) { i -> writer.node(entry(2, "f$i", 42, 3).copy(depth = 2)) }
+            writer.node(entry(3, "later-byte", 42, 5).copy(name = byteArrayOf(0xff.toByte()), depth = 2))
+            val selected = entry(3, "earlier-byte", 42, 7).copy(name = byteArrayOf(0x80.toByte()), depth = 2)
+            writer.node(selected)
+            winner = selected.id
+            val hidden = entry(3, "ineligible", 43, 55).copy(depth = 2, valid = false, complete = false)
+            writer.node(hidden); invalid = hidden.id
+            val excluded = entry(3, "skipped", 43, 66).copy(depth = 2, skip = 1, complete = false)
+            writer.node(excluded); skipped = excluded.id
+            val eligible = entry(2, "eligible", 43, 11).copy(depth = 2)
+            writer.node(eligible); valid = eligible.id
+            val allInvalid = entry(2, "no-owner", 44, 77).copy(depth = 2, valid = false, complete = false)
+            writer.node(allInvalid); noOwner = allInvalid.id
+            writer.node(entry(3, "non-contributing", 44, 88).copy(depth = 2, skip = 1, complete = false))
+            for (dir in listOf(3L, 2L, 1L)) writer.directory(dir, true, true, 0)
+            writer.flush()
+        }
+        val result = store.finalize(id, StreamSummary("completed", next, 0, 0, 0, 0, 1, 0)) { false }
+        assertEquals("partial", result.getString("state"))
+        assertEquals(18L, result.getLong("logicalBytes"))
+        assertEquals(5L * 4096L, result.getLong("allocatedBytes"))
+        assertEquals(4098L, result.getLong("issueCount")) // All non-directories of inode 42.
+        val db = store.readableDatabase
+        fun row(node: Long): List<Long> = db.rawQuery(
+            "SELECT owner,own_logical,own_allocated,logical,complete FROM aggregates WHERE sid=? AND id=?",
+            arrayOf(id, node.toString()),
+        ).use { assertTrue(it.moveToFirst()); (0..4).map(it::getLong) }
+        assertEquals(listOf(winner, 7L, 4096L, 7L, 0L), row(winner))
+        assertEquals(listOf(winner, 0L, 0L, 0L, 0L), row(4L))
+        assertEquals(listOf(winner, 0L, 4096L, 7L, 0L), row(3L))
+        assertEquals(listOf(valid, 0L, 0L, 0L, 0L), row(invalid))
+        assertEquals(listOf(valid, 0L, 0L, 0L, 0L), row(skipped))
+        assertEquals(listOf(noOwner, 0L, 0L, 0L, 0L), row(noOwner))
+        db.rawQuery("SELECT COUNT(*) FROM hardlinks WHERE sid=?", arrayOf(id)).use {
+            assertTrue(it.moveToFirst()); assertEquals(2, it.getInt(0))
+        }
+    }
+
+    @Test fun directoryAggregationRejectsSumAndAdditionOverflowBeforePublishing() = withStore(finalizer = FinalizePolicy.OPTIMIZED) { store ->
+        for (sumOverflow in listOf(true, false)) {
+            val id = UUID.randomUUID().toString()
+            store.begin(id, "/fixture", "ordinary", Process.myUid(), Process.myPid()).use { writer ->
+                writer.node(node(1, 0, "", 0, 1).copy(allocated = if (sumOverflow) 0 else Long.MAX_VALUE))
+                writer.node(node(2, 1, "first", if (sumOverflow) Long.MAX_VALUE else 1, 2).copy(allocated = 1))
+                writer.node(node(3, 1, "second", 1, 3).copy(allocated = 0))
+                writer.directory(1, true, true, 0)
+                writer.flush()
+            }
+            val failure = runCatching { store.finalize(id, StreamSummary("completed", 3, 0, 0, 0, 0, 1, 0)) { false } }.exceptionOrNull()
+            if (sumOverflow) assertTrue("$failure", failure is android.database.sqlite.SQLiteException)
+            else assertEquals("Aggregate counter overflow", failure?.message)
+            assertTrue(store.preview(id).getBoolean("provisional"))
+            assertNoSnapshot(store, id)
+        }
+    }
+
+    @Test fun cancellationDuringAggregationDoesNotExposeASnapshot() = withStore(finalizer = FinalizePolicy.OPTIMIZED) { store ->
+        val id = UUID.randomUUID().toString()
+        store.begin(id, "/fixture", "ordinary", Process.myUid(), Process.myPid()).use {
+            it.node(node(1, 0, "", 0, 1)); it.node(node(2, 1, "leaf", 9, 2))
+            it.directory(1, true, true, 0); it.flush()
+        }
+        val signal = CancellationSignal()
+        val failure = runCatching {
+            store.finalize(id, StreamSummary("completed", 2, 0, 0, 0, 0, 1, 0), signal) {
+                store.readableDatabase.rawQuery("SELECT phase FROM sessions WHERE id=?", arrayOf(id)).use {
+                    if (it.moveToFirst() && it.getString(0) == "aggregating") signal.cancel()
+                }
+                false
+            }
+        }.exceptionOrNull()
+        assertTrue("$failure", failure is OperationCanceledException)
+        store.recover()
+        val recovered = store.preview(id)
+        assertEquals("interrupted", recovered.getString("state"))
+        assertTrue(recovered.getBoolean("provisional"))
+        assertNoSnapshot(store, id)
+    }
+
+    private fun assertNoSnapshot(store: IndexStore, id: String) {
+        store.readableDatabase.rawQuery("SELECT 1 FROM snapshots WHERE sid=?", arrayOf(id)).use { assertFalse(it.moveToFirst()) }
+    }
+
     @Test fun changedHardlinkIsPartialAndRecoveryPreservesRows() = withStore { store ->
         val id = UUID.randomUUID().toString()
         store.begin(id, "/fixture", "ordinary", Process.myUid(), Process.myPid()).use {

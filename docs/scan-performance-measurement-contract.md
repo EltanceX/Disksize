@@ -67,6 +67,7 @@
 | `aggregateMicros` | 初始化后 → 按深度汇总容量和完整性，判定最终扫描状态 |
 | `commitMicros` | 开启终态数据库事务前 → 事务返回；含会话、快照及 revision 写入 |
 | `previewMicros` | 终态事务返回 → 生成用于 journal 的有界结果预览 |
+| `variant` | 最终处理策略；当前默认为 `optimized`。历史记录可能缺失，基准构建可对照其它策略 |
 
 前三项首尾相接，已存入 SQLite；后两项测得时事务已完成，因此只进入终态快照及 journal。创建快照与提交位于同一事务内，不能把 `commitMicros` 当作纯 fsync 时间。
 
