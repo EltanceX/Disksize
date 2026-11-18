@@ -29,6 +29,7 @@ Flutter 的 integration_test 依赖固定了 AndroidX test 1.3.0；测试 manife
 root 的应用授权须预先通过管理器授予，脚本不会修改管理器全局策略。
 
 日志、JSON 指标及内存采样保存在忽略提交的 `.local/phase5/`。
+规模报告的顶层 `performance` 来自实时终态，包含 journal 发布开销；历史 `metrics` 仍来自 SQLite。计时口径见[扫描性能测量契约](../../docs/scan-performance-measurement-contract.md)。
 规模样本使用随机私有目录与 marker；测试 finally 删除本次样本。
 如果测试进程被强制停止，marker 样本可能保留，重试前仅清理已核对 marker 的本次目录。
 数据库保留扫描会话和快照索引，供后续目录 UI 开发；索引保留/删除界面属于阶段 8。

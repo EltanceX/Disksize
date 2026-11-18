@@ -9,6 +9,7 @@ import android.os.UserManager
 import android.system.Os
 import android.system.OsConstants
 import android.util.Log
+import com.example.disksize.index.IndexProtocol
 import com.example.disksize.scan.NativeBridge
 import com.example.disksize.scan.ipc.IRootScanner
 import com.topjohnwu.superuser.ipc.RootService
@@ -67,7 +68,7 @@ class RootScannerService : RootService() {
             }
             val unlocked: Any = try { getSystemService(UserManager::class.java)?.isUserUnlocked ?: JSONObject.NULL }
                 catch (_: Exception) { JSONObject.NULL }
-            return JSONObject().put("state", "ready").put("protocolVersion", 3)
+            return JSONObject().put("state", "ready").put("protocolVersion", IndexProtocol.VERSION)
                 .put("uid", native.processUid).put("effectiveUid", native.effectiveUid).put("pid", native.processId)
                 .put("coreVersion", native.coreVersion).put("mountNamespace", Os.readlink("/proc/self/ns/mnt"))
                 .put("selinux", File("/proc/self/attr/current").readText().trim().trimEnd('\u0000'))

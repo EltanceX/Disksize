@@ -5,7 +5,7 @@
 namespace disksize::wire {
 class IndexWriter {
 public:
-    IndexWriter(int fd, Bytes id, CancellationToken& token) : wire_(fd, std::move(id), token, 3) {
+    IndexWriter(int fd, Bytes id, CancellationToken& token) : wire_(fd, std::move(id), token, 4, &pipe_) {
         Bytes b; u32(b, getuid()); u32(b, geteuid()); u32(b, getpid()); wire_.frame(1, b, true);
         u32(batch_, 0);
     }
@@ -44,9 +44,22 @@ public:
         u64(b, r.scan.summary.issue_count); u64(b, r.scan.metrics.elapsed_microseconds);
         u64(b, r.scan.metrics.peak_open_fds); u64(b, r.scan.metrics.open_fds_at_finish);
         u64(b, r.scan.root_mount_id); u64(b, r.scan.root_filesystem_type);
-        wire_.frame(5, b, true); wire_.frame(6, {}, true);
+        wire_.frame(5, b, true);
+        // Measure identity through summary. Reporting the counters does not count itself.
+        Bytes timing;
+        u64(timing, micros(Clock::now() - started_));
+        u64(timing, micros(pipe_.writes)); u64(timing, micros(pipe_.polls));
+        u64(timing, pipe_.frames); u64(timing, pipe_.bytes);
+        wire_.frame(9, timing, true);
+        wire_.frame(6, {}, true);
     }
 private:
+    using Clock = std::chrono::steady_clock;
+    static std::uint64_t micros(Clock::duration duration) {
+        return std::chrono::duration_cast<std::chrono::microseconds>(duration).count();
+    }
+    Clock::time_point started_ = Clock::now();
+    PipeMeasurements pipe_;
     Writer wire_; Bytes batch_; std::uint32_t count_ = 0;
 };
 }

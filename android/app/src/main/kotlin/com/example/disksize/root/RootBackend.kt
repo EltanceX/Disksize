@@ -83,7 +83,8 @@ internal class RootBackend(private val context: Context) : AutoCloseable {
                 }
                 val service = future.get(25, TimeUnit.SECONDS)
                 val inspection = JSONObject(service.inspect())
-                check(inspection.getInt("protocolVersion") == 3 && inspection.getInt("uid") == 0 && inspection.getInt("effectiveUid") == 0)
+                check(inspection.getInt("protocolVersion") == IndexProtocol.VERSION &&
+                    inspection.getInt("uid") == 0 && inspection.getInt("effectiveUid") == 0)
                 synchronized(lock) { check(!closed); status = inspection.toString() }
             } catch (error: Exception) {
                 Log.w("DiskSize.Root", "Root authorization/binding failed", error)

@@ -105,6 +105,8 @@ internal class IndexStore(context: Context, filename: String = "scan-index.db") 
             arrayOf<Any>(id, root, backend, now(), uid, pid, identity(root)))
         return Import(id)
     }
+    enum class FlushReason { LIMIT, PROGRESS, SUMMARY }
+
     inner class Import internal constructor(val id: String) : AutoCloseable {
         private val db = writableDatabase
         private val insert = db.compileStatement("""INSERT INTO nodes(sid,id,parent,depth,name,name_key,path,link,kind,mode,uid,gid,
@@ -114,6 +116,14 @@ internal class IndexStore(context: Context, filename: String = "scan-index.db") 
         private var discovered = 0L; private var issueCount = 0L
         var writeNanos = 0L
             private set
+        private var volumeNanos = 0L
+        private var commitNanos = 0L
+        private var committedActions = 0L
+        private var maxActions = 0
+        private val commits = LongArray(FlushReason.entries.size)
+        private var parentCacheHits = 0L
+        private var parentCacheMisses = 0L
+        val measuredImportNanos get() = writeNanos + volumeNanos
         // At most 32 recent parent paths, with a 1 MiB byte cap (deep trees can have long paths).
         private val paths = LinkedHashMap<Long, Pair<ByteArray, Int>>(32, 0.75f, true)
         private var pathBytes = 0
@@ -130,9 +140,18 @@ internal class IndexStore(context: Context, filename: String = "scan-index.db") 
         fun node(n: IndexNode) {
             val before = System.nanoTime()
             action()
-            val ancestor = if (n.parent == 0L) byteArrayOf() to -1 else paths[n.parent] ?: db.rawQuery(
-                "SELECT path,depth,kind FROM nodes WHERE sid=? AND id=?", arrayOf(id, n.parent.toString())).use {
-                require(it.moveToFirst() && it.getInt(2) == 1) { "Missing/non-directory parent" }; it.getBlob(0) to it.getInt(1)
+            val ancestor = if (n.parent == 0L) byteArrayOf() to -1 else {
+                val parent = paths[n.parent]
+                if (parent != null) {
+                    parentCacheHits++
+                    parent
+                } else {
+                    parentCacheMisses++
+                    db.rawQuery("SELECT path,depth,kind FROM nodes WHERE sid=? AND id=?", arrayOf(id, n.parent.toString())).use {
+                        require(it.moveToFirst() && it.getInt(2) == 1) { "Missing/non-directory parent" }
+                        it.getBlob(0) to it.getInt(1)
+                    }
+                }
             }
             require(n.depth == ancestor.second + 1)
             val path = if (ancestor.first.isEmpty()) n.name else ancestor.first + byteArrayOf(47) + n.name
@@ -148,7 +167,7 @@ internal class IndexStore(context: Context, filename: String = "scan-index.db") 
             if (n.kind == 1) cached(n.id, path, n.depth)
             discovered++
             writeNanos += System.nanoTime() - before
-            if (actions >= 256) flush()
+            if (actions >= 256) flush(FlushReason.LIMIT)
         }
         fun directory(node: Long, enumerated: Boolean, complete: Boolean, skip: Int) {
             val before = System.nanoTime()
@@ -159,7 +178,7 @@ internal class IndexStore(context: Context, filename: String = "scan-index.db") 
             if (skip != 0) db.execSQL("UPDATE aggregates SET own_logical=0,own_allocated=0,logical=0,allocated=0 WHERE sid=? AND id=?",
                 arrayOf<Any>(id, node))
             writeNanos += System.nanoTime() - before
-            if (actions >= 256) flush()
+            if (actions >= 256) flush(FlushReason.LIMIT)
         }
         fun issue(node: Long, code: Int, errno: Int, op: String) {
             val before = System.nanoTime()
@@ -168,22 +187,39 @@ internal class IndexStore(context: Context, filename: String = "scan-index.db") 
             db.execSQL("UPDATE nodes SET complete=0 WHERE sid=? AND id=?", arrayOf<Any>(id, node))
             db.execSQL("UPDATE aggregates SET complete=0 WHERE sid=? AND id=?", arrayOf<Any>(id, node))
             writeNanos += System.nanoTime() - before
-            if (actions >= 256) flush()
+            if (actions >= 256) flush(FlushReason.LIMIT)
         }
         fun volume(total: Long, free: Long, available: Long, captured: Long) {
+            val before = System.nanoTime()
             action()
             val value = JSONObject().put("totalBytes", total).put("freeBytes", free)
                 .put("availableBytes", available).put("capturedAtMillis", captured)
             db.execSQL("UPDATE sessions SET volume=? WHERE id=?", arrayOf(value.toString(), id))
+            volumeNanos += System.nanoTime() - before
         }
-        fun flush() {
+        fun flush(reason: FlushReason = FlushReason.SUMMARY) {
             if (!transaction) return
             val before = System.nanoTime()
+            val batch = actions
             try {
                 db.execSQL("UPDATE sessions SET revision=revision+1,nodes=?,issues=? WHERE id=?", arrayOf<Any>(discovered, issueCount, id))
                 db.setTransactionSuccessful()
-            } finally { db.endTransaction(); transaction = false; actions = 0; writeNanos += System.nanoTime() - before }
+            } finally {
+                db.endTransaction(); transaction = false; actions = 0
+                val elapsed = System.nanoTime() - before
+                writeNanos += elapsed
+                commitNanos += elapsed
+            }
+            commits[reason.ordinal]++
+            committedActions += batch
+            maxActions = maxOf(maxActions, batch)
         }
+        fun measurements() = JSONObject().put("importMicros", measuredImportNanos / 1000)
+            .put("importCommitMicros", commitNanos / 1000)
+            .put("transactions", commits.sum()).put("committedActions", committedActions).put("maxActionsPerTransaction", maxActions)
+            .put("limitCommits", commits[FlushReason.LIMIT.ordinal]).put("progressCommits", commits[FlushReason.PROGRESS.ordinal])
+            .put("summaryCommits", commits[FlushReason.SUMMARY.ordinal])
+            .put("parentCacheHits", parentCacheHits).put("parentCacheMisses", parentCacheMisses)
         override fun close() {
             if (transaction) { db.endTransaction(); transaction = false }
             insert.close(); insertAggregate.close(); paths.clear()
@@ -203,6 +239,7 @@ internal class IndexStore(context: Context, filename: String = "scan-index.db") 
     }
     fun finalize(id: String, summary: StreamSummary, signal: CancellationSignal = CancellationSignal(), cancelled: () -> Boolean): JSONObject {
         val start = android.os.SystemClock.elapsedRealtime()
+        val startNanos = System.nanoTime()
         val db = writableDatabase
         db.rawQuery("SELECT 1 FROM snapshots WHERE sid=?", arrayOf(id)).use { check(!it.moveToFirst()) { "Snapshot is immutable" } }
         fun check() { if (cancelled()) throw CancellationException("Index finalization cancelled") }
@@ -236,6 +273,7 @@ internal class IndexStore(context: Context, filename: String = "scan-index.db") 
         }
         transaction(id) { it.execSQL("UPDATE sessions SET phase='aggregating' WHERE id=?", arrayOf(id)) }
         val dedupMillis = android.os.SystemClock.elapsedRealtime() - start
+        val initializeStart = System.nanoTime()
         var from = 1L
         while (from <= summary.nodes) {
             check(); val to = from + 4095
@@ -255,6 +293,7 @@ internal class IndexStore(context: Context, filename: String = "scan-index.db") 
             from = to + 1
         }
         val initializeMillis = android.os.SystemClock.elapsedRealtime() - start - dedupMillis
+        val aggregateStart = System.nanoTime()
         val depth = db.rawQuery("SELECT COALESCE(MAX(depth),0) FROM nodes WHERE sid=?", arrayOf(id)).use { it.moveToFirst(); it.getInt(0) }
         for (level in depth downTo 0) {
             var after = 0L
@@ -279,10 +318,18 @@ internal class IndexStore(context: Context, filename: String = "scan-index.db") 
         check()
         val complete = db.rawQuery("SELECT complete FROM aggregates WHERE sid=? AND id=1", arrayOf(id)).use { it.moveToFirst() && it.getInt(0) == 1 }
         val state = if (summary.state == "completed" && !complete) "partial" else summary.state
+        val aggregateEnd = System.nanoTime()
         val metrics = JSONObject().put("scanMicros", summary.elapsed).put("finalizeMillis", android.os.SystemClock.elapsedRealtime() - start)
             .put("importDbMicros", summary.importWriteMicros).put("dedupMillis", dedupMillis).put("initializeMillis", initializeMillis)
             .put("peakOpenFds", summary.peakFds).put("openFdsAtFinish", summary.finishFds)
             .put("rootMountId", summary.mount).put("rootFilesystemType", summary.filesystem)
+        val finalize = summary.performance?.let {
+            JSONObject().put("dedupMicros", (initializeStart - startNanos) / 1000)
+                .put("initializeMicros", (aggregateStart - initializeStart) / 1000)
+                .put("aggregateMicros", (aggregateEnd - aggregateStart) / 1000)
+                .also { timings -> metrics.put("performance", it.put("finalize", timings)) }
+        }
+        val commitStart = System.nanoTime()
         transaction(id) {
             it.execSQL("""UPDATE sessions SET state=?,phase='final',provisional=0,ended=?,metrics=?,
                 issues=(SELECT COUNT(*) FROM issues WHERE sid=?) WHERE id=?""", arrayOf<Any>(state, now(), metrics.toString(), id, id))
@@ -291,7 +338,15 @@ internal class IndexStore(context: Context, filename: String = "scan-index.db") 
                 COALESCE((SELECT allocated FROM aggregates WHERE sid=? AND id=1),0),? FROM sessions WHERE id=?""",
                 arrayOf<Any>(now(), id, id, if (complete) 1 else 0, id))
         }
-        return preview(id)
+        val committed = System.nanoTime()
+        val result = preview(id)
+        // Only the terminal journal can carry timings measured after this transaction.
+        if (finalize != null) {
+            result.getJSONObject("performance").getJSONObject("finalize")
+                .put("commitMicros", (committed - commitStart) / 1000)
+                .put("previewMicros", (System.nanoTime() - committed) / 1000)
+        }
+        return result
     }
     fun preview(id: String): JSONObject {
         val db = readableDatabase

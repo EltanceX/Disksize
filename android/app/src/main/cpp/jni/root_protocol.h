@@ -5,6 +5,7 @@
 #include <cerrno>
 #include <chrono>
 #include <csignal>
+#include <cstdint>
 #include <poll.h>
 #include <stdexcept>
 #include <string_view>
@@ -26,10 +27,19 @@ inline void blob(Bytes& out, std::string_view value) {
 
 // All integers are big endian. Header: magic, version/type (u16), payload
 // length (u32), UUID (16 raw bytes), sequence (u64). Max payload is 64 KiB.
+struct PipeMeasurements {
+    std::uint64_t frames = 0;
+    std::uint64_t bytes = 0;
+    std::chrono::steady_clock::duration writes{};
+    std::chrono::steady_clock::duration polls{};
+};
+
 class Writer {
 public:
-    Writer(int output, Bytes session, CancellationToken& cancellation, std::uint16_t version = 1)
-        : fd_(dup(output)), session_(std::move(session)), cancellation_(cancellation), version_(version) {
+    Writer(int output, Bytes session, CancellationToken& cancellation, std::uint16_t version = 1,
+           PipeMeasurements* measurements = nullptr)
+        : fd_(dup(output)), session_(std::move(session)), cancellation_(cancellation), version_(version),
+          measurements_(measurements) {
         if (fd_ < 0 || session_.size() != 16) {
             if (fd_ >= 0) close(fd_);
             throw std::runtime_error("Invalid pipe/session");
@@ -49,7 +59,13 @@ public:
         Bytes header; u32(header, 0x44535a34); u32(header, (static_cast<std::uint32_t>(version_) << 16) | type);
         u32(header, body.size()); header.insert(header.end(), session_.begin(), session_.end());
         u64(header, sequence_++);
+        const auto start = measurements_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         write(header, terminal); write(body, terminal);
+        if (measurements_) {
+            measurements_->writes += std::chrono::steady_clock::now() - start;
+            ++measurements_->frames;
+            measurements_->bytes += header.size() + body.size();
+        }
     }
     void progress(const ScanProgress& value) {
         if (cancellation_.requested()) return;
@@ -100,9 +116,12 @@ private:
             if (size > 0) { offset += size; deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10); continue; }
             if (size < 0 && errno == EINTR) continue;
             if (size < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                if (std::chrono::steady_clock::now() >= deadline) throw std::runtime_error("Pipe consumer stalled");
+                const auto poll_start = std::chrono::steady_clock::now();
+                if (poll_start >= deadline) throw std::runtime_error("Pipe consumer stalled");
                 pollfd descriptor{fd_, POLLOUT, 0};
-                if (poll(&descriptor, 1, 100) < 0 && errno != EINTR) throw std::runtime_error("Pipe poll failed");
+                const auto status = poll(&descriptor, 1, 100);
+                if (status < 0 && errno != EINTR) throw std::runtime_error("Pipe poll failed");
+                if (measurements_) measurements_->polls += std::chrono::steady_clock::now() - poll_start;
                 if (descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) throw std::runtime_error("Pipe disconnected");
                 continue;
             }
@@ -113,6 +132,7 @@ private:
     Bytes session_;
     CancellationToken& cancellation_;
     std::uint16_t version_;
+    PipeMeasurements* measurements_;
     std::uint64_t sequence_ = 0;
 };
 } // namespace disksize::wire

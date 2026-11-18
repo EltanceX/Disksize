@@ -5,6 +5,7 @@ import java.io.DataInputStream
 import java.io.InputStream
 import java.nio.ByteBuffer
 import java.util.UUID
+import org.json.JSONObject
 
 internal fun ByteArray.hex(): String {
     val digits = "0123456789abcdef"; val out = CharArray(size * 2)
@@ -26,24 +27,37 @@ internal data class IndexNode(val id: Long, val parent: Long, val name: ByteArra
     val valid: Boolean, val complete: Boolean, val skip: Int)
 internal data class StreamSummary(val state: String, val nodes: Long, val issues: Long,
     val elapsed: Long, val peakFds: Long, val finishFds: Long, val mount: Long, val filesystem: Long,
-    val importWriteMicros: Long = 0)
+    val importWriteMicros: Long = 0, val performance: JSONObject? = null)
 
 /** Strict bounded parser shared by ordinary and privileged producers. */
 internal object IndexProtocol {
+    const val VERSION = 4
+    private const val HEADER_BYTES = 36
+
     fun read(input: InputStream, id: String, uid: Int, pid: Int, writer: IndexStore.Import,
         progress: (Long, Long, Long) -> Unit): StreamSummary {
+        val start = System.nanoTime()
         val expected = uuidBytes(id); val stream = DataInputStream(input)
         var sequence = 0L; var count = 0L; var issues = 0L; var identity = false
         var summary: StreamSummary? = null
+        var producer: JSONObject? = null
         var volumeSeen = false
+        var bytes = 0L; var batches = 0; var maxBatch = 0
+        var receiveNanos = 0L; var dispatchNanos = 0L; var progressNanos = 0L
+        val nodeKinds = LongArray(kinds.size)
         while (true) {
-            require(stream.readInt() == 0x44535a34 && stream.readUnsignedShort() == 3) { "Bad stream magic/version" }
+            val beforeRead = System.nanoTime()
+            require(stream.readInt() == 0x44535a34 && stream.readUnsignedShort() == VERSION) { "Bad stream magic/version" }
             val type = stream.readUnsignedShort(); val length = stream.readInt()
             require(length in 0..65536) { "Frame too large" }
             require(ByteArray(16).also { stream.readFully(it) }.contentEquals(expected)) { "Session mismatch" }
             require(stream.readLong() == sequence++) { "Sequence mismatch" }
-            val body = DataInputStream(ByteArrayInputStream(ByteArray(length).also { stream.readFully(it) }))
-            require(identity || type == 1); require(summary == null || type == 6)
+            val payload = ByteArray(length).also { stream.readFully(it) }
+            val afterRead = System.nanoTime()
+            receiveNanos += afterRead - beforeRead
+            val body = DataInputStream(ByteArrayInputStream(payload))
+            require(identity || type == 1)
+            require(if (producer != null) type == 6 else if (summary != null) type == 9 else type != 9 && type != 6)
             when (type) {
                 1 -> {
                     require(!identity && sequence == 1L)
@@ -53,10 +67,14 @@ internal object IndexProtocol {
                 2 -> {
                     val nodes = body.positive(); val logical = body.positive(); val totalIssues = body.positive(); body.positive()
                     require(nodes == count && totalIssues == issues)
-                    writer.flush(); progress(nodes, logical, totalIssues)
+                    writer.flush(IndexStore.FlushReason.PROGRESS)
+                    val beforeProgress = System.nanoTime()
+                    progress(nodes, logical, totalIssues)
+                    progressNanos += System.nanoTime() - beforeProgress
                 }
                 3 -> {
                     val size = body.readInt(); require(size in 1..256)
+                    batches++; maxBatch = maxOf(maxBatch, size)
                     repeat(size) {
                         val nodeId = body.positive(); val parent = body.positive()
                         val name = body.blob(255); val link = body.blob(4096)
@@ -73,6 +91,7 @@ internal object IndexProtocol {
                         val valid = body.flag(); val complete = body.flag(); val skip = body.readInt(); require(skip in skips.indices)
                         writer.node(IndexNode(nodeId, parent, name, link, kind, depth, mode, user, group, device, inode,
                             mount, links, bytes, allocated, seconds, nanos, valid, complete, skip)); count++
+                        nodeKinds[kind]++
                     }
                 }
                 4 -> {
@@ -92,7 +111,7 @@ internal object IndexProtocol {
                     require(state != null && body.positive() == count && body.positive() == issues)
                     summary = StreamSummary(state, count, issues, body.positive(), body.positive(), body.positive(), body.positive(), body.positive())
                     require(summary.finishFds == 0L)
-                    writer.flush()
+                    writer.flush(IndexStore.FlushReason.SUMMARY)
                 }
                 8 -> {
                     require(!volumeSeen); volumeSeen = true
@@ -100,13 +119,36 @@ internal object IndexProtocol {
                     require(free <= total && available <= free && captured > 0)
                     writer.volume(total, free, available, captured)
                 }
+                9 -> {
+                    require(length == 40)
+                    val elapsed = body.positive(); val writes = body.positive(); val polls = body.positive()
+                    val frames = body.positive(); val wireBytes = body.positive()
+                    require(polls <= writes && writes <= elapsed && checkNotNull(summary).elapsed <= elapsed)
+                    require(frames == sequence - 1 && wireBytes == bytes) { "Producer frame counts mismatch" }
+                    producer = JSONObject().put("elapsedMicros", elapsed).put("pipeWriteMicros", writes)
+                        .put("pipePollMicros", polls).put("frames", frames).put("wireBytes", wireBytes)
+                        .put("nodeBatches", batches).put("maxNodesPerBatch", maxBatch)
+                        .put("nodesByKind", JSONObject().apply { kinds.forEachIndexed { i, kind -> put(kind, nodeKinds[i]) } })
+                }
                 6 -> {
-                    require(summary != null && length == 0 && stream.read() == -1) { "Missing end/EOF" }
-                    return summary
+                    require(length == 0 && stream.read() == -1) { "Missing end/EOF" }
+                    val end = System.nanoTime()
+                    receiveNanos += end - afterRead
+                    val consumer = writer.measurements()
+                        .put("elapsedMicros", (end - start) / 1000)
+                        .put("receiveMicros", receiveNanos / 1000)
+                        .put("decodeMicros", (dispatchNanos - writer.measuredImportNanos - progressNanos) / 1000)
+                        .put("progressMicros", progressNanos / 1000)
+                    return checkNotNull(summary).copy(
+                        importWriteMicros = writer.writeNanos / 1000,
+                        performance = JSONObject().put("version", 1).put("producer", producer).put("consumer", consumer),
+                    )
                 }
                 else -> error("Unknown record")
             }
             require(body.available() == 0) { "Trailing payload" }
+            bytes += HEADER_BYTES + length
+            dispatchNanos += System.nanoTime() - afterRead
         }
     }
     private fun DataInputStream.positive() = readLong().also { require(it >= 0) }

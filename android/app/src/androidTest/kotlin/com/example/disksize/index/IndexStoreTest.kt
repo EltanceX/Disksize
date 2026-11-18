@@ -119,29 +119,43 @@ class IndexStoreTest {
         val detail = JSONObject(queries.query(JSONObject().put("sessionId", id).put("kind", "detail").put("nodeId", 2).toString())).getJSONObject("detail")
         assertEquals("66696c652d32", detail.getString("pathHex")); assertEquals(8, detail.getLong("rawSize"))
     }
-    @Test fun v3RejectsMalformedAndInterruptedStreams() = withStore { store ->
+    @Test fun v4RejectsMalformedAndInterruptedStreams() = withStore { store ->
         val id = UUID.randomUUID().toString()
         fun payload(block: (DataOutputStream) -> Unit): ByteArray = ByteArrayOutputStream().also { buffer ->
             DataOutputStream(buffer).use(block)
         }.toByteArray()
         fun frame(type: Int, sequence: Long, body: ByteArray) = payload {
-            it.writeInt(0x44535a34); it.writeShort(3); it.writeShort(type); it.writeInt(body.size)
+            it.writeInt(0x44535a34); it.writeShort(IndexProtocol.VERSION); it.writeShort(type); it.writeInt(body.size)
             it.write(uuidBytes(id)); it.writeLong(sequence); it.write(body)
         }
         val identity = frame(1, 0, payload { it.writeInt(Process.myUid()); it.writeInt(Process.myUid()); it.writeInt(Process.myPid()) })
         val summary = frame(5, 1, payload { out -> out.writeInt(7); repeat(7) { out.writeLong(0) } })
-        val end = frame(6, 2, byteArrayOf())
+        fun measurement(write: Long = 3, poll: Long = 2, frames: Long = 2) = frame(9, 2, payload { out ->
+            for (value in listOf(5L, write, poll, frames, (identity.size + summary.size).toLong())) out.writeLong(value)
+        })
+        val end = frame(6, 3, byteArrayOf())
         store.begin(id, "/fixture", "ordinary", Process.myUid(), Process.myPid()).use { writer ->
-            val good = identity + summary + end
-            assertEquals("failed", IndexProtocol.read(ByteArrayInputStream(good), id, Process.myUid(), Process.myPid(), writer) { _, _, _ -> }.state)
+            val good = identity + summary + measurement() + end
+            val result = IndexProtocol.read(ByteArrayInputStream(good), id, Process.myUid(), Process.myPid(), writer) { _, _, _ -> }
+            assertEquals("failed", result.state)
+            val producer = checkNotNull(result.performance).getJSONObject("producer")
+            assertEquals(2, producer.getLong("frames"))
+            assertEquals((identity.size + summary.size).toLong(), producer.getLong("wireBytes"))
+            assertEquals(3, producer.getLong("pipeWriteMicros"))
+            assertEquals(2, producer.getLong("pipePollMicros"))
             val variants = listOf(
                 good.copyOf(good.size - 1), good + byteArrayOf(1),
-                good.copyOf().also { it[5] = 1 }, // obsolete protocol
+                good.copyOf().also { it[5] = 3 }, // obsolete protocol
                 good.copyOf().also { it[8] = 127 }, // oversized payload
                 good.copyOf().also { it[12] = (it[12].toInt() xor 1).toByte() },
                 good.copyOf().also { it[35] = 1 }, // out-of-order sequence
                 good.copyOf().also { it[39] = (it[39].toInt() xor 1).toByte() }, // wrong scanner UID
-                identity + end // end before summary
+                identity + frame(6, 1, byteArrayOf()), // end before summary
+                identity + summary + frame(6, 2, byteArrayOf()), // missing measurements
+                identity + summary + measurement(frames = 1) + end,
+                identity + summary + measurement(poll = 4) + end,
+                identity + summary + measurement() + frame(9, 3, byteArrayOf()) + end,
+                identity + summary + frame(9, 2, ByteArray(39)) + end,
             )
             for (bytes in variants) {
                 var rejected = false

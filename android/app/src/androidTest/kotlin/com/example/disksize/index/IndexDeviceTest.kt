@@ -55,6 +55,42 @@ class IndexDeviceTest {
         }
         error("Root authorization timed out")
     }
+    private fun assertPerformance(result: JSONObject): JSONObject {
+        val performance = result.getJSONObject("performance")
+        assertEquals(1, performance.getInt("version"))
+        val producer = performance.getJSONObject("producer")
+        val consumer = performance.getJSONObject("consumer")
+        val types = producer.getJSONObject("nodesByKind")
+        assertEquals(result.getLong("nodeCount"), types.keys().asSequence().sumOf { types.getLong(it) })
+        assertTrue(producer.getInt("maxNodesPerBatch") in 1..256)
+        assertTrue(producer.getLong("wireBytes") > producer.getLong("frames") * 36)
+        assertTrue(producer.getLong("frames") >= producer.getLong("nodeBatches") + 2)
+        val writes = producer.getLong("pipeWriteMicros")
+        assertTrue(producer.getLong("pipePollMicros") in 0..writes)
+        assertTrue(producer.getLong("elapsedMicros") >= maxOf(writes, result.getLong("scanMicros")))
+        val transactions = consumer.getLong("transactions")
+        assertTrue(transactions > 0)
+        assertEquals(transactions, listOf("limitCommits", "progressCommits", "summaryCommits").sumOf { consumer.getLong(it) })
+        assertTrue(consumer.getInt("maxActionsPerTransaction") in 1..256)
+        assertEquals(result.getLong("nodeCount") - 1, consumer.getLong("parentCacheHits") + consumer.getLong("parentCacheMisses"))
+        val importMicros = consumer.getLong("importMicros")
+        assertTrue(consumer.getLong("importCommitMicros") in 0..importMicros)
+        assertTrue(importMicros >= result.getLong("importDbMicros"))
+        assertTrue(listOf("receiveMicros", "decodeMicros", "progressMicros", "importMicros").sumOf {
+            consumer.getLong(it).also { elapsed -> assertTrue(elapsed >= 0) }
+        } <= consumer.getLong("elapsedMicros"))
+        val finalize = performance.getJSONObject("finalize")
+        for (key in listOf("dedupMicros", "initializeMicros", "aggregateMicros", "commitMicros", "previewMicros")) {
+            assertTrue(finalize.getLong(key) >= 0)
+        }
+        val pipeline = performance.getJSONObject("coordinator").getLong("pipelineMicros")
+        assertTrue(pipeline >= consumer.getLong("elapsedMicros"))
+        val publication = performance.getJSONObject("publication")
+        assertTrue(publication.getLong("journalWriteMicros") >= 0 && publication.getLong("journalQueueMicros") >= 0)
+        assertTrue(publication.getLong("prepareToPublishMicros") >= pipeline + publication.getLong("journalWriteMicros"))
+        return performance
+    }
+
     @Test fun ordinaryServicePersistsAndQueriesAfterProcessDeath() {
         val root = File(context.filesDir, "phase5-ipc-${UUID.randomUUID()}"); check(root.mkdir())
         val (connection, remote) = service()
@@ -63,17 +99,41 @@ class IndexDeviceTest {
             val result = scan(remote, root.path, "own")
             assertEquals("completed", result.getString("state")); assertEquals(301, result.getLong("nodeCount"))
             assertEquals(1800, result.getLong("logicalBytes")); assertEquals(0, result.getLong("openFdsAtFinish"))
+            val performance = assertPerformance(result)
             val id = result.getString("sessionId")
             val query = JSONObject().put("sessionId", id).put("kind", "children").put("parentId", 1).toString()
             val first = JSONObject(remote.queryIndex(query))
             assertEquals(100, first.getJSONArray("entries").length())
+            val stored = first.getJSONObject("metrics").getJSONObject("performance")
+            assertEquals(performance.getJSONObject("producer").toString(), stored.getJSONObject("producer").toString())
+            assertFalse(stored.getJSONObject("finalize").has("commitMicros"))
+            assertFalse(stored.has("publication"))
             Process.sendSignal(result.getInt("servicePid"), 9)
             SystemClock.sleep(400)
             val rebound = runBlocking { connection.getService() }
             val second = JSONObject(rebound.queryIndex(query))
             assertEquals(first.getLong("revision"), second.getLong("revision")); assertFalse(second.getBoolean("provisional"))
-            assertEquals("completed", JSONObject(rebound.scanSnapshot).getString("state"))
+            val restored = JSONObject(rebound.scanSnapshot)
+            assertEquals("completed", restored.getString("state"))
+            assertTrue(restored.getJSONObject("performance").getJSONObject("finalize").has("commitMicros"))
+            assertFalse(restored.getJSONObject("performance").has("publication"))
         } finally { connection.close(); root.deleteRecursively() }
+    }
+
+    @Test fun rootScanUsesSamePerformanceContract() {
+        assumeTrue(InstrumentationRegistry.getArguments().getString("scanPerformanceRoot") == "true")
+        val fixture = File(context.filesDir, "scan-performance-${UUID.randomUUID()}")
+        check(fixture.mkdir())
+        val (connection, remote) = service()
+        try {
+            repeat(300) { check(File(fixture, "f$it").createNewFile()) }
+            root(remote)
+            val result = scan(remote, fixture.path, "root")
+            assertEquals("completed", result.getString("state"))
+            assertEquals(301, result.getLong("nodeCount")); assertEquals(0, result.getInt("scannerUid"))
+            assertEquals(Process.myUid(), result.getInt("serviceUid"))
+            assertPerformance(result)
+        } finally { connection.close(); fixture.deleteRecursively() }
     }
     @Test fun rootBaselineUsesOrdinaryUidIndex() {
         assumeTrue(InstrumentationRegistry.getArguments().getString("phase5Root") == "true")
@@ -219,6 +279,7 @@ class IndexDeviceTest {
             val result = scan(remote, fixture.path, if (backend == "root") "root" else "own")
             val elapsed = SystemClock.elapsedRealtime() - start
             assertEquals("completed", result.getString("state")); assertEquals(size + 1L, result.getLong("nodeCount"))
+            val performance = assertPerformance(result)
             val id = result.getString("sessionId")
             val meta = JSONObject(remote.queryIndex(JSONObject().put("sessionId", id).put("kind", "session").toString()))
             val seen = BitSet(size + 2); var cursor = ""; var pages = 0; var count = 0
@@ -238,7 +299,7 @@ class IndexDeviceTest {
             } while (cursor.isNotEmpty())
             assertEquals(dirs * files, count)
             val report = JSONObject().put("size", size + 1).put("backend", backend).put("totalMillis", elapsed)
-                .put("metrics", meta.getJSONObject("metrics")).put("pages", pages).put("files", count)
+                .put("metrics", meta.getJSONObject("metrics")).put("performance", performance).put("pages", pages).put("files", count)
                 .put("firstPageMicros", firstMicros).put("lastPageMicros", lastMicros).put("maxPageMicros", maxMicros)
                 .put("servicePid", result.getInt("servicePid")).put("scannerPid", result.getInt("scannerPid"))
                 .put("databaseBytes", File(context.noBackupFilesDir, "scan-index.db").length())

@@ -35,7 +35,10 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
 class CoordinatorService : Service() {
-    private class Active(val id: String, val root: String, val monitorShared: Boolean, val rootMode: Boolean) {
+    private class Active(val id: String, val root: String, val monitorShared: Boolean, val rootMode: Boolean,
+        val prepareStart: Long) {
+        val preparedAt = System.nanoTime()
+        var foregroundAt = 0L
         var handle = 0L
         var started = false
         var finalizing = false
@@ -96,6 +99,7 @@ class CoordinatorService : Service() {
         override fun getRootStatus(): String { checkCallingUid(); return rootBackend.status }
         override fun prepareScan(rootPath: String, source: String): String {
             checkCallingUid()
+            val prepareStart = System.nanoTime()
             initialized.get(5, TimeUnit.SECONDS)
             require(source in setOf("own", "external-own", "shared", "path", "root")) { "Unknown scan source" }
             require(rootPath.startsWith('/') && !rootPath.contains('\u0000') && rootPath.toByteArray().size <= 4096) {
@@ -113,7 +117,7 @@ class CoordinatorService : Service() {
                 check(active == null) { "A scan is already active" }
                 Active(UUID.randomUUID().toString(), root,
                     source != "root" && access.sharedAccessGranted && ScanAccess.requiresSharedAccess(this@CoordinatorService, root),
-                    source == "root").also {
+                    source == "root", prepareStart).also {
                     active = it
                     current = newSnapshot(it.id, root).put("source", source)
                         .put("backend", if (it.rootMode) "root" else "ordinary")
@@ -227,6 +231,7 @@ class CoordinatorService : Service() {
         val task = synchronized(lock) {
             active?.takeIf { it.id == intent?.getStringExtra(EXTRA_SESSION) && !it.started && !it.finalizing }?.also {
                 it.started = true
+                it.foregroundAt = System.nanoTime()
                 current!!.put("state", "running")
                 publishLocked()
             }
@@ -239,6 +244,8 @@ class CoordinatorService : Service() {
     }
 
     private fun runScan(task: Active) {
+        val workerStart = System.nanoTime()
+        var performance: JSONObject? = null
         try {
             // Flush the active marker before JNI. Abrupt process death is then
             // distinguishable from a completed scan on the next binding.
@@ -254,22 +261,35 @@ class CoordinatorService : Service() {
                 main.post { updateNotification() }
             }
             val view = synchronized(lock) { JSONObject(current.toString()) }
+            val indexStart = System.nanoTime()
+            var pipelineStart = indexStart
             val summary = index.begin(task.id, task.root, if (task.rootMode) "root" else "ordinary",
-                view.getInt("scannerUid"), view.getInt("scannerPid")).use { importer -> val streamed = if (task.rootMode) {
-                // A queued cancellation must not dispatch new privileged work.
-                if (synchronized(lock) { task.cancelled || destroyed }) throw RootFailure("cancelled-before-root-start")
-                rootBackend.run(task.id, task.root, importer) { nodes, logical, issues ->
-                    progress(nodes, logical, issues)
-                    if (synchronized(lock) { task.cancelled || destroyed }) rootBackend.cancel(task.id)
+                view.getInt("scannerUid"), view.getInt("scannerPid")).use { importer ->
+                pipelineStart = System.nanoTime()
+                if (task.rootMode) {
+                    // A queued cancellation must not dispatch new privileged work.
+                    if (synchronized(lock) { task.cancelled || destroyed }) throw RootFailure("cancelled-before-root-start")
+                    rootBackend.run(task.id, task.root, importer) { nodes, logical, issues ->
+                        progress(nodes, logical, issues)
+                        if (synchronized(lock) { task.cancelled || destroyed }) rootBackend.cancel(task.id)
+                    }
+                } else {
+                    val handle = NativeBridge.nativeCreateScan(task.root.toByteArray(Charsets.UTF_8))
+                    synchronized(lock) {
+                        task.handle = handle
+                        if (task.cancelled || destroyed) NativeBridge.nativeCancelScan(handle)
+                    }
+                    LocalScanPipe.run(handle, task.id, importer, progress)
                 }
-            } else {
-                val handle = NativeBridge.nativeCreateScan(task.root.toByteArray(Charsets.UTF_8))
-                synchronized(lock) {
-                    task.handle = handle
-                    if (task.cancelled || destroyed) NativeBridge.nativeCancelScan(handle)
-                }
-                LocalScanPipe.run(handle, task.id, importer, progress)
-            }; streamed.copy(importWriteMicros = importer.writeNanos / 1000) }
+            }
+            val pipelineEnd = System.nanoTime()
+            performance = summary.performance?.put("coordinator", JSONObject()
+                .put("prepareMicros", (task.preparedAt - task.prepareStart) / 1000)
+                .put("foregroundMicros", (task.foregroundAt - task.preparedAt) / 1000)
+                .put("workerQueueMicros", (workerStart - task.foregroundAt) / 1000)
+                .put("beforeIndexMicros", (indexStart - workerStart) / 1000)
+                .put("indexSetupMicros", (pipelineStart - indexStart) / 1000)
+                .put("pipelineMicros", (pipelineEnd - pipelineStart) / 1000))
             synchronized(lock) {
                 if (!destroyed && active === task) {
                     current!!.put("peakOpenFds", summary.peakFds).put("openFdsAtFinish", summary.finishFds)
@@ -304,6 +324,7 @@ class CoordinatorService : Service() {
             synchronized(lock) {
                 if (!destroyed && active === task) {
                     persisted?.keys()?.forEach { key -> current!!.put(key, persisted.get(key)) }
+                    if (!current!!.has("performance") && performance != null) current!!.put("performance", performance)
                     val rootReason = (error as? RootFailure)?.reason
                     current!!.put("state", task.forcedState ?: if (task.cancelled) "cancelled" else if (rootReason != null) "interrupted" else "failed")
                         .put("reason", task.reason.ifEmpty { if (task.cancelled) "" else rootReason ?: "native-or-journal-failure" })
@@ -329,8 +350,11 @@ class CoordinatorService : Service() {
         val terminal = current.toString()
         // Keep the last published view active until the terminal record is
         // durable. A caller that observes Completed may then kill/rebind safely.
+        val queuedAt = System.nanoTime()
         journalExecutor.execute {
-            try { journal.write(terminal) }
+            val writeStart = System.nanoTime()
+            var writtenAt: Long? = null
+            try { journal.write(terminal); writtenAt = System.nanoTime() }
             catch (error: Exception) {
                 journalHealthy = false
                 Log.e(TAG, "Terminal persistence failed", error)
@@ -339,7 +363,15 @@ class CoordinatorService : Service() {
                 }
             }
             synchronized(lock) {
-                if (active === task) { active = null; encoded = current.toString() }
+                if (active === task) {
+                    // Keep this post-write sample live; a second write would distort the measurement.
+                    if (writtenAt != null) current!!.optJSONObject("performance")?.put("publication", JSONObject()
+                        .put("journalQueueMicros", (writeStart - queuedAt) / 1000)
+                        .put("journalWriteMicros", (writtenAt - writeStart) / 1000)
+                        .put("prepareToPublishMicros", (System.nanoTime() - task.prepareStart) / 1000))
+                    active = null
+                    encoded = current.toString()
+                }
             }
             main.post { releaseIfIdle() }
         }
