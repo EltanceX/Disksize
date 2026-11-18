@@ -83,4 +83,5 @@ Root 真机验证和协议单元测试见[阶段 4 工具说明](tools/phase4/RE
 - [扫描性能优化构建基线](docs/scan-performance-baseline.md)
 - [扫描性能导入改进](docs/scan-performance-import.md)
 - [扫描性能最终处理改进](docs/scan-performance-finalize.md)
+- [扫描性能 native 与传输改进](docs/scan-performance-native.md)
 - [使用其他应用打开](docs/external-open.md)

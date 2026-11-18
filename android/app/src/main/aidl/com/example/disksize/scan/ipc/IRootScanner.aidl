@@ -7,5 +7,6 @@ interface IRootScanner {
     String inspect();
     void start(String sessionId, in byte[] rootPath, in ParcelFileDescriptor output, IBinder client);
     void cancel(String sessionId);
-    long[] benchmarkTraversal(in byte[] rootPath);
+    long[] benchmarkTraversal(in byte[] rootPath, int pipeline, boolean measureMetadata);
+    void startBenchmark(String sessionId, in byte[] rootPath, in ParcelFileDescriptor output, IBinder client, int pipeline);
 }

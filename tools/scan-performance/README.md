@@ -36,6 +36,17 @@
 
 `-ReplayFixture` 默认为 `empty`。`sparse-links` 和 `dense-links` 跨目录构造不同密度的硬链接、晚发现的 owner 及同 inode 元数据变动；预期状态为 `partial`。`deep-wide` 同时构造深目录链和宽目录。非空配方还会在计时结束后验证容量和状态，并校验各行 owner、容量、完整性及问题记录摘要一致。真实文件的 C 仍使用空文件树。
 
+固定样本的 A/B/C 可以用 `-PipelineVariant` 单独对照 [native 与传输策略](../../docs/scan-performance-native.md)：`baseline` 是分两次查元数据、逐帧分配，`metadata` 仅合并查询，`transport` 仅复用编解码缓冲，`optimized` 两项都启用（默认）。对照组固定使用默认导入和最终处理策略；固定样本的容量、节点种类、状态等必须一致。模式 A 不经过传输，因此只需对比 `baseline` 与 `optimized`。
+
+```powershell
+./tools/scan-performance/verify.ps1 -Serial '<device-id>' -Suite Custom -Size 100000 `
+  -Mode B -PipelineVariant baseline,metadata,transport,optimized -RootInstall
+./tools/scan-performance/verify.ps1 -Serial '<device-id>' -Suite Custom -Size 100000 `
+  -Mode A -PipelineVariant baseline,optimized -MeasureMetadata -RootInstall
+```
+
+`-MeasureMetadata` 仅模式 A 可用。`namedMetadata` 统计按目录 FD 和名称发起的 `fstatat`、`statx` 次数与各自累计耗时，以及需打开 `O_PATH` 再确认挂载的回退次数和耗时。不含根目录、打开的目录 FD 核验或结束检查；回退内部调用合在 `fdFallbackMicros`。此选项增加逐项计时，应单独运行，不与无诊断的吞吐结果混算。
+
 | 模式 | 实际执行 | 主计时 `elapsedMicros` |
 | --- | --- | --- |
 | A | APK 中的 `stream_directory`，回调仅累加 kind、深度和原始容量；无 pipe/SQLite | native 核心经过时间 |

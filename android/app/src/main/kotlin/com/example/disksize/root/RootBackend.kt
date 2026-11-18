@@ -12,6 +12,7 @@ import android.os.ParcelFileDescriptor
 import android.util.Log
 import com.example.disksize.scan.ipc.IRootScanner
 import com.example.disksize.index.IndexProtocol
+import com.example.disksize.scan.ScanPipeline
 import com.example.disksize.index.IndexConsumer
 import com.example.disksize.index.StreamSummary
 import com.topjohnwu.superuser.Shell
@@ -103,12 +104,13 @@ internal class RootBackend(private val context: Context) : AutoCloseable {
         JSONObject(status).optString("state") == "ready" && remote?.asBinder()?.isBinderAlive == true
     }
 
-    fun benchmarkTraversal(root: String): LongArray {
+    fun benchmarkTraversal(root: String, pipeline: ScanPipeline, measureMetadata: Boolean): LongArray {
         val service = synchronized(lock) { check(!closed && ready()); remote!! }
-        return service.benchmarkTraversal(root.toByteArray(Charsets.UTF_8))
+        return service.benchmarkTraversal(root.toByteArray(Charsets.UTF_8), pipeline.nativeCode, measureMetadata)
     }
 
-    fun run(id: String, root: String, writer: IndexConsumer, progress: (Long, Long, Long) -> Unit): StreamSummary {
+    fun run(id: String, root: String, writer: IndexConsumer, pipeline: ScanPipeline = ScanPipeline.OPTIMIZED,
+        progress: (Long, Long, Long) -> Unit): StreamSummary {
         val service: IRootScanner
         val pid: Int
         val pipe = ParcelFileDescriptor.createPipe()
@@ -117,10 +119,12 @@ internal class RootBackend(private val context: Context) : AutoCloseable {
             service = remote!!; pid = JSONObject(status).getInt("pid"); currentRead = pipe[0]
         }
         try {
-            service.start(id, root.toByteArray(Charsets.UTF_8), pipe[1], client)
+            val path = root.toByteArray(Charsets.UTF_8)
+            if (pipeline == ScanPipeline.OPTIMIZED) service.start(id, path, pipe[1], client)
+            else service.startBenchmark(id, path, pipe[1], client, pipeline.nativeCode)
             pipe[1].close() // Binder owns an independent writer descriptor.
             return ParcelFileDescriptor.AutoCloseInputStream(pipe[0]).use {
-                IndexProtocol.read(it, id, 0, pid, writer, progress)
+                IndexProtocol.read(it, id, 0, pid, writer, pipeline.reuseBuffers, progress)
             }
         } catch (error: Exception) {
             try { service.cancel(id) } catch (_: Exception) { }

@@ -56,6 +56,7 @@ class CoordinatorService : Service() {
     private lateinit var journal: SessionJournal
     private lateinit var rootBackend: RootBackend
     private lateinit var index: IndexStore
+    private var pipeline = ScanPipeline.OPTIMIZED
     private var current: JSONObject? = null
     @Volatile private var encoded = ""
     @Volatile private var destroyed = false
@@ -70,6 +71,7 @@ class CoordinatorService : Service() {
             journal = SessionJournal(storage, BenchmarkStorage.JOURNAL)
             index = IndexStore(storage, BenchmarkStorage.INDEX, BenchmarkStorage.importPolicy(storage),
                 BenchmarkStorage.finalizePolicy(storage))
+            pipeline = BenchmarkStorage.pipeline(storage)
         } else {
             journal = SessionJournal(this)
             index = IndexStore(this)
@@ -277,7 +279,7 @@ class CoordinatorService : Service() {
                 if (task.rootMode) {
                     // A queued cancellation must not dispatch new privileged work.
                     if (synchronized(lock) { task.cancelled || destroyed }) throw RootFailure("cancelled-before-root-start")
-                    rootBackend.run(task.id, task.root, importer) { nodes, logical, issues ->
+                    rootBackend.run(task.id, task.root, importer, pipeline) { nodes, logical, issues ->
                         progress(nodes, logical, issues)
                         if (synchronized(lock) { task.cancelled || destroyed }) rootBackend.cancel(task.id)
                     }
@@ -287,7 +289,7 @@ class CoordinatorService : Service() {
                         task.handle = handle
                         if (task.cancelled || destroyed) NativeBridge.nativeCancelScan(handle)
                     }
-                    LocalScanPipe.run(handle, task.id, importer, progress)
+                    LocalScanPipe.run(handle, task.id, importer, pipeline, progress)
                 }
             }
             val pipelineEnd = System.nanoTime()
@@ -298,6 +300,7 @@ class CoordinatorService : Service() {
                 .put("beforeIndexMicros", (indexStart - workerStart) / 1000)
                 .put("indexSetupMicros", (pipelineStart - indexStart) / 1000)
                 .put("pipelineMicros", (pipelineEnd - pipelineStart) / 1000))
+            if (BuildConfig.SCAN_BENCHMARK) performance?.put("pipelineVariant", pipeline.wireName)
             synchronized(lock) {
                 if (!destroyed && active === task) {
                     current!!.put("peakOpenFds", summary.peakFds).put("openFdsAtFinish", summary.finishFds)

@@ -87,6 +87,8 @@
 
 默认只累加帧、事务与阶段计时，进度计时沿用现有的限频回调；沿用已有逐项导入时钟，不新增逐项计时或日志。进程 CPU、内存、FD、独立 SQLite 主库和 WAL 文件大小由基准工具单独采样；文件长度不等于设备写入量，采样峰值也可能漏掉瞬时峰值。编码独立耗时、GC 和设备 I/O 不属于本契约的内嵌指标。正式比较需要同构建、同样本和重复测量，本契约不提供加速数字。
 
+步骤 6 的 `namedMetadata` 只出现在独立模式 A 基准的逐条诊断报告里，不写入 `performance` 或历史会话。字段及采集开关见[基准工具](../tools/scan-performance/README.md)。缓冲区复用未改变 v4 字节布局或计时边界。
+
 ## 验证
 
 设备回归通过普通和 Root 的独立小样本检查计数、计时包含关系及终态发布。普通模式另验证 SQLite 留存与进程重启后恢复的字段差异。Root 用例 `IndexDeviceTest#rootScanUsesSamePerformanceContract` 仅在 instrumentation 传入 `-e scanPerformanceRoot true` 时运行，使用应用自有样本，需开发包已有 Root 授权。另运行 `realFileScaleBaseline` 的 10,001 节点普通模式确认规模报告也能导出实时终态；单次 Debug 冒烟结果不作为性能基线。

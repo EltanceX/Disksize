@@ -6,7 +6,10 @@
 #include <string>
 #include <sys/stat.h>
 
-namespace disksize::internal {
+namespace disksize {
+enum class StreamMetadata;
+struct EntryMeasurements;
+namespace internal {
 
 struct FdMetrics {
     std::atomic<std::uint64_t> current{0};
@@ -52,8 +55,22 @@ private:
 [[nodiscard]] std::uint64_t mount_id_for_fd(int fd, FdMetrics& metrics);
 [[nodiscard]] std::uint64_t mount_id_at(
     int parent, const char* name, const struct stat& expected, FdMetrics& metrics);
+class EntryReader {
+public:
+    EntryReader(StreamMetadata strategy, EntryMeasurements* measurements) noexcept;
+    ~EntryReader();
+    // A successful lookup may still have an unknown mount (zero).
+    [[nodiscard]] bool read(int parent, const char* name, struct stat& value,
+                            std::uint64_t& mount, FdMetrics& metrics);
+private:
+    StreamMetadata strategy_;
+    EntryMeasurements* measurements_;
+    bool statx_unavailable_ = false;
+    std::uint64_t stat_ns_ = 0, statx_ns_ = 0, fallback_ns_ = 0;
+};
 [[nodiscard]] bool same_identity(const struct stat& left, const struct stat& right) noexcept;
 [[nodiscard]] bool pseudo_filesystem(std::uint64_t type) noexcept;
 [[nodiscard]] bool excluded_system_root(const std::string& canonical_path) noexcept;
 
-}  // namespace disksize::internal
+}  // namespace internal
+}  // namespace disksize

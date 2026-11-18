@@ -17,6 +17,7 @@ import com.example.disksize.scan.BenchmarkStorage
 import com.example.disksize.scan.CoordinatorConnection
 import com.example.disksize.scan.CoordinatorService
 import com.example.disksize.scan.NativeBridge
+import com.example.disksize.scan.ScanPipeline
 import com.example.disksize.scan.ipc.IScanCoordinator
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
@@ -107,6 +108,10 @@ class ScanPerformanceTest {
         val mode = requireNotNull(args.getString("mode")).also { require(it in setOf("A", "B", "C", "Replay")) }
         val policy = args.getString("importVariant")?.let(ImportPolicy::benchmark) ?: ImportPolicy.DEFAULT
         val finalizer = args.getString("finalizeVariant")?.let(FinalizePolicy::benchmark) ?: FinalizePolicy.DEFAULT
+        val pipeline = args.getString("pipelineVariant")?.let(ScanPipeline::benchmark) ?: ScanPipeline.OPTIMIZED
+        val measureMetadata = args.getString("measureMetadata") == "true"
+        require(!measureMetadata || mode == "A")
+        require(pipeline == ScanPipeline.OPTIMIZED || mode != "Replay")
         val recipe = if (mode == "Replay") FinalizeReplay(args.getString("replayFixture") ?: "empty", dirs, filesPerDir) else null
         val backend = requireNotNull(args.getString("backend")).also { require(it in setOf("ordinary", "root")) }
         val view = requireNotNull(args.getString("view")).also {
@@ -125,9 +130,9 @@ class ScanPerformanceTest {
         }
         val windowStart = SystemClock.elapsedRealtimeNanos()
         val result = when (mode) {
-            "C" -> complete(checkNotNull(target), view, backend, policy, finalizer)
+            "C" -> complete(checkNotNull(target), view, backend, policy, finalizer, pipeline)
             "Replay" -> replay(checkNotNull(recipe), policy, finalizer)
-            else -> stream(checkNotNull(target), backend, mode)
+            else -> stream(checkNotNull(target), backend, mode, pipeline, measureMetadata)
         }
         if (mode == "C" || mode == "Replay") {
             val timings = result.getJSONObject("performance")
@@ -137,6 +142,7 @@ class ScanPerformanceTest {
         }
         val fs = result.optLong("filesystemMagic", -1)
         if (mode != "Replay") {
+            result.put("pipelineVariant", pipeline.wireName)
             check(fs in if (view == "fuse") setOf(0x65735546L) else setOf(0xf2f52010L, 0xef53L)) {
                 "Unexpected filesystem magic 0x${fs.toString(16)} for $view"
             }
@@ -152,6 +158,7 @@ class ScanPerformanceTest {
             check(result.getString("state") == state && result.getLong("issues") == issues) {
                 "Fixed fixture did not complete"
             }
+            if (mode == "C") check(result.getBoolean("complete"))
             check(result.getLong("nodes") == size + 1L && result.getLong("logicalBytes") == (recipe?.logical ?: 0L))
             if (recipe != null) check(result.getLong("allocatedBytes") == recipe.allocated)
             val kinds = result.getJSONObject("nodesByKind")
@@ -185,6 +192,7 @@ class ScanPerformanceTest {
         File(journal.path + ".bak").let { check(!it.exists() || it.delete()) }
         File(storage.noBackupFilesDir, BenchmarkStorage.IMPORT_VARIANT).let { check(!it.exists() || it.delete()) }
         File(storage.noBackupFilesDir, BenchmarkStorage.FINALIZE_VARIANT).let { check(!it.exists() || it.delete()) }
+        File(storage.noBackupFilesDir, BenchmarkStorage.PIPELINE_VARIANT).let { check(!it.exists() || it.delete()) }
     }
 
     private class Counter : IndexConsumer {
@@ -203,7 +211,7 @@ class ScanPerformanceTest {
         override fun flush(reason: IndexStore.FlushReason) = Unit
     }
 
-    private fun stream(path: String, backend: String, mode: String): JSONObject {
+    private fun stream(path: String, backend: String, mode: String, pipeline: ScanPipeline, measureMetadata: Boolean): JSONObject {
         val root = if (backend == "root") RootBackend(context) else null
         try {
             val rootStart = System.nanoTime()
@@ -216,8 +224,9 @@ class ScanPerformanceTest {
             val started = System.nanoTime()
             val cpuBefore = Process.getElapsedCpuTime()
             val result = if (mode == "A") {
-                val r = if (root != null) root.benchmarkTraversal(path) else native(path, NativeBridge::nativeBenchmarkTraversal)
-                check(r.size == 22 && r[0] == r[1] && r[0] == identity.getLong("uid") && r[2] == identity.getLong("pid"))
+                val r = if (root != null) root.benchmarkTraversal(path, pipeline, measureMetadata)
+                    else native(path) { NativeBridge.nativeBenchmarkTraversal(it, pipeline.nativeCode, measureMetadata) }
+                check(r.size == 28 && r[0] == r[1] && r[0] == identity.getLong("uid") && r[2] == identity.getLong("pid"))
                 JSONObject().put("state", if (r[3] == 5L) "completed" else if (r[3] == 6L) "partial" else "failed")
                     .put("nodes", r[4]).put("issues", r[5]).put("elapsedMicros", r[6])
                     .put("peakOpenFds", r[7]).put("openFdsAtFinish", r[8]).put("mountId", r[9]).put("filesystemMagic", r[10])
@@ -225,11 +234,16 @@ class ScanPerformanceTest {
                     .put("nodesByKind", JSONObject().apply { kinds.forEachIndexed { i, kind -> put(kind, r[14 + i]) } })
                     .put("producerThreadUserMicros", r[19].takeIf { it >= 0 })
                     .put("producerThreadSystemMicros", r[20].takeIf { it >= 0 }).put("workers", r[21])
+                    .apply {
+                        if (measureMetadata) put("namedMetadata", JSONObject()
+                            .put("statCalls", r[22]).put("statxCalls", r[23]).put("fdFallbacks", r[24])
+                            .put("statMicros", r[25]).put("statxMicros", r[26]).put("fdFallbackMicros", r[27]))
+                    }
             } else {
                 val counter = Counter()
                 val id = UUID.randomUUID().toString()
-                val summary = if (root != null) root.run(id, path, counter) { _, _, _ -> } else {
-                    native(path) { LocalScanPipe.run(it, id, counter) { _, _, _ -> } }
+                val summary = if (root != null) root.run(id, path, counter, pipeline) { _, _, _ -> } else {
+                    native(path) { LocalScanPipe.run(it, id, counter, pipeline) { _, _, _ -> } }
                 }
                 val elapsed = micros(started)
                 val performance = checkNotNull(summary.performance)
@@ -252,11 +266,13 @@ class ScanPerformanceTest {
         return try { action(handle) } finally { NativeBridge.nativeReleaseScan(handle) }
     }
 
-    private fun complete(path: String, view: String, backend: String, policy: ImportPolicy, finalizer: FinalizePolicy): JSONObject {
+    private fun complete(path: String, view: String, backend: String, policy: ImportPolicy,
+        finalizer: FinalizePolicy, pipeline: ScanPipeline): JSONObject {
         clearIndex()
         val storage = BenchmarkStorage.context(context).noBackupFilesDir
         File(storage, BenchmarkStorage.IMPORT_VARIANT).writeText(policy.name)
         File(storage, BenchmarkStorage.FINALIZE_VARIANT).writeText(finalizer.wireName)
+        File(storage, BenchmarkStorage.PIPELINE_VARIANT).writeText(pipeline.wireName)
         context.startActivity(Intent(context, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
         test.waitForIdleSync()
         val connect = System.nanoTime()
@@ -282,6 +298,7 @@ class ScanPerformanceTest {
             }
             val observed = micros(started)
             val performance = result.getJSONObject("performance")
+            check(performance.getString("pipelineVariant") == pipeline.wireName)
             val servicePid = result.getInt("servicePid")
             val scannerPid = result.getInt("scannerPid")
             val query = JSONObject().put("sessionId", id).put("kind", "large-files").put("limit", 100).toString()

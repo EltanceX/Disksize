@@ -12,6 +12,7 @@ import android.util.Log
 import com.example.disksize.BuildConfig
 import com.example.disksize.index.IndexProtocol
 import com.example.disksize.scan.NativeBridge
+import com.example.disksize.scan.ScanPipeline
 import com.example.disksize.scan.ipc.IRootScanner
 import com.topjohnwu.superuser.ipc.RootService
 import org.json.JSONArray
@@ -78,9 +79,17 @@ class RootScannerService : RootService() {
                 .put("roots", roots).toString()
         }
 
-        override fun start(sessionId: String, rootPath: ByteArray, output: ParcelFileDescriptor, client: IBinder) {
+        override fun start(sessionId: String, rootPath: ByteArray, output: ParcelFileDescriptor, client: IBinder) =
+            startScan(sessionId, rootPath, output, client, null)
+
+        override fun startBenchmark(sessionId: String, rootPath: ByteArray, output: ParcelFileDescriptor,
+            client: IBinder, pipeline: Int) = startScan(sessionId, rootPath, output, client, pipeline)
+
+        private fun startScan(sessionId: String, rootPath: ByteArray, output: ParcelFileDescriptor,
+            client: IBinder, benchmarkPipeline: Int?) {
             try {
                 authorize()
+                val pipeline = benchmarkPipeline?.let(ScanPipeline::benchmark) ?: ScanPipeline.OPTIMIZED
                 UUID.fromString(sessionId)
                 require(rootPath.isNotEmpty() && rootPath.size <= 4096 && rootPath[0] == '/'.code.toByte() && !rootPath.contains(0))
                 val job = synchronized(lock) {
@@ -93,7 +102,7 @@ class RootScannerService : RootService() {
                         synchronized(lock) { job.handle = handle; if (job.cancelled) NativeBridge.nativeCancelScan(handle) }
                         val uuid = UUID.fromString(sessionId)
                         val bytes = ByteBuffer.allocate(16).putLong(uuid.mostSignificantBits).putLong(uuid.leastSignificantBits).array()
-                        NativeBridge.nativeStreamScan(handle, output.fd, bytes)
+                        NativeBridge.nativeStreamScan(handle, output.fd, bytes, pipeline.nativeCode)
                     } catch (error: Throwable) {
                         Log.w("DiskSize.Root", "Root scan/transport stopped", error)
                     } finally {
@@ -114,7 +123,7 @@ class RootScannerService : RootService() {
             synchronized(lock) { active?.takeIf { it.id == sessionId }?.let { stop(it) } }
         }
 
-        override fun benchmarkTraversal(rootPath: ByteArray): LongArray {
+        override fun benchmarkTraversal(rootPath: ByteArray, pipeline: Int, measureMetadata: Boolean): LongArray {
             authorize()
             check(BuildConfig.SCAN_BENCHMARK)
             require(rootPath.isNotEmpty() && rootPath.size <= 4096 &&
@@ -122,7 +131,7 @@ class RootScannerService : RootService() {
             return synchronized(lock) {
                 check(!destroyed && active == null)
                 val handle = NativeBridge.nativeCreateScan(rootPath)
-                try { NativeBridge.nativeBenchmarkTraversal(handle) }
+                try { NativeBridge.nativeBenchmarkTraversal(handle, pipeline, measureMetadata) }
                 finally { NativeBridge.nativeReleaseScan(handle) }
             }
         }

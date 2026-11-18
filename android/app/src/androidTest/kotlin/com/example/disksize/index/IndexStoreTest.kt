@@ -340,13 +340,6 @@ class IndexStoreTest {
         val end = frame(6, 3, byteArrayOf())
         store.begin(id, "/fixture", "ordinary", Process.myUid(), Process.myPid()).use { writer ->
             val good = identity + summary + measurement() + end
-            val result = IndexProtocol.read(ByteArrayInputStream(good), id, Process.myUid(), Process.myPid(), writer) { _, _, _ -> }
-            assertEquals("failed", result.state)
-            val producer = checkNotNull(result.performance).getJSONObject("producer")
-            assertEquals(2, producer.getLong("frames"))
-            assertEquals((identity.size + summary.size).toLong(), producer.getLong("wireBytes"))
-            assertEquals(3, producer.getLong("pipeWriteMicros"))
-            assertEquals(2, producer.getLong("pipePollMicros"))
             val variants = listOf(
                 good.copyOf(good.size - 1), good + byteArrayOf(1),
                 good.copyOf().also { it[5] = 3 }, // obsolete protocol
@@ -360,12 +353,26 @@ class IndexStoreTest {
                 identity + summary + measurement(poll = 4) + end,
                 identity + summary + measurement() + frame(9, 3, byteArrayOf()) + end,
                 identity + summary + frame(9, 2, ByteArray(39)) + end,
+                identity + frame(5, 1, payload { it.writeInt(7); repeat(6) { _ -> it.writeLong(0) } }),
+                identity + frame(5, 1, payload { it.writeInt(7); repeat(7) { _ -> it.writeLong(0) }; it.writeByte(0) }),
             )
-            for (bytes in variants) {
-                var rejected = false
-                try { IndexProtocol.read(ByteArrayInputStream(bytes), id, Process.myUid(), Process.myPid(), writer) { _, _, _ -> } }
-                catch (_: Exception) { rejected = true }
-                assertTrue("Malformed stream accepted", rejected)
+            for (reuse in listOf(false, true)) {
+                val fragmented = object : ByteArrayInputStream(good) {
+                    override fun read(b: ByteArray, off: Int, len: Int) = super.read(b, off, minOf(len, 7))
+                }
+                val result = IndexProtocol.read(fragmented, id, Process.myUid(), Process.myPid(), writer, reuse) { _, _, _ -> }
+                assertEquals("failed", result.state)
+                val producer = checkNotNull(result.performance).getJSONObject("producer")
+                assertEquals(2, producer.getLong("frames"))
+                assertEquals((identity.size + summary.size).toLong(), producer.getLong("wireBytes"))
+                assertEquals(3, producer.getLong("pipeWriteMicros"))
+                assertEquals(2, producer.getLong("pipePollMicros"))
+                for (bytes in variants) {
+                    var rejected = false
+                    try { IndexProtocol.read(ByteArrayInputStream(bytes), id, Process.myUid(), Process.myPid(), writer, reuse) { _, _, _ -> } }
+                    catch (_: Exception) { rejected = true }
+                    assertTrue("Malformed stream accepted (reuse=$reuse)", rejected)
+                }
             }
         }
     }

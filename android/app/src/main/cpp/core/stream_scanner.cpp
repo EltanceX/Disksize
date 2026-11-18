@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <limits>
 #include <memory>
+#include <string_view>
 #include <sys/vfs.h>
 #include <unistd.h>
 
@@ -39,8 +40,9 @@ struct Frame {
 };
 class Stream {
 public:
-    Stream(const ScanConfiguration& c, CancellationToken& token, const StreamCallbacks& cb)
-        : c_(c), token_(token), cb_(cb) {}
+    Stream(const ScanConfiguration& c, CancellationToken& token, const StreamCallbacks& cb,
+           StreamMetadata strategy, EntryMeasurements* measurements)
+        : c_(c), token_(token), cb_(cb), entries_(strategy, measurements) {}
     StreamResult run() {
         try { walk(); }
         catch (...) { consumer_failed_ = true; }
@@ -140,7 +142,7 @@ private:
                 if (cb_.on_directory) cb_.on_directory(frame.node);
                 stack_.pop_back(); continue;
             }
-            const std::string name(entry->d_name);
+            const std::string_view name(entry->d_name);
             if (name == "." || name == "..") continue;
             if (result_.node_count >= c_.max_nodes) {
                 frame.node.skipped = SkipReason::ResourceLimit;
@@ -149,11 +151,13 @@ private:
             ScanNode child; child.id = ++result_.node_count; child.parent_id = parent;
             child.name = name; child.depth = frame.node.depth + 1;
             struct stat st{};
-            if (fstatat(fd, name.c_str(), &st, AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT) || !metadata(child, st)) {
-                const int e = errno; deliver(child); issue(&child, classify(e), "fstatat", e);
+            const bool found = entries_.read(fd, child.name.c_str(), st, child.mount_id, fds_);
+            if (!found || !metadata(child, st)) {
+                const int e = found ? EOVERFLOW : errno;
+                child.mount_id = 0;
+                deliver(child); issue(&child, classify(e), "fstatat", e);
                 continue;
             }
-            child.mount_id = internal::mount_id_at(fd, name.c_str(), st, fds_);
             if (!child.mount_id) child.skipped = SkipReason::UnknownMount;
             else if (child.mount_id != r.root_mount_id || child.device != n.device) child.skipped = SkipReason::MountBoundary;
             if (child.kind == NodeKind::Directory && child.skipped == SkipReason::None) {
@@ -167,7 +171,7 @@ private:
                 observed_ += child.raw_size;
             }
             if (child.kind == NodeKind::Symlink && child.skipped == SkipReason::None) {
-                char target[4097]; const auto size = readlinkat(fd, name.c_str(), target, sizeof(target));
+                char target[4097]; const auto size = readlinkat(fd, child.name.c_str(), target, sizeof(target));
                 if (size >= 0 && size <= 4096) child.symlink_target.assign(target, size);
                 else { deliver(child); issue(&child, ScanErrorCode::Io, "readlinkat", size < 0 ? errno : EOVERFLOW); continue; }
             }
@@ -176,7 +180,7 @@ private:
             deliver(child); progress();
             if (child.kind != NodeKind::Directory || child.skipped != SkipReason::None) continue;
             // openat + identity + mount verification closes replacement/symlink races.
-            internal::Fd next(openat(fd, name.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC), fds_);
+            internal::Fd next(openat(fd, child.name.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC), fds_);
             struct stat opened{};
             if (!next || fstat(next.get(), &opened)) {
                 issue(&child, classify(errno), "open-directory", errno);
@@ -191,13 +195,15 @@ private:
         }
     }
     const ScanConfiguration& c_; CancellationToken& token_; const StreamCallbacks& cb_;
+    internal::EntryReader entries_;
     StreamResult result_; internal::FdMetrics fds_; std::vector<Frame> stack_;
     Clock::time_point start_ = Clock::now(), last_ = start_;
     std::uint64_t observed_ = 0;
     bool partial_ = false, failed_ = false, consumer_failed_ = false;
 };
 }
-StreamResult stream_directory(const ScanConfiguration& c, CancellationToken& token, const StreamCallbacks& cb) {
-    return Stream(c, token, cb).run();
+StreamResult stream_directory(const ScanConfiguration& c, CancellationToken& token, const StreamCallbacks& cb,
+                              StreamMetadata strategy, EntryMeasurements* measurements) {
+    return Stream(c, token, cb, strategy, measurements).run();
 }
 }

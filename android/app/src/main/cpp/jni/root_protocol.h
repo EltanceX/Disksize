@@ -37,9 +37,9 @@ struct PipeMeasurements {
 class Writer {
 public:
     Writer(int output, Bytes session, CancellationToken& cancellation, std::uint16_t version = 1,
-           PipeMeasurements* measurements = nullptr)
+           PipeMeasurements* measurements = nullptr, bool reuse_header = false)
         : fd_(dup(output)), session_(std::move(session)), cancellation_(cancellation), version_(version),
-          measurements_(measurements) {
+          measurements_(measurements), reuse_header_(reuse_header) {
         if (fd_ < 0 || session_.size() != 16) {
             if (fd_ >= 0) close(fd_);
             throw std::runtime_error("Invalid pipe/session");
@@ -56,7 +56,11 @@ public:
 
     void frame(std::uint16_t type, const Bytes& body, bool terminal = false) {
         if (body.size() > 65536) throw std::runtime_error("Frame too large");
-        Bytes header; u32(header, 0x44535a34); u32(header, (static_cast<std::uint32_t>(version_) << 16) | type);
+        Bytes temporary;
+        auto& header = reuse_header_ ? header_ : temporary;
+        header.clear();
+        if (reuse_header_) header.reserve(36);
+        u32(header, 0x44535a34); u32(header, (static_cast<std::uint32_t>(version_) << 16) | type);
         u32(header, body.size()); header.insert(header.end(), session_.begin(), session_.end());
         u64(header, sequence_++);
         const auto start = measurements_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -133,6 +137,8 @@ private:
     CancellationToken& cancellation_;
     std::uint16_t version_;
     PipeMeasurements* measurements_;
+    bool reuse_header_;
+    Bytes header_;
     std::uint64_t sequence_ = 0;
 };
 } // namespace disksize::wire

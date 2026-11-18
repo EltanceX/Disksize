@@ -97,6 +97,14 @@ struct ObserverRef {
     jobject reference;
     ~ObserverRef() { if (reference) env->DeleteGlobalRef(reference); }
 };
+disksize::StreamMetadata entry_strategy(jint pipeline) {
+    if (pipeline == 0) return disksize::StreamMetadata::Combined;
+#ifdef DISKSIZE_SCAN_BENCHMARK
+    if (pipeline == 1 || pipeline == 3) return disksize::StreamMetadata::Separate;
+    if (pipeline == 2) return disksize::StreamMetadata::Combined;
+#endif
+    throw std::invalid_argument("Invalid incremental scan pipeline");
+}
 }  // namespace
 
 extern "C" JNIEXPORT jlong JNICALL
@@ -189,7 +197,7 @@ Java_com_example_disksize_scan_NativeBridge_nativeRunScanToPipe(
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_example_disksize_scan_NativeBridge_nativeStreamScan(
-    JNIEnv* env, jobject, jlong handle, jint output, jbyteArray session_id) {
+    JNIEnv* env, jobject, jlong handle, jint output, jbyteArray session_id, jint pipeline) {
     try {
         const auto session = session_for(handle);
         if (session->running.exchange(true)) throw std::logic_error("Scan already running");
@@ -198,19 +206,21 @@ Java_com_example_disksize_scan_NativeBridge_nativeStreamScan(
         env->GetByteArrayRegion(session_id, 0, 16, reinterpret_cast<jbyte*>(id.data()));
         if (env->ExceptionCheck()) return;
         session->configuration.max_nodes = 2'000'000;
-        disksize::wire::IndexWriter writer(output, std::move(id), session->cancellation);
+        const auto strategy = entry_strategy(pipeline);
+        disksize::wire::IndexWriter writer(output, std::move(id), session->cancellation, pipeline == 0 || pipeline == 3);
         disksize::StreamCallbacks cb;
         cb.on_nodes = [&](std::span<const disksize::ScanNode> nodes) { for (const auto& n : nodes) writer.node(n); };
         cb.on_directory = [&](const disksize::ScanNode& n) { writer.directory(n); };
         cb.on_issue = [&](const disksize::ScanIssue& i) { writer.issue(i); };
         cb.on_progress = [&](const disksize::ScanProgress& p) { writer.progress(p); };
-        writer.finish(disksize::stream_directory(session->configuration, session->cancellation, cb));
+        writer.finish(disksize::stream_directory(session->configuration, session->cancellation, cb, strategy));
     } catch (...) { fail(env, "Incremental scan/pipe failed"); }
 }
 
 #ifdef DISKSIZE_SCAN_BENCHMARK
 extern "C" JNIEXPORT jlongArray JNICALL
-Java_com_example_disksize_scan_NativeBridge_nativeBenchmarkTraversal(JNIEnv* env, jobject, jlong handle) {
+Java_com_example_disksize_scan_NativeBridge_nativeBenchmarkTraversal(
+    JNIEnv* env, jobject, jlong handle, jint pipeline, jboolean measure_metadata) {
     try {
         const auto session = session_for(handle);
         if (session->running.exchange(true)) throw std::logic_error("Scan already running");
@@ -234,10 +244,12 @@ Java_com_example_disksize_scan_NativeBridge_nativeBenchmarkTraversal(JNIEnv* env
         };
         rusage before{}, after{};
         const auto sampled = getrusage(RUSAGE_THREAD, &before) == 0;
-        const auto r = disksize::stream_directory(session->configuration, session->cancellation, cb);
+        disksize::EntryMeasurements metadata;
+        const auto r = disksize::stream_directory(session->configuration, session->cancellation, cb,
+            entry_strategy(pipeline), measure_metadata ? &metadata : nullptr);
         const auto cpu = getrusage(RUSAGE_THREAD, &after) == 0 && sampled;
         auto micros = [](const timeval& t) { return static_cast<jlong>(t.tv_sec) * 1'000'000 + t.tv_usec; };
-        const std::array<jlong, 22> payload{
+        const std::array<jlong, 28> payload{
             getuid(), geteuid(), getpid(), static_cast<jlong>(r.scan.state), static_cast<jlong>(r.node_count),
             static_cast<jlong>(r.scan.summary.issue_count), static_cast<jlong>(r.scan.metrics.elapsed_microseconds),
             static_cast<jlong>(r.scan.metrics.peak_open_fds), static_cast<jlong>(r.scan.metrics.open_fds_at_finish),
@@ -246,6 +258,9 @@ Java_com_example_disksize_scan_NativeBridge_nativeBenchmarkTraversal(JNIEnv* env
             cpu ? micros(after.ru_utime) - micros(before.ru_utime) : -1,
             cpu ? micros(after.ru_stime) - micros(before.ru_stime) : -1,
             static_cast<jlong>(r.scan.metrics.peak_active_workers),
+            static_cast<jlong>(metadata.stat_calls), static_cast<jlong>(metadata.statx_calls),
+            static_cast<jlong>(metadata.fd_fallbacks), static_cast<jlong>(metadata.stat_micros),
+            static_cast<jlong>(metadata.statx_micros), static_cast<jlong>(metadata.fd_fallback_micros),
         };
         const auto result = env->NewLongArray(payload.size());
         if (result) env->SetLongArrayRegion(result, 0, payload.size(), payload.data());

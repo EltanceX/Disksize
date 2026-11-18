@@ -11,6 +11,7 @@ internal object BenchmarkStorage {
     const val JOURNAL = "scan-benchmark-v1.json"
     const val IMPORT_VARIANT = "scan-benchmark-variant"
     const val FINALIZE_VARIANT = "scan-benchmark-finalize"
+    const val PIPELINE_VARIANT = "scan-benchmark-pipeline"
 
     fun context(context: Context): Context {
         check(BuildConfig.SCAN_BENCHMARK)
@@ -28,5 +29,11 @@ internal object BenchmarkStorage {
         check(BuildConfig.SCAN_BENCHMARK)
         val file = File(storage.noBackupFilesDir, FINALIZE_VARIANT)
         return if (file.isFile) FinalizePolicy.benchmark(file.readText()) else FinalizePolicy.DEFAULT
+    }
+
+    fun pipeline(storage: Context): ScanPipeline {
+        check(BuildConfig.SCAN_BENCHMARK)
+        val file = File(storage.noBackupFilesDir, PIPELINE_VARIANT)
+        return if (file.isFile) ScanPipeline.benchmark(file.readText()) else ScanPipeline.OPTIMIZED
     }
 }

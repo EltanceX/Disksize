@@ -33,11 +33,26 @@ internal data class StreamSummary(val state: String, val nodes: Long, val issues
 internal object IndexProtocol {
     const val VERSION = 4
     private const val HEADER_BYTES = 36
+    private const val MAX_PAYLOAD = 65536
+
+    private class Payload(bytes: ByteArray) : ByteArrayInputStream(bytes) {
+        fun resetTo(length: Int) {
+            pos = 0
+            count = length
+        }
+    }
 
     fun read(input: InputStream, id: String, uid: Int, pid: Int, writer: IndexConsumer,
+        reuseBuffers: Boolean = true,
         progress: (Long, Long, Long) -> Unit): StreamSummary {
         val start = System.nanoTime()
         val expected = uuidBytes(id); val stream = DataInputStream(input)
+        val expectedUuid = ByteBuffer.wrap(expected)
+        val most = expectedUuid.long; val least = expectedUuid.long
+        val header = if (reuseBuffers) ByteBuffer.allocate(HEADER_BYTES) else null
+        val payload = if (reuseBuffers) ByteArray(MAX_PAYLOAD) else null
+        val window = payload?.let(::Payload)
+        val reader = window?.let(::DataInputStream)
         var sequence = 0L; var count = 0L; var issues = 0L; var identity = false
         var summary: StreamSummary? = null
         var producer: JSONObject? = null
@@ -47,15 +62,33 @@ internal object IndexProtocol {
         val nodeKinds = LongArray(kinds.size)
         while (true) {
             val beforeRead = System.nanoTime()
-            require(stream.readInt() == 0x44535a34 && stream.readUnsignedShort() == VERSION) { "Bad stream magic/version" }
-            val type = stream.readUnsignedShort(); val length = stream.readInt()
-            require(length in 0..65536) { "Frame too large" }
-            require(ByteArray(16).also { stream.readFully(it) }.contentEquals(expected)) { "Session mismatch" }
-            require(stream.readLong() == sequence++) { "Sequence mismatch" }
-            val payload = ByteArray(length).also { stream.readFully(it) }
-            val afterRead = System.nanoTime()
+            val type: Int
+            val length: Int
+            val body: DataInputStream
+            val afterRead: Long
+            if (header != null && payload != null && window != null && reader != null) {
+                stream.readFully(header.array())
+                header.rewind()
+                require(header.int == 0x44535a34 && header.short.toInt() == VERSION) { "Bad stream magic/version" }
+                type = header.short.toInt() and 0xffff; length = header.int
+                require(length in 0..MAX_PAYLOAD) { "Frame too large" }
+                require(header.long == most && header.long == least) { "Session mismatch" }
+                require(header.long == sequence++) { "Sequence mismatch" }
+                stream.readFully(payload, 0, length)
+                afterRead = System.nanoTime()
+                window.resetTo(length)
+                body = reader
+            } else {
+                require(stream.readInt() == 0x44535a34 && stream.readUnsignedShort() == VERSION) { "Bad stream magic/version" }
+                type = stream.readUnsignedShort(); length = stream.readInt()
+                require(length in 0..MAX_PAYLOAD) { "Frame too large" }
+                require(ByteArray(16).also { stream.readFully(it) }.contentEquals(expected)) { "Session mismatch" }
+                require(stream.readLong() == sequence++) { "Sequence mismatch" }
+                val bytes = ByteArray(length).also { stream.readFully(it) }
+                afterRead = System.nanoTime()
+                body = DataInputStream(ByteArrayInputStream(bytes))
+            }
             receiveNanos += afterRead - beforeRead
-            val body = DataInputStream(ByteArrayInputStream(payload))
             require(identity || type == 1)
             require(if (producer != null) type == 6 else if (summary != null) type == 9 else type != 9 && type != 6)
             when (type) {
@@ -80,7 +113,9 @@ internal object IndexProtocol {
                         val name = body.blob(255); val link = body.blob(4096)
                         require(nodeId == count + 1 && nodeId <= 2_000_000 && parent < nodeId)
                         require(if (nodeId == 1L) parent == 0L && name.isEmpty() else parent > 0 && name.isNotEmpty())
-                        require(name.none { it == 0.toByte() || it == 47.toByte() } && !name.contentEquals(byteArrayOf(46)) && !name.contentEquals(byteArrayOf(46, 46)))
+                        require(name.none { it == 0.toByte() || it == 47.toByte() } &&
+                            !(name.size == 1 && name[0] == 46.toByte()) &&
+                            !(name.size == 2 && name[0] == 46.toByte() && name[1] == 46.toByte()))
                         val kind = body.readInt(); val depth = body.readInt()
                         require(kind in kinds.indices && depth in 0..512)
                         val mode = body.readInt().toLong() and 0xffffffffL

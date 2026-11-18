@@ -31,8 +31,8 @@ internal object NativeBridge {
     external fun nativeCreateScan(rootPath: ByteArray): Long
     external fun nativeRunScan(handle: Long, observer: NativeScanObserver): String
     external fun nativeRunScanToPipe(handle: Long, outputFd: Int, sessionId: ByteArray)
-    external fun nativeStreamScan(handle: Long, outputFd: Int, sessionId: ByteArray)
-    external fun nativeBenchmarkTraversal(handle: Long): LongArray
+    external fun nativeStreamScan(handle: Long, outputFd: Int, sessionId: ByteArray, pipeline: Int)
+    external fun nativeBenchmarkTraversal(handle: Long, pipeline: Int, measureMetadata: Boolean): LongArray
     external fun nativeCancelScan(handle: Long)
     external fun nativeReleaseScan(handle: Long)
 }
