@@ -68,7 +68,7 @@ class CoordinatorService : Service() {
         if (BuildConfig.SCAN_BENCHMARK) {
             val storage = BenchmarkStorage.context(this)
             journal = SessionJournal(storage, BenchmarkStorage.JOURNAL)
-            index = IndexStore(storage, BenchmarkStorage.INDEX)
+            index = IndexStore(storage, BenchmarkStorage.INDEX, BenchmarkStorage.importPolicy(storage))
         } else {
             journal = SessionJournal(this)
             index = IndexStore(this)

@@ -2,7 +2,7 @@
 
 日期：2026-11-17。方案对应代码基线：`fa211a9`，应用元数据协议 v3、SQLite schema 4。
 
-本文保存后续性能工作的执行方案。当前已有[测量契约 v1](./scan-performance-measurement-contract.md)、[分层基准入口](../tools/scan-performance/README.md)和[优化构建基线](./scan-performance-baseline.md)；算法优化待实施。
+本文保存性能工作的执行方案。当前已有[测量契约 v1](./scan-performance-measurement-contract.md)、[分层基准入口](../tools/scan-performance/README.md)、[优化构建基线](./scan-performance-baseline.md)和[导入对照与改进](./scan-performance-import.md)。
 
 ## 1. 问题与判断
 
@@ -185,7 +185,7 @@ CPU 统一提供原始 CPU 秒与两种换算：
 - [x] **步骤 1：测量契约。** 固定指标名称、单位、嵌套关系、开始/结束边界及报告版本；补充 producer、consumer、最终处理与发布计时，默认限频。见[测量契约 v1](./scan-performance-measurement-contract.md)。
 - [x] **步骤 2：基准入口。** 基于 `stream_directory` 实现 A/B/C 和固定流回放，建立受控样本摘要；支持显式选择模式/后端与输出目录并记录实际 UID，样本仅在自有测试目录创建和清理。见[基准工具](../tools/scan-performance/README.md)。
 - [x] **步骤 3：优化构建基线。** 已核验双 ABI 的 `-O2` 和符号，完成 1 万冒烟、10 万普通/Root/FUSE/直达对照、百万普通组，以及独立资源采样。真实应用目录保留为独立 opt-in 项。见[基线报告](./scan-performance-baseline.md)。
-- [ ] **步骤 4：导入改进。** 依次 A/B 测试事务、编码/绑定分配、索引与记录布局。先做低风险调整，只有证据支持时引入 schema 迁移。
+- [x] **步骤 4：导入改进。** 固定流回放与真机完整链路均验证增大事务批量的收益；默认采用 4,096 个动作，保留逐进度提交。绑定与减索引尚无足够收益，记录布局和 schema 迁移暂缓。见[导入改进报告](./scan-performance-import.md)。
 - [ ] **步骤 5：最终处理改进。** 优化去重与目录汇总，核对 owner、容量、问题及完整性；计入索引维护和最终发布成本。
 - [ ] **步骤 6：native 与传输改进。** 根据重测热点合并 metadata 调用、降低编解码开销；仅在条件满足时增加有界并发实验。
 - [ ] **步骤 7：整体验收。** 同构建、同样本和缓存条件复测，补充当前 schema/protocol 的性能结果文档、设备限制与回退方式，再决定采用哪些优化。

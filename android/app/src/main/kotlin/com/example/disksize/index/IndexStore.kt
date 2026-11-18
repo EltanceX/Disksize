@@ -5,13 +5,14 @@ import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
 import android.database.sqlite.SQLiteStatement
 import android.os.CancellationSignal
+import com.example.disksize.BuildConfig
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.util.concurrent.CancellationException
 
 /** Owned by the ordinary scanner process. Import/finalize are confined to its single worker. */
-internal class IndexStore(context: Context, filename: String = "scan-index.db") : SQLiteOpenHelper(
+internal class IndexStore(context: Context, filename: String = "scan-index.db", private val policy: ImportPolicy = ImportPolicy.DEFAULT) : SQLiteOpenHelper(
     context, File(context.noBackupFilesDir, filename).absolutePath, null, SCHEMA_VERSION) {
     private val scanIdentity = JSONObject().put("rules", "native-v3:path-min-hardlink:blocks512:no-follow:one-mount:2000000:512")
         .put("user", android.os.Process.myUid() / 100000)
@@ -45,7 +46,7 @@ internal class IndexStore(context: Context, filename: String = "scan-index.db") 
             seconds INTEGER NOT NULL, nanos INTEGER NOT NULL, valid INTEGER NOT NULL, complete INTEGER NOT NULL,
             enumerated INTEGER NOT NULL DEFAULT 0, skip INTEGER NOT NULL, PRIMARY KEY(sid,id)) WITHOUT ROWID""")
         db.execSQL("CREATE UNIQUE INDEX node_path ON nodes(sid,path)")
-        db.execSQL("CREATE INDEX node_parent ON nodes(sid,parent,id)")
+        if (!BuildConfig.SCAN_BENCHMARK || policy.keepNodeParentIndex) db.execSQL("CREATE INDEX node_parent ON nodes(sid,parent,id)")
         db.execSQL("CREATE INDEX node_identity ON nodes(sid,device,inode,path)")
         db.execSQL("""CREATE TABLE aggregates(sid TEXT NOT NULL REFERENCES sessions(id), id INTEGER NOT NULL,
             parent INTEGER NOT NULL, depth INTEGER NOT NULL, kind INTEGER NOT NULL, name_key TEXT NOT NULL,
@@ -105,7 +106,7 @@ internal class IndexStore(context: Context, filename: String = "scan-index.db") 
             arrayOf<Any>(id, root, backend, now(), uid, pid, identity(root)))
         return Import(id)
     }
-    enum class FlushReason { LIMIT, PROGRESS, SUMMARY }
+    enum class FlushReason { LIMIT, PROGRESS, SUMMARY, INTERVAL }
 
     inner class Import internal constructor(val id: String) : AutoCloseable, IndexConsumer {
         private val db = writableDatabase
@@ -113,6 +114,9 @@ internal class IndexStore(context: Context, filename: String = "scan-index.db") 
             device,inode,mount,nlink,size,allocated,seconds,nanos,valid,complete,skip) VALUES(${List(23) { "?" }.joinToString(",")})""")
         private val insertAggregate = db.compileStatement("INSERT INTO aggregates VALUES(?,?,?,?,?,?,?,?,?,?,?,?)")
         private var actions = 0; private var transaction = false
+        private var openedAt = 0L
+        private var maxActiveNanos = 0L
+        private var deferredProgress = 0L
         private var discovered = 0L; private var issueCount = 0L
         override var writeNanos = 0L
             private set
@@ -133,13 +137,19 @@ internal class IndexStore(context: Context, filename: String = "scan-index.db") 
                 val first = paths.entries.iterator(); pathBytes -= first.next().value.first.size; first.remove()
             }
         }
-        private fun action() {
-            if (!transaction) { db.beginTransactionNonExclusive(); transaction = true }
+        private fun action(before: Long) {
+            if (!transaction) { db.beginTransactionNonExclusive(); transaction = true; openedAt = before }
             actions++
+        }
+        private fun finishAction(before: Long, volume: Boolean = false) {
+            val after = System.nanoTime()
+            if (volume) volumeNanos += after - before else writeNanos += after - before
+            if (actions >= policy.actionLimit) flush(FlushReason.LIMIT)
+            else if (policy.maxActiveNanos > 0L && after - openedAt >= policy.maxActiveNanos) flush(FlushReason.INTERVAL)
         }
         override fun node(n: IndexNode) {
             val before = System.nanoTime()
-            action()
+            action(before)
             val ancestor = if (n.parent == 0L) byteArrayOf() to -1 else {
                 val parent = paths[n.parent]
                 if (parent != null) {
@@ -154,54 +164,87 @@ internal class IndexStore(context: Context, filename: String = "scan-index.db") 
                 }
             }
             require(n.depth == ancestor.second + 1)
-            val path = if (ancestor.first.isEmpty()) n.name else ancestor.first + byteArrayOf(47) + n.name
+            val prefix = ancestor.first
+            val typed = policy.typedBindings
+            val path = when {
+                prefix.isEmpty() -> n.name
+                !typed -> prefix + byteArrayOf(47) + n.name
+                else -> ByteArray(prefix.size + 1 + n.name.size).also {
+                    prefix.copyInto(it)
+                    it[prefix.size] = 47
+                    n.name.copyInto(it, prefix.size + 1)
+                }
+            }
             require(path.size <= 512 * 256)
-            insert.bindAll(listOf(id, n.id, n.parent, n.depth, n.name, n.name.hex(), path, n.link, n.kind, n.mode, n.uid, n.gid,
-                n.device, n.inode, n.mount, n.links, n.size, n.allocated, n.seconds, n.nanos, n.valid, n.complete, n.skip))
-            insert.executeInsert()
             val logical = if (n.valid && n.skip == 0 && n.kind == 2) n.size else 0L
             val allocated = if (n.valid && n.skip == 0) n.allocated else 0L
-            insertAggregate.bindAll(listOf(id, n.id, n.parent, n.depth, n.kind, n.name.hex(), n.id, logical, allocated,
-                logical, allocated, n.complete))
-            insertAggregate.executeInsert()
+            val nameKey = n.name.hex()
+            if (typed) {
+                val complete = if (n.complete) 1L else 0L
+                insert.apply {
+                    bindString(1, id); bindLong(2, n.id); bindLong(3, n.parent); bindLong(4, n.depth.toLong())
+                    bindBlob(5, n.name); bindString(6, nameKey); bindBlob(7, path); bindBlob(8, n.link)
+                    bindLong(9, n.kind.toLong()); bindLong(10, n.mode); bindLong(11, n.uid); bindLong(12, n.gid)
+                    bindBlob(13, n.device); bindBlob(14, n.inode); bindLong(15, n.mount); bindLong(16, n.links)
+                    bindLong(17, n.size); bindLong(18, n.allocated); bindLong(19, n.seconds); bindLong(20, n.nanos)
+                    bindLong(21, if (n.valid) 1L else 0L); bindLong(22, complete); bindLong(23, n.skip.toLong())
+                }
+                insert.executeInsert()
+                insertAggregate.apply {
+                    bindString(1, id); bindLong(2, n.id); bindLong(3, n.parent); bindLong(4, n.depth.toLong())
+                    bindLong(5, n.kind.toLong()); bindString(6, nameKey); bindLong(7, n.id)
+                    bindLong(8, logical); bindLong(9, allocated); bindLong(10, logical); bindLong(11, allocated)
+                    bindLong(12, complete)
+                }
+                insertAggregate.executeInsert()
+            } else {
+                insert.bindAll(listOf(id, n.id, n.parent, n.depth, n.name, nameKey, path, n.link, n.kind, n.mode, n.uid, n.gid,
+                    n.device, n.inode, n.mount, n.links, n.size, n.allocated, n.seconds, n.nanos, n.valid, n.complete, n.skip))
+                insert.executeInsert()
+                insertAggregate.bindAll(listOf(id, n.id, n.parent, n.depth, n.kind, n.name.hex(), n.id, logical, allocated,
+                    logical, allocated, n.complete))
+                insertAggregate.executeInsert()
+            }
             if (n.kind == 1) cached(n.id, path, n.depth)
             discovered++
-            writeNanos += System.nanoTime() - before
-            if (actions >= 256) flush(FlushReason.LIMIT)
+            finishAction(before)
         }
         override fun directory(node: Long, enumerated: Boolean, complete: Boolean, skip: Int) {
             val before = System.nanoTime()
-            action()
+            action(before)
             db.execSQL("UPDATE nodes SET enumerated=?,complete=?,skip=? WHERE sid=? AND id=? AND kind=1",
                 arrayOf<Any>(if (enumerated) 1 else 0, if (complete) 1 else 0, skip, id, node))
             db.execSQL("UPDATE aggregates SET complete=? WHERE sid=? AND id=?", arrayOf<Any>(if (complete) 1 else 0, id, node))
             if (skip != 0) db.execSQL("UPDATE aggregates SET own_logical=0,own_allocated=0,logical=0,allocated=0 WHERE sid=? AND id=?",
                 arrayOf<Any>(id, node))
-            writeNanos += System.nanoTime() - before
-            if (actions >= 256) flush(FlushReason.LIMIT)
+            finishAction(before)
         }
         override fun issue(node: Long, code: Int, errno: Int, op: String) {
             val before = System.nanoTime()
-            action(); issueCount++
+            action(before); issueCount++
             db.execSQL("INSERT INTO issues(sid,node,code,errno,operation) VALUES(?,?,?,?,?)", arrayOf<Any>(id, node, code, errno, op))
             db.execSQL("UPDATE nodes SET complete=0 WHERE sid=? AND id=?", arrayOf<Any>(id, node))
             db.execSQL("UPDATE aggregates SET complete=0 WHERE sid=? AND id=?", arrayOf<Any>(id, node))
-            writeNanos += System.nanoTime() - before
-            if (actions >= 256) flush(FlushReason.LIMIT)
+            finishAction(before)
         }
         override fun volume(total: Long, free: Long, available: Long, captured: Long) {
             val before = System.nanoTime()
-            action()
+            action(before)
             val value = JSONObject().put("totalBytes", total).put("freeBytes", free)
                 .put("availableBytes", available).put("capturedAtMillis", captured)
             db.execSQL("UPDATE sessions SET volume=? WHERE id=?", arrayOf(value.toString(), id))
-            volumeNanos += System.nanoTime() - before
+            finishAction(before, volume = true)
         }
         fun flush() = flush(FlushReason.SUMMARY)
 
         override fun flush(reason: FlushReason) {
             if (!transaction) return
             val before = System.nanoTime()
+            val activeNanos = before - openedAt
+            if (reason == FlushReason.PROGRESS && policy.maxActiveNanos > 0L && activeNanos < policy.maxActiveNanos) {
+                deferredProgress++
+                return
+            }
             val batch = actions
             try {
                 db.execSQL("UPDATE sessions SET revision=revision+1,nodes=?,issues=? WHERE id=?", arrayOf<Any>(discovered, issueCount, id))
@@ -215,12 +258,15 @@ internal class IndexStore(context: Context, filename: String = "scan-index.db") 
             commits[reason.ordinal]++
             committedActions += batch
             maxActions = maxOf(maxActions, batch)
+            maxActiveNanos = maxOf(maxActiveNanos, activeNanos)
         }
         override fun measurements() = JSONObject().put("importMicros", measuredImportNanos / 1000)
             .put("importCommitMicros", commitNanos / 1000)
             .put("transactions", commits.sum()).put("committedActions", committedActions).put("maxActionsPerTransaction", maxActions)
             .put("limitCommits", commits[FlushReason.LIMIT.ordinal]).put("progressCommits", commits[FlushReason.PROGRESS.ordinal])
             .put("summaryCommits", commits[FlushReason.SUMMARY.ordinal])
+            .put("intervalCommits", commits[FlushReason.INTERVAL.ordinal]).put("deferredProgressFlushes", deferredProgress)
+            .put("maxActiveTransactionMicros", maxActiveNanos / 1000).put("importVariant", policy.name)
             .put("parentCacheHits", parentCacheHits).put("parentCacheMisses", parentCacheMisses)
         override fun close() {
             if (transaction) { db.endTransaction(); transaction = false }

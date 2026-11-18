@@ -70,8 +70,9 @@ class IndexDeviceTest {
         assertTrue(producer.getLong("elapsedMicros") >= maxOf(writes, result.getLong("scanMicros")))
         val transactions = consumer.getLong("transactions")
         assertTrue(transactions > 0)
-        assertEquals(transactions, listOf("limitCommits", "progressCommits", "summaryCommits").sumOf { consumer.getLong(it) })
-        assertTrue(consumer.getInt("maxActionsPerTransaction") in 1..256)
+        assertEquals(transactions, listOf("limitCommits", "progressCommits", "summaryCommits", "intervalCommits").sumOf { consumer.getLong(it) })
+        assertEquals(ImportPolicy.DEFAULT.name, consumer.getString("importVariant"))
+        assertTrue(consumer.getInt("maxActionsPerTransaction") in 1..ImportPolicy.DEFAULT.actionLimit)
         assertEquals(result.getLong("nodeCount") - 1, consumer.getLong("parentCacheHits") + consumer.getLong("parentCacheMisses"))
         val importMicros = consumer.getLong("importMicros")
         assertTrue(consumer.getLong("importCommitMicros") in 0..importMicros)
@@ -232,8 +233,10 @@ class IndexDeviceTest {
             var id = start(remote)
             val runningDeadline = SystemClock.elapsedRealtime() + 5000
             while (JSONObject(remote.scanSnapshot).getString("state") != "running" && SystemClock.elapsedRealtime() < runningDeadline) SystemClock.sleep(10)
+            val cancelStart = System.nanoTime()
             remote.cancelScan(id)
             val cancelled = terminal(remote, id)
+            Log.i("DiskSize.ImportCheck", "cancelToTerminalMicros=${(System.nanoTime() - cancelStart) / 1000}")
             assertEquals("cancelled", cancelled.getString("state")); assertTrue(cancelled.getBoolean("provisional"))
             assertEquals("cancelled", JSONObject(remote.queryIndex(JSONObject().put("kind", "session").put("sessionId", id).toString())).getString("state"))
             id = start(remote)
@@ -241,6 +244,16 @@ class IndexDeviceTest {
             while (SystemClock.elapsedRealtime() < deadline) {
                 val value = JSONObject(remote.scanSnapshot)
                 if (value.getString("sessionId") == id && value.getLong("nodeCount") > 256 && value.getBoolean("active")) {
+                    val startQuery = System.nanoTime()
+                    val page = JSONObject(remote.queryIndex(JSONObject().put("sessionId", id).put("kind", "children")
+                        .put("parentId", 1).toString()))
+                    val queryMicros = (System.nanoTime() - startQuery) / 1000
+                    assertTrue(page.getString("status") in setOf("ok", "stale-cursor"))
+                    if (page.getString("status") == "ok") {
+                        assertTrue(page.getBoolean("provisional"))
+                        assertTrue(page.getLong("nodeCount") > 0)
+                    }
+                    Log.i("DiskSize.ImportCheck", "activeQueryMicros=$queryMicros")
                     Process.sendSignal(value.getInt("servicePid"), 9); killed = true; break
                 }
                 SystemClock.sleep(10)

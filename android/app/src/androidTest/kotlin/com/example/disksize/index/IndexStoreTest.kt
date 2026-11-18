@@ -1,18 +1,23 @@
 package com.example.disksize.index
 
 import android.database.sqlite.SQLiteDatabase
+import android.os.Bundle
 import android.os.Process
 import android.system.Os
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
+import com.example.disksize.BuildConfig
 import com.example.disksize.scan.NativeBridge
 import org.junit.Assert.*
+import org.junit.Assume.assumeTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import java.io.File
 import java.io.RandomAccessFile
 import java.nio.ByteBuffer
 import java.util.UUID
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import org.json.JSONObject
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
@@ -21,12 +26,108 @@ import java.io.DataOutputStream
 @RunWith(AndroidJUnit4::class)
 class IndexStoreTest {
     private val context get() = InstrumentationRegistry.getInstrumentation().targetContext
-    private fun withStore(block: (IndexStore) -> Unit) {
+    private fun withStore(policy: ImportPolicy = ImportPolicy.DEFAULT, block: (IndexStore) -> Unit) {
         val name = "phase5-test-${UUID.randomUUID()}.db"
-        val store = IndexStore(context, name)
+        val store = IndexStore(context, name, policy)
         try { block(store) } finally {
             store.close(); SQLiteDatabase.deleteDatabase(File(context.noBackupFilesDir, name))
         }
+    }
+    @Test fun importKeepsPendingRowsPrivateAndAdvancesCursorOnlyOnCommit() = withStore { store ->
+        val older = UUID.randomUUID().toString()
+        val current = UUID.randomUUID().toString()
+        val uid = Process.myUid()
+        val pid = Process.myPid()
+        val limit = ImportPolicy.DEFAULT.actionLimit.toLong()
+        store.begin(older, "/fixture", "ordinary", uid, pid).use {
+            it.node(node(1, 0, "", 0, 1))
+            it.node(node(2, 1, "old", 8, 2))
+            it.directory(1, true, true, 0)
+            it.flush()
+        }
+        store.finalize(older, StreamSummary("completed", 2, 0, 0, 2, 0, 1, 1)) { false }
+        val queries = IndexQueries(store)
+        val reader = Executors.newSingleThreadExecutor()
+        fun query(kind: String, id: String, cursor: String = ""): JSONObject {
+            val request = JSONObject().put("kind", kind).put("sessionId", id)
+                .put("parentId", 1).put("sort", "name").put("limit", 2).put("cursor", cursor)
+            return reader.submit<JSONObject> { JSONObject(queries.query(request.toString())) }.get(5, TimeUnit.SECONDS)
+        }
+        try {
+            store.begin(current, "/fixture", "ordinary", uid, pid).use { importer ->
+                importer.node(node(1, 0, "", 0, 1))
+                for (i in 2L..limit) importer.node(node(i, 1, "new-$i", 8, i))
+                val page = query("children", current)
+                assertEquals("ok", page.getString("status"))
+                val token = page.getString("nextCursor")
+                assertEquals(limit, page.getLong("nodeCount"))
+                assertTrue(page.getBoolean("provisional"))
+                importer.node(node(limit + 1, 1, "pending", 8, limit + 1))
+                assertEquals("ok", query("children", current, token).getString("status"))
+                assertEquals(limit, query("session", current).getLong("nodeCount"))
+                assertEquals("6f6c64", query("children", older).getJSONArray("entries").getJSONObject(0).getString("nameHex"))
+                importer.flush(IndexStore.FlushReason.PROGRESS)
+                assertEquals("stale-cursor", query("children", current, token).getString("status"))
+                assertEquals(limit + 1, query("session", current).getLong("nodeCount"))
+                importer.node(node(limit + 2, 1, "rollback", 8, limit + 2))
+            }
+            store.recover()
+            val recovered = query("session", current)
+            assertEquals("interrupted", recovered.getString("state"))
+            assertEquals(limit + 1, recovered.getLong("nodeCount"))
+            val snapshots = query("snapshot-list", older).getJSONArray("snapshots")
+            assertEquals(1, snapshots.length())
+            assertEquals(older, snapshots.getJSONObject(0).getString("id"))
+        } finally { reader.shutdownNow() }
+    }
+
+    @Test fun reportImportQueryPlans() {
+        val test = InstrumentationRegistry.getInstrumentation()
+        assumeTrue(BuildConfig.SCAN_BENCHMARK && InstrumentationRegistry.getArguments().getString("scanImportExplain") == "true")
+        val plans = JSONObject()
+        for (variant in listOf("1024-eager-typed", "1024-eager-typed-lean")) {
+            withStore(ImportPolicy.benchmark(variant)) { store ->
+                val id = UUID.randomUUID().toString()
+                store.begin(id, "/fixture", "ordinary", Process.myUid(), Process.myPid()).use { writer ->
+                    writer.node(node(1, 0, "", 0, 1))
+                    repeat(32) { i -> writer.node(node(i + 2L, 1, "f$i", 8, i + 2L)) }
+                    writer.flush()
+                }
+                val db = store.readableDatabase
+                val record = JSONObject()
+                for (table in listOf("nodes", "aggregates")) {
+                    db.rawQuery("PRAGMA index_list($table)", null).use { c ->
+                        val indexes = org.json.JSONArray()
+                        while (c.moveToNext()) indexes.put(c.getString(1))
+                        record.put(table, indexes)
+                    }
+                }
+                val queries = linkedMapOf(
+                    "snapshotPaths" to "SELECT n.id,a.logical FROM nodes n JOIN aggregates a ON a.sid=n.sid AND a.id=n.id WHERE n.sid=? ORDER BY n.path LIMIT 16",
+                    "dedup" to "SELECT device,inode,MIN(path) FROM nodes WHERE sid=? AND valid=1 AND skip=0 AND kind<>1 GROUP BY device,inode ORDER BY device,inode LIMIT 1024",
+                    "parentSum" to "SELECT SUM(logical),SUM(allocated) FROM aggregates WHERE sid=? AND parent=1",
+                    "parentIncomplete" to "SELECT 1 FROM aggregates WHERE sid=? AND parent=1 AND complete=0",
+                    "depth" to "SELECT id FROM aggregates WHERE sid=? AND depth=1 AND id>0 ORDER BY id LIMIT 1024",
+                    "nodeDetail" to "SELECT * FROM nodes WHERE sid=? AND id=1",
+                )
+                for (sort in listOf("logical", "allocated", "name_key")) {
+                    val order = if (sort == "name_key") "ASC" else "DESC"
+                    queries["children-$sort"] = "SELECT a.id,n.name FROM aggregates a JOIN nodes n ON n.sid=a.sid AND n.id=a.id " +
+                        "WHERE a.sid=? AND a.parent=1 ORDER BY a.$sort $order,a.id $order LIMIT 101"
+                    if (sort != "name_key") queries["large-$sort"] = "SELECT a.id,n.name FROM aggregates a JOIN nodes n ON n.sid=a.sid AND n.id=a.id " +
+                        "WHERE a.sid=? AND a.kind=2 ORDER BY a.$sort DESC,a.id DESC LIMIT 101"
+                }
+                for ((key, sql) in queries) {
+                    db.rawQuery("EXPLAIN QUERY PLAN $sql", arrayOf(id)).use { c ->
+                        val entries = org.json.JSONArray()
+                        while (c.moveToNext()) entries.put(c.getString(3))
+                        record.put(key, entries)
+                    }
+                }
+                plans.put(variant, record)
+            }
+        }
+        test.sendStatus(2, Bundle().apply { putString("importPlans", plans.toString()) })
     }
     @Test fun nativeImportMatchesIndependentStatAndHardlinkOwner() = withStore { store ->
         val root = File(context.filesDir, "phase5-test-${UUID.randomUUID()}")

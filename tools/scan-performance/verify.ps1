@@ -5,6 +5,7 @@ param(
     [ValidateSet('ordinary','root')][string]$Backend = 'ordinary',
     [ValidateSet('internal','fuse','emulated-direct')][string]$View = 'internal',
     [ValidateSet(10000,100000,1000000)][int]$Size = 10000,
+    [ValidatePattern('^(256|1024|4096)-(eager|paced)-(list|typed)(-lean)?$')][string[]]$ImportVariant,
     [ValidateRange(1,30)][int]$Repeats = 5,
     [ValidateRange(0,5)][int]$Warmups = 1,
     [string]$Output,
@@ -132,7 +133,7 @@ function Run-Group([hashtable]$Group) {
     $common = @{ fixture = $id; location = $Group.location; size = $Group.size }
     $cleanup.Add($common)
     $name = $Group.name
-    if ($Group.location -ne 'live' -and @($Group.cases | Where-Object { $_ -notmatch '/Replay$' }).Count -gt 0) {
+    if ($Group.location -ne 'live' -and @($Group.cases | Where-Object { $_ -notmatch '/Replay(/|$)' }).Count -gt 0) {
         Write-Host "Generating $($Group.size) entries for $name"
         $setup = Invoke-Case ($common + @{ action = 'setup' }) "$name-setup"
         Write-Json $setup "$name-setup.json"
@@ -141,12 +142,15 @@ function Run-Group([hashtable]$Group) {
         $warm = $round -lt $Group.warmups
         for ($offset = 0; $offset -lt $Group.cases.Count; $offset++) {
             $case = $Group.cases[($offset + $round) % $Group.cases.Count]
-            $source, $surface, $modeName = $case -split '/'
+            $source, $surface, $modeName, $variant = $case -split '/'
             $namePart = "$name-r$round-$source-$surface-$modeName"
+            if ($variant) { $namePart += "-$variant" }
             Write-Host "Running $namePart (warmup=$warm)"
             $battery = Read-Battery
-            $value = Invoke-Case ($common + @{ mode = $modeName; backend = $source; view = $surface
-                allowLiveAppData = ([string][bool]$LiveAppData).ToLowerInvariant() }) $namePart
+            $settings = @{ mode = $modeName; backend = $source; view = $surface
+                allowLiveAppData = ([string][bool]$LiveAppData).ToLowerInvariant() }
+            if ($variant) { $settings.importVariant = $variant }
+            $value = Invoke-Case ($common + $settings) $namePart
             $value.group = $name
             $value.round = $round
             $value.warmup = $warm
@@ -167,13 +171,14 @@ function Run-Group([hashtable]$Group) {
 }
 function Write-Summary {
     $summary = @($records | Where-Object { -not $_.warmup } |
-        Group-Object group, mode, backend, view | ForEach-Object {
+        Group-Object group, mode, backend, view, importVariant | ForEach-Object {
             $samples = @($_.Group.elapsedMicros | Sort-Object)
             $n = $samples.Count
             $first = $_.Group[0]
             $median = if ($n % 2 -eq 0) { ($samples[$n / 2 - 1] + $samples[$n / 2]) / 2 } else { $samples[[int][Math]::Floor($n / 2)] }
             [ordered]@{ group = $first.group; mode = $first.mode; backend = $first.backend; view = $first.view
-                nodes = $first.nodes; samples = $n; minMicros = $samples[0]; medianMicros = $median; maxMicros = $samples[-1] }
+                importVariant = $first.importVariant; nodes = $first.nodes; samples = $n; minMicros = $samples[0]
+                medianMicros = $median; maxMicros = $samples[-1] }
         })
     Write-Json $summary 'summary.json'
 }
@@ -188,6 +193,12 @@ try {
     if ($Suite -eq 'Custom' -and $View -eq 'emulated-direct' -and $Backend -ne 'root') { throw 'emulated-direct requires root.' }
     if ($Suite -eq 'Custom' -and 'Replay' -in $Mode -and ($View -ne 'internal' -or $Backend -ne 'ordinary')) {
         throw 'Replay runs with ordinary UID and does not traverse a filesystem.'
+    }
+    if ($ImportVariant -and ($Suite -ne 'Custom' -or $LiveAppData -or 'A' -in $Mode -or 'B' -in $Mode)) {
+        throw 'Use -ImportVariant with -Suite Custom and mode C or Replay on a fixed fixture.'
+    }
+    if ($ImportVariant -and @($ImportVariant | Sort-Object -Unique).Count -ne $ImportVariant.Count) {
+        throw 'Use each import variant once per run.'
     }
     if (-not $SkipBuild) {
         & (Join-Path $repo 'android/gradlew.bat') -p (Join-Path $repo 'android') :app:assembleProfile :app:assembleProfileAndroidTest `
@@ -226,11 +237,14 @@ try {
     Install-App $testApk
     if ($SampleResources) {
         if ((Invoke-Adb @('shell',"su -c 'id -u'")).Trim() -ne '0') { throw 'Sampling requires ADB shell root.' }
+        $user = (Invoke-Adb @('shell','am','get-current-user')).Trim()
+        if ($user -notmatch '^\d+$') { throw 'Cannot identify the Android user for resource sampling.' }
+        $index = "/data/user_de/$user/$package/no_backup/scan-benchmark-v1.db"
         Invoke-Adb @('push', (Join-Path $PSScriptRoot 'sample.sh'), $sampleHelper) | Out-Null
         Invoke-Adb @('shell','touch',$sampleMarker) | Out-Null
-        $resources = Start-Job -ArgumentList $adb,$Serial,$sampleHelper,$sampleMarker,(Join-Path $results 'resources.tsv') -ScriptBlock {
-            param($Adb,$Serial,$Helper,$Marker,$Log)
-            & $Adb -s $Serial shell "su -c 'sh $Helper $Marker'" > $Log
+        $resources = Start-Job -ArgumentList $adb,$Serial,$sampleHelper,$sampleMarker,$index,(Join-Path $results 'resources.tsv') -ScriptBlock {
+            param($Adb,$Serial,$Helper,$Marker,$Index,$Log)
+            & $Adb -s $Serial shell "su -c 'sh $Helper $Marker $Index'" > $Log
         }
     }
     if ($LiveAppData) {
@@ -240,7 +254,11 @@ try {
         $View = $View.ToLowerInvariant()
         $Mode = @($Mode | ForEach-Object { if ($_ -eq 'Replay') { 'Replay' } else { $_.ToUpperInvariant() } })
         $location = if ($View -eq 'internal') { 'internal' } else { 'external' }
-        Run-Group (New-Group 'custom' $Size $location @($Mode | ForEach-Object { "$Backend/$View/$_" }) $Repeats $Warmups)
+        $cases = foreach ($modeName in $Mode) {
+            if ($ImportVariant) { foreach ($variant in $ImportVariant) { "$Backend/$View/$modeName/$($variant.ToLowerInvariant())" } }
+            else { "$Backend/$View/$modeName" }
+        }
+        Run-Group (New-Group 'custom' $Size $location $cases $Repeats $Warmups)
     } else {
         $ordinary = @('ordinary/internal/A','ordinary/internal/B','ordinary/internal/C','ordinary/internal/Replay')
         Run-Group (New-Group 'smoke-10000' 10000 'internal' $ordinary 1 0)

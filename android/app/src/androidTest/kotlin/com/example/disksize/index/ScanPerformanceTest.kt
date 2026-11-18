@@ -8,6 +8,7 @@ import android.os.Process
 import android.os.SystemClock
 import android.system.Os
 import android.util.AtomicFile
+import android.util.Base64
 import androidx.test.platform.app.InstrumentationRegistry
 import com.example.disksize.BuildConfig
 import com.example.disksize.MainActivity
@@ -105,6 +106,7 @@ class ScanPerformanceTest {
         }
         require(action == "scan")
         val mode = requireNotNull(args.getString("mode")).also { require(it in setOf("A", "B", "C", "Replay")) }
+        val policy = args.getString("importVariant")?.let(ImportPolicy::benchmark) ?: ImportPolicy.DEFAULT
         val backend = requireNotNull(args.getString("backend")).also { require(it in setOf("ordinary", "root")) }
         val view = requireNotNull(args.getString("view")).also {
             require(it in setOf("internal", "fuse", "emulated-direct", "live-app-data"))
@@ -122,9 +124,13 @@ class ScanPerformanceTest {
         }
         val windowStart = SystemClock.elapsedRealtimeNanos()
         val result = when (mode) {
-            "C" -> complete(checkNotNull(target), view, backend)
-            "Replay" -> replay()
+            "C" -> complete(checkNotNull(target), view, backend, policy)
+            "Replay" -> replay(policy)
             else -> stream(checkNotNull(target), backend, mode)
+        }
+        if (mode == "C" || mode == "Replay") {
+            check(result.getJSONObject("performance").getJSONObject("consumer").getString("importVariant") == policy.name)
+            result.put("importVariant", policy.name)
         }
         val fs = result.optLong("filesystemMagic", -1)
         if (mode != "Replay") {
@@ -170,6 +176,7 @@ class ScanPerformanceTest {
         val journal = File(storage.noBackupFilesDir, BenchmarkStorage.JOURNAL)
         AtomicFile(journal).delete()
         File(journal.path + ".bak").let { check(!it.exists() || it.delete()) }
+        File(storage.noBackupFilesDir, BenchmarkStorage.IMPORT_VARIANT).let { check(!it.exists() || it.delete()) }
     }
 
     private class Counter : IndexConsumer {
@@ -237,9 +244,10 @@ class ScanPerformanceTest {
         return try { action(handle) } finally { NativeBridge.nativeReleaseScan(handle) }
     }
 
-    private fun complete(path: String, view: String, backend: String): JSONObject {
+    private fun complete(path: String, view: String, backend: String, policy: ImportPolicy): JSONObject {
         clearIndex()
         val storage = BenchmarkStorage.context(context).noBackupFilesDir
+        File(storage, BenchmarkStorage.IMPORT_VARIANT).writeText(policy.name)
         context.startActivity(Intent(context, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
         test.waitForIdleSync()
         val connect = System.nanoTime()
@@ -272,6 +280,24 @@ class ScanPerformanceTest {
             val first = JSONObject(remote.queryIndex(query))
             val queryMicros = micros(queryStart)
             check(first.getString("status") == "ok" && !first.getBoolean("provisional"))
+            val tailMicros = if (view != "live-app-data") {
+                // Empty files tie on logical size, so a lower sentinel on the sort tuple
+                // lets the real backward keyset query return the last page directly.
+                val cursor = JSONObject().put("version", 2).put("query", "$id|large-files|0|0|logical|100")
+                    .put("revision", first.getLong("revision")).put("direction", "before")
+                    .put("key", "0").put("lastId", 1)
+                val tailQuery = JSONObject(query).put("cursor", Base64.encodeToString(cursor.toString().toByteArray(),
+                    Base64.URL_SAFE or Base64.NO_WRAP)).toString()
+                val tailStart = System.nanoTime()
+                val last = JSONObject(remote.queryIndex(tailQuery))
+                val time = micros(tailStart)
+                check(last.getString("status") == "ok")
+                val headRows = first.getJSONArray("entries")
+                val tailRows = last.getJSONArray("entries")
+                check(headRows.length() == 100 && tailRows.length() == 100 &&
+                    headRows.getJSONObject(99).getLong("id") > tailRows.getJSONObject(0).getLong("id"))
+                time
+            } else null
             return JSONObject().put("state", result.getString("state")).put("complete", result.getBoolean("complete"))
                 .put("nodes", result.getLong("nodeCount")).put("issues", result.getLong("issueCount"))
                 .put("logicalBytes", result.getLong("logicalBytes")).put("allocatedBytes", result.getLong("allocatedBytes"))
@@ -282,7 +308,7 @@ class ScanPerformanceTest {
                 .put("peakOpenFds", result.getLong("peakOpenFds")).put("openFdsAtFinish", result.getLong("openFdsAtFinish"))
                 .put("nodesByKind", performance.getJSONObject("producer").getJSONObject("nodesByKind"))
                 .put("performance", performance).put("elapsedMicros", performance.getJSONObject("publication").getLong("prepareToPublishMicros"))
-                .put("clientObservedMicros", observed).put("firstPageMicros", queryMicros)
+                .put("clientObservedMicros", observed).put("firstPageMicros", queryMicros).put("lastPageMicros", tailMicros)
                 .put("coordinatorBindMicros", connectMicros).put("rootReadyMicros", rootMicros)
                 .put("databaseBytes", File(storage, BenchmarkStorage.INDEX).length())
                 .put("walBytes", File(storage, BenchmarkStorage.INDEX + "-wal").length())
@@ -315,7 +341,7 @@ class ScanPerformanceTest {
     private fun namespace(pid: Int = Process.myPid()): String? =
         runCatching { Os.readlink("/proc/$pid/ns/mnt") }.getOrNull()
 
-    private fun replay(): JSONObject {
+    private fun replay(policy: ImportPolicy): JSONObject {
         clearIndex()
         val storage = BenchmarkStorage.context(context)
         val id = UUID.randomUUID().toString()
@@ -326,7 +352,7 @@ class ScanPerformanceTest {
         val empty = byteArrayOf()
         val cpu = Process.getElapsedCpuTime()
         val started = System.nanoTime()
-        return IndexStore(storage, BenchmarkStorage.INDEX).use { store ->
+        return IndexStore(storage, BenchmarkStorage.INDEX, policy).use { store ->
             val performance = JSONObject().put("version", 1)
             val importStarted = System.nanoTime()
             store.begin(id, "/synthetic", "ordinary", Process.myUid(), Process.myPid()).use { writer ->

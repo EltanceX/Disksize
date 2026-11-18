@@ -51,6 +51,9 @@
 | `progressMicros` | 同步进度回调的累计时间；不包含投递到主线程后的通知工作 |
 | `transactions`、`committedActions`、`maxActionsPerTransaction` | 已成功提交的事务数、事务内导入动作总数、单事务最大动作数；动作含节点、目录关闭、问题与卷记录，不等于节点数 |
 | `limitCommits`、`progressCommits`、`summaryCommits` | 按达到上限、进度帧、summary 帧区分实际提交次数；空 flush 不计 |
+| `intervalCommits`、`deferredProgressFlushes` | 活动时间限制触发的提交，以及有打开事务但合并收集的进度帧次数；后者不计入 `transactions` |
+| `maxActiveTransactionMicros` | 成功提交事务中，从第一项导入动作开始到调用 flush 的最长经过时间；不含提交本身，不保证操作或 pipe 阻塞时也能中途提交 |
+| `importVariant` | 导入策略名称；历史报告中可能缺失。协议节点批量与事务动作上限独立 |
 | `parentCacheHits`、`parentCacheMisses` | 非根节点的父路径缓存命中及查库次数 |
 
 `receiveMicros + decodeMicros + importMicros + progressMicros` 近似覆盖 consumer 的内部工作，不能再加 `importCommitMicros`。两侧并行运行，`producer.elapsedMicros` 和 `consumer.elapsedMicros` 都落在 `coordinator.pipelineMicros` 内，不能相加。减去 `pipeWriteMicros` 得到的也不是纯遍历，因为还包含编码和其他 native 开销；纯遍历由步骤 2 的模式 A 单独测量。
@@ -81,7 +84,7 @@
 
 `scanMicros`、`importDbMicros`、`finalizeMillis`、`dedupMillis`、`initializeMillis` 保留历史边界与单位。`scanMicros` 是核心带回调的区间，可能包括传输阻塞；部分尾帧在该区间之后发送。`importDbMicros` 是原有导入累计计时，含提交但不含卷记录。`finalizeMillis` 包含两个原毫秒子项，但截至终态数据库事务之前。`startedAtMillis` 与 `endedAtMillis` 属于墙上时间，继续用于会话展示，不用于替代单调时钟耗时。
 
-默认只累加帧、事务与阶段计时，进度计时沿用现有的限频回调；沿用已有逐项导入时钟，不新增逐项计时或日志。编码独立耗时、进程 CPU/内存、GC、SQLite/WAL 峰值和设备 I/O 仍由后续采样或对照基准采集。正式比较需要同构建、同样本和重复测量，本契约不提供加速数字。
+默认只累加帧、事务与阶段计时，进度计时沿用现有的限频回调；沿用已有逐项导入时钟，不新增逐项计时或日志。进程 CPU、内存、FD、独立 SQLite 主库和 WAL 文件大小由基准工具单独采样；文件长度不等于设备写入量，采样峰值也可能漏掉瞬时峰值。编码独立耗时、GC 和设备 I/O 不属于本契约的内嵌指标。正式比较需要同构建、同样本和重复测量，本契约不提供加速数字。
 
 ## 验证
 
