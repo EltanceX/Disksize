@@ -1,6 +1,6 @@
 # 扫描性能测量契约 v1
 
-本契约定义普通与 Root 扫描在完整服务链路上的计时边界。它对应[性能优化计划](./scan-performance-optimization-plan.md)步骤 1；分层基准与可比较的优化构建基线留给后续步骤。
+本契约定义普通与 Root 扫描在完整服务链路上的计时边界，对应[性能优化计划](./scan-performance-optimization-plan.md)步骤 1。复用本契约的 A/B/C 与回放入口见[基准工具说明](../tools/scan-performance/README.md)。
 
 ## 读取结果
 

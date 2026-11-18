@@ -9,6 +9,11 @@
 #include <sstream>
 #include <stdexcept>
 #include <unordered_map>
+#ifdef DISKSIZE_SCAN_BENCHMARK
+#include <array>
+#include <limits>
+#include <sys/resource.h>
+#endif
 
 namespace {
 struct Session {
@@ -202,3 +207,49 @@ Java_com_example_disksize_scan_NativeBridge_nativeStreamScan(
         writer.finish(disksize::stream_directory(session->configuration, session->cancellation, cb));
     } catch (...) { fail(env, "Incremental scan/pipe failed"); }
 }
+
+#ifdef DISKSIZE_SCAN_BENCHMARK
+extern "C" JNIEXPORT jlongArray JNICALL
+Java_com_example_disksize_scan_NativeBridge_nativeBenchmarkTraversal(JNIEnv* env, jobject, jlong handle) {
+    try {
+        const auto session = session_for(handle);
+        if (session->running.exchange(true)) throw std::logic_error("Scan already running");
+        session->configuration.max_nodes = 2'000'000;
+        std::array<jlong, 5> kinds{};
+        jlong logical = 0, allocated = 0, max_depth = 0;
+        auto add = [](jlong& total, std::uint64_t amount) {
+            if (amount > static_cast<std::uint64_t>(std::numeric_limits<jlong>::max() - total))
+                throw std::overflow_error("Benchmark counter overflow");
+            total += static_cast<jlong>(amount);
+        };
+        disksize::StreamCallbacks cb;
+        cb.on_nodes = [&](std::span<const disksize::ScanNode> nodes) {
+            for (const auto& n : nodes) {
+                ++kinds.at(static_cast<std::size_t>(n.kind));
+                max_depth = std::max(max_depth, static_cast<jlong>(n.depth));
+                if (!n.metadata_valid || n.skipped != disksize::SkipReason::None) continue;
+                if (n.kind == disksize::NodeKind::Regular) add(logical, n.raw_size);
+                add(allocated, n.raw_allocated_bytes);
+            }
+        };
+        rusage before{}, after{};
+        const auto sampled = getrusage(RUSAGE_THREAD, &before) == 0;
+        const auto r = disksize::stream_directory(session->configuration, session->cancellation, cb);
+        const auto cpu = getrusage(RUSAGE_THREAD, &after) == 0 && sampled;
+        auto micros = [](const timeval& t) { return static_cast<jlong>(t.tv_sec) * 1'000'000 + t.tv_usec; };
+        const std::array<jlong, 22> payload{
+            getuid(), geteuid(), getpid(), static_cast<jlong>(r.scan.state), static_cast<jlong>(r.node_count),
+            static_cast<jlong>(r.scan.summary.issue_count), static_cast<jlong>(r.scan.metrics.elapsed_microseconds),
+            static_cast<jlong>(r.scan.metrics.peak_open_fds), static_cast<jlong>(r.scan.metrics.open_fds_at_finish),
+            static_cast<jlong>(r.scan.root_mount_id), static_cast<jlong>(r.scan.root_filesystem_type),
+            logical, allocated, max_depth, kinds[0], kinds[1], kinds[2], kinds[3], kinds[4],
+            cpu ? micros(after.ru_utime) - micros(before.ru_utime) : -1,
+            cpu ? micros(after.ru_stime) - micros(before.ru_stime) : -1,
+            static_cast<jlong>(r.scan.metrics.peak_active_workers),
+        };
+        const auto result = env->NewLongArray(payload.size());
+        if (result) env->SetLongArrayRegion(result, 0, payload.size(), payload.data());
+        return result;
+    } catch (...) { fail(env, "Benchmark traversal failed"); return nullptr; }
+}
+#endif

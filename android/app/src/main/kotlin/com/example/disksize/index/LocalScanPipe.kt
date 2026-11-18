@@ -6,7 +6,7 @@ import com.example.disksize.scan.NativeBridge
 import java.util.concurrent.atomic.AtomicReference
 
 internal object LocalScanPipe {
-    fun run(handle: Long, id: String, writer: IndexStore.Import, progress: (Long, Long, Long) -> Unit): StreamSummary {
+    fun run(handle: Long, id: String, writer: IndexConsumer, progress: (Long, Long, Long) -> Unit): StreamSummary {
         val pipe = ParcelFileDescriptor.createPipe()
         val failure = AtomicReference<Throwable?>(null)
         val producer = Thread({

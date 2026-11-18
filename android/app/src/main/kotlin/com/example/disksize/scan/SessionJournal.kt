@@ -6,8 +6,8 @@ import org.json.JSONObject
 import java.io.File
 
 /** Single writer in :scanner. The UI accesses snapshots only through Binder. */
-internal class SessionJournal(context: Context) {
-    private val file = AtomicFile(File(context.noBackupFilesDir, "scan-session.json"))
+internal class SessionJournal(context: Context, filename: String = "scan-session.json") {
+    private val file = AtomicFile(File(context.noBackupFilesDir, filename))
 
     fun read(): JSONObject? {
         if (!file.baseFile.exists() && !File(file.baseFile.path + ".bak").exists()) return null

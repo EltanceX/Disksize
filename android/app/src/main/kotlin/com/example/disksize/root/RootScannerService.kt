@@ -9,6 +9,7 @@ import android.os.UserManager
 import android.system.Os
 import android.system.OsConstants
 import android.util.Log
+import com.example.disksize.BuildConfig
 import com.example.disksize.index.IndexProtocol
 import com.example.disksize.scan.NativeBridge
 import com.example.disksize.scan.ipc.IRootScanner
@@ -111,6 +112,19 @@ class RootScannerService : RootService() {
         override fun cancel(sessionId: String) {
             authorize()
             synchronized(lock) { active?.takeIf { it.id == sessionId }?.let { stop(it) } }
+        }
+
+        override fun benchmarkTraversal(rootPath: ByteArray): LongArray {
+            authorize()
+            check(BuildConfig.SCAN_BENCHMARK)
+            require(rootPath.isNotEmpty() && rootPath.size <= 4096 &&
+                rootPath[0] == '/'.code.toByte() && !rootPath.contains(0))
+            return synchronized(lock) {
+                check(!destroyed && active == null)
+                val handle = NativeBridge.nativeCreateScan(rootPath)
+                try { NativeBridge.nativeBenchmarkTraversal(handle) }
+                finally { NativeBridge.nativeReleaseScan(handle) }
+            }
         }
     }
 

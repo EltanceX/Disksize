@@ -12,7 +12,7 @@ import android.os.ParcelFileDescriptor
 import android.util.Log
 import com.example.disksize.scan.ipc.IRootScanner
 import com.example.disksize.index.IndexProtocol
-import com.example.disksize.index.IndexStore
+import com.example.disksize.index.IndexConsumer
 import com.example.disksize.index.StreamSummary
 import com.topjohnwu.superuser.Shell
 import com.topjohnwu.superuser.ipc.RootService
@@ -103,7 +103,12 @@ internal class RootBackend(private val context: Context) : AutoCloseable {
         JSONObject(status).optString("state") == "ready" && remote?.asBinder()?.isBinderAlive == true
     }
 
-    fun run(id: String, root: String, writer: IndexStore.Import, progress: (Long, Long, Long) -> Unit): StreamSummary {
+    fun benchmarkTraversal(root: String): LongArray {
+        val service = synchronized(lock) { check(!closed && ready()); remote!! }
+        return service.benchmarkTraversal(root.toByteArray(Charsets.UTF_8))
+    }
+
+    fun run(id: String, root: String, writer: IndexConsumer, progress: (Long, Long, Long) -> Unit): StreamSummary {
         val service: IRootScanner
         val pid: Int
         val pipe = ParcelFileDescriptor.createPipe()

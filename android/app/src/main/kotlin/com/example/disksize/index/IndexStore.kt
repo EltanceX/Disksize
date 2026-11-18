@@ -107,14 +107,14 @@ internal class IndexStore(context: Context, filename: String = "scan-index.db") 
     }
     enum class FlushReason { LIMIT, PROGRESS, SUMMARY }
 
-    inner class Import internal constructor(val id: String) : AutoCloseable {
+    inner class Import internal constructor(val id: String) : AutoCloseable, IndexConsumer {
         private val db = writableDatabase
         private val insert = db.compileStatement("""INSERT INTO nodes(sid,id,parent,depth,name,name_key,path,link,kind,mode,uid,gid,
             device,inode,mount,nlink,size,allocated,seconds,nanos,valid,complete,skip) VALUES(${List(23) { "?" }.joinToString(",")})""")
         private val insertAggregate = db.compileStatement("INSERT INTO aggregates VALUES(?,?,?,?,?,?,?,?,?,?,?,?)")
         private var actions = 0; private var transaction = false
         private var discovered = 0L; private var issueCount = 0L
-        var writeNanos = 0L
+        override var writeNanos = 0L
             private set
         private var volumeNanos = 0L
         private var commitNanos = 0L
@@ -123,7 +123,7 @@ internal class IndexStore(context: Context, filename: String = "scan-index.db") 
         private val commits = LongArray(FlushReason.entries.size)
         private var parentCacheHits = 0L
         private var parentCacheMisses = 0L
-        val measuredImportNanos get() = writeNanos + volumeNanos
+        override val measuredImportNanos get() = writeNanos + volumeNanos
         // At most 32 recent parent paths, with a 1 MiB byte cap (deep trees can have long paths).
         private val paths = LinkedHashMap<Long, Pair<ByteArray, Int>>(32, 0.75f, true)
         private var pathBytes = 0
@@ -137,7 +137,7 @@ internal class IndexStore(context: Context, filename: String = "scan-index.db") 
             if (!transaction) { db.beginTransactionNonExclusive(); transaction = true }
             actions++
         }
-        fun node(n: IndexNode) {
+        override fun node(n: IndexNode) {
             val before = System.nanoTime()
             action()
             val ancestor = if (n.parent == 0L) byteArrayOf() to -1 else {
@@ -169,7 +169,7 @@ internal class IndexStore(context: Context, filename: String = "scan-index.db") 
             writeNanos += System.nanoTime() - before
             if (actions >= 256) flush(FlushReason.LIMIT)
         }
-        fun directory(node: Long, enumerated: Boolean, complete: Boolean, skip: Int) {
+        override fun directory(node: Long, enumerated: Boolean, complete: Boolean, skip: Int) {
             val before = System.nanoTime()
             action()
             db.execSQL("UPDATE nodes SET enumerated=?,complete=?,skip=? WHERE sid=? AND id=? AND kind=1",
@@ -180,7 +180,7 @@ internal class IndexStore(context: Context, filename: String = "scan-index.db") 
             writeNanos += System.nanoTime() - before
             if (actions >= 256) flush(FlushReason.LIMIT)
         }
-        fun issue(node: Long, code: Int, errno: Int, op: String) {
+        override fun issue(node: Long, code: Int, errno: Int, op: String) {
             val before = System.nanoTime()
             action(); issueCount++
             db.execSQL("INSERT INTO issues(sid,node,code,errno,operation) VALUES(?,?,?,?,?)", arrayOf<Any>(id, node, code, errno, op))
@@ -189,7 +189,7 @@ internal class IndexStore(context: Context, filename: String = "scan-index.db") 
             writeNanos += System.nanoTime() - before
             if (actions >= 256) flush(FlushReason.LIMIT)
         }
-        fun volume(total: Long, free: Long, available: Long, captured: Long) {
+        override fun volume(total: Long, free: Long, available: Long, captured: Long) {
             val before = System.nanoTime()
             action()
             val value = JSONObject().put("totalBytes", total).put("freeBytes", free)
@@ -197,7 +197,9 @@ internal class IndexStore(context: Context, filename: String = "scan-index.db") 
             db.execSQL("UPDATE sessions SET volume=? WHERE id=?", arrayOf(value.toString(), id))
             volumeNanos += System.nanoTime() - before
         }
-        fun flush(reason: FlushReason = FlushReason.SUMMARY) {
+        fun flush() = flush(FlushReason.SUMMARY)
+
+        override fun flush(reason: FlushReason) {
             if (!transaction) return
             val before = System.nanoTime()
             val batch = actions
@@ -214,7 +216,7 @@ internal class IndexStore(context: Context, filename: String = "scan-index.db") 
             committedActions += batch
             maxActions = maxOf(maxActions, batch)
         }
-        fun measurements() = JSONObject().put("importMicros", measuredImportNanos / 1000)
+        override fun measurements() = JSONObject().put("importMicros", measuredImportNanos / 1000)
             .put("importCommitMicros", commitNanos / 1000)
             .put("transactions", commits.sum()).put("committedActions", committedActions).put("maxActionsPerTransaction", maxActions)
             .put("limitCommits", commits[FlushReason.LIMIT.ordinal]).put("progressCommits", commits[FlushReason.PROGRESS.ordinal])

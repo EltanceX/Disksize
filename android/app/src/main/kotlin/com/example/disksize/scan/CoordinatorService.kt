@@ -19,6 +19,7 @@ import android.util.Log
 import com.example.disksize.scan.ipc.IScanCoordinator
 import com.example.disksize.scan.ipc.NativeDiagnosticsParcel
 import com.example.disksize.MainActivity
+import com.example.disksize.BuildConfig
 import com.example.disksize.root.RootBackend
 import com.example.disksize.root.RootFailure
 import com.example.disksize.index.IndexStore
@@ -64,9 +65,15 @@ class CoordinatorService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        journal = SessionJournal(this)
+        if (BuildConfig.SCAN_BENCHMARK) {
+            val storage = BenchmarkStorage.context(this)
+            journal = SessionJournal(storage, BenchmarkStorage.JOURNAL)
+            index = IndexStore(storage, BenchmarkStorage.INDEX)
+        } else {
+            journal = SessionJournal(this)
+            index = IndexStore(this)
+        }
         rootBackend = RootBackend(this)
-        index = IndexStore(this)
         getSystemService(NotificationManager::class.java).createNotificationChannel(
             NotificationChannel(CHANNEL, "目录扫描", NotificationManager.IMPORTANCE_LOW),
         )

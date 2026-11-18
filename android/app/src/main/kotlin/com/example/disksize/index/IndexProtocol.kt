@@ -34,7 +34,7 @@ internal object IndexProtocol {
     const val VERSION = 4
     private const val HEADER_BYTES = 36
 
-    fun read(input: InputStream, id: String, uid: Int, pid: Int, writer: IndexStore.Import,
+    fun read(input: InputStream, id: String, uid: Int, pid: Int, writer: IndexConsumer,
         progress: (Long, Long, Long) -> Unit): StreamSummary {
         val start = System.nanoTime()
         val expected = uuidBytes(id); val stream = DataInputStream(input)

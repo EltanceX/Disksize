@@ -4,6 +4,8 @@ plugins {
     id("dev.flutter.flutter-gradle-plugin")
 }
 
+val scanBenchmark = providers.gradleProperty("disksizeBenchmark").orNull == "true"
+
 android {
     namespace = "com.example.disksize"
     compileSdk = 36
@@ -11,7 +13,9 @@ android {
 
     buildFeatures {
         aidl = true
+        buildConfig = true
     }
+    testBuildType = if (scanBenchmark) "profile" else "debug"
 
     externalNativeBuild {
         cmake {
@@ -33,6 +37,7 @@ android {
         minSdk = 29
         targetSdk = 36
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        buildConfigField("boolean", "SCAN_BENCHMARK", "false")
         ndk {
             abiFilters += listOf("arm64-v8a", "x86_64")
         }
@@ -51,6 +56,12 @@ android {
     }
 
     buildTypes {
+        named("profile") {
+            if (scanBenchmark) {
+                buildConfigField("boolean", "SCAN_BENCHMARK", "true")
+                externalNativeBuild.cmake.arguments += "-DDISKSIZE_SCAN_BENCHMARK=ON"
+            }
+        }
         release {
             // TODO: Add your own signing config for the release build.
             // Signing with the debug keys for now, so `flutter run --release` works.
