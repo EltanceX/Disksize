@@ -165,6 +165,34 @@ Widget _page(_Client client) => MaterialApp(
 );
 
 void main() {
+  for (final size in [const Size(360, 800), const Size(1280, 800)]) {
+    testWidgets('dashboard scrolls from either side margin at $size', (
+      tester,
+    ) async {
+      await tester.binding.setSurfaceSize(size);
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      await tester.pumpWidget(_page(_Client()..value = view('completed')));
+      await tester.pumpAndSettle();
+      final viewport = find.byKey(const Key('dashboard-scroll'));
+      final position = tester
+          .state<ScrollableState>(
+            find
+                .descendant(of: viewport, matching: find.byType(Scrollable))
+                .first,
+          )
+          .position;
+      for (final x in [8.0, size.width - 8]) {
+        position.jumpTo(0);
+        await tester.pump();
+        await tester.dragFrom(Offset(x, 500), const Offset(0, -200));
+        await tester.pumpAndSettle();
+        expect(position.pixels, greaterThan(100));
+      }
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox());
+    });
+  }
+
   testWidgets(
     'permission results received while inactive refresh once on resume',
     (tester) async {

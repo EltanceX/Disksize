@@ -11,4 +11,7 @@ interface IScanCoordinator {
     String queryIndex(String requestJson);
     void cancelScan(String sessionId);
     void rejectPreparedScan(String sessionId, String reason);
+    String prepareSnapshotRescan(String snapshotId, long nodeId, long expectedRevision);
+    String getSnapshotRescan(String taskId);
+    String cancelSnapshotRescan(String taskId);
 }

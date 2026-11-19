@@ -98,6 +98,10 @@ class ExplorerFixture implements IndexClient {
         m['issues'] = [];
       case IndexQueryKind.session:
         break;
+      case IndexQueryKind.locate:
+        final id = r.pathHex == hex('folder') ? 2 : 1;
+        m['detail'] = entry(id);
+        m['pathMatched'] = r.pathHex == '' || r.pathHex == hex('folder');
       case IndexQueryKind.treemap:
         m['entries'] = r.parentId == 2 ? [entry(4)] : [entry(2), entry(3)];
         m['treemap'] = {
@@ -142,8 +146,8 @@ void main() {
     client.revision++;
     await c.resume();
     expect(c.page!.revision, 2);
-    expect(c.pageNumber, 2);
-    expect(client.requests.any((r) => r.cursor == 'next'), isTrue);
+    expect(c.pageNumber, 1);
+    expect(client.requests.last.cursor, isNull);
     client.intercept = (_) =>
         Future.value(IndexPage.fromJson({'status': 'not-found'}));
     await c.resume();
@@ -401,6 +405,101 @@ void main() {
     expect(find.text('路径包含非 UTF-8 字节，已复制完整路径的十六进制字节。'), findsOneWidget);
     await tester.pumpWidget(const SizedBox());
   });
+
+  for (final config in [
+    (const Size(360, 800), 2.0, 'directory'),
+    (const Size(1280, 900), 1.0, 'directory'),
+    (const Size(360, 800), 2.0, 'empty'),
+    (const Size(360, 800), 2.0, 'missing'),
+    (const Size(360, 800), 1.0, 'back'),
+  ]) {
+    testWidgets('folder taps preserve scroll through loading ${config.$1}, '
+        'scale ${config.$2}, ${config.$3}', (tester) async {
+      await tester.binding.setSurfaceSize(config.$1);
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      final client = ExplorerFixture();
+      final pending = Completer<IndexPage>();
+      client.intercept = (request) {
+        if (request.kind != IndexQueryKind.children) return null;
+        if (request.parentId == 2) return pending.future;
+        return Future.value(
+          IndexPage.fromJson({
+            ...client.metadata(),
+            'entries': [
+              for (var id = 10; id < 30; id++) client.entry(id),
+              client.entry(2),
+            ],
+          }),
+        );
+      };
+      await tester.pumpWidget(
+        MaterialApp(
+          builder: (context, child) => MediaQuery(
+            data: MediaQuery.of(context)
+                .copyWith(textScaler: TextScaler.linear(config.$2)),
+            child: child!,
+          ),
+          home: ExplorerPage(client: client, sessionId: 'fixture'),
+        ),
+      );
+      await tester.pumpAndSettle();
+      final viewport = find.byType(CustomScrollView);
+      await tester.scrollUntilVisible(
+        find.byKey(const ValueKey('entry-2')),
+        500,
+        scrollable: find
+            .descendant(of: viewport, matching: find.byType(Scrollable))
+            .first,
+      );
+      await tester.pumpAndSettle();
+      final scroll = tester.widget<CustomScrollView>(viewport).controller!;
+      final offset = scroll.offset;
+      expect(offset, greaterThan(500));
+      await tester.tap(find.byKey(const ValueKey('entry-2')));
+      await tester.pump(const Duration(milliseconds: 500));
+      expect(scroll.offset, closeTo(offset, .01));
+      expect(find.byType(LinearProgressIndicator), findsOneWidget);
+      if (config.$3 == 'back') {
+        await tester.tap(find.byType(BackButton).first);
+        await tester.pumpAndSettle();
+        expect(scroll.offset, 0);
+      }
+      pending.complete(
+        IndexPage.fromJson({
+          ...client.metadata(),
+          if (config.$3 == 'missing') 'status': 'not-found',
+          'entries': config.$3 == 'empty'
+              ? []
+              : [
+                  for (var id = 100; id < 150; id++)
+                    {...client.entry(id), 'parentId': 2},
+                ],
+        }),
+      );
+      await tester.pumpAndSettle();
+      expect(
+        find.byWidgetPredicate(
+          (widget) => widget is LinearProgressIndicator && widget.value == null,
+        ),
+        findsNothing,
+      );
+      expect(find.text('正在读取目录…'), findsNothing);
+      if (config.$3 == 'back') {
+        expect(scroll.offset, 0);
+        expect(find.byKey(const ValueKey('crumb-2')), findsNothing);
+      } else {
+        expect(
+          scroll.offset,
+          closeTo(offset.clamp(0.0, scroll.position.maxScrollExtent), .01),
+        );
+        if (config.$3 == 'empty' || config.$3 == 'missing') {
+          expect(scroll.position.maxScrollExtent, lessThan(offset));
+        }
+      }
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox());
+    });
+  }
 
   for (final config in [
     (const Size(360, 800), 1.0),

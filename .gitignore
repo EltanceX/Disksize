@@ -7,6 +7,10 @@
 .pub/
 build/
 coverage/
+
+# Python verification helpers
+__pycache__/
+*.py[cod]
 doc/api/
 
 # Android / Gradle / native build output

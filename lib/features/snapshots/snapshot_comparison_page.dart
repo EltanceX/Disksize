@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../../platform/scan_client.dart';
 import '../../platform/snapshot_client.dart';
 import '../explorer/explorer_format.dart';
+import 'local_update_summary.dart';
 
 const changeLabels = {
   'all': '全部变化',
@@ -35,16 +36,39 @@ class SnapshotComparisonPage extends StatefulWidget {
   State<SnapshotComparisonPage> createState() => _SnapshotComparisonPageState();
 }
 
-class _SnapshotComparisonPageState extends State<SnapshotComparisonPage> {
+class _SnapshotComparisonPageState extends State<SnapshotComparisonPage>
+    with WidgetsBindingObserver {
   SnapshotComparison? _page;
   String _sort = 'logical', _filter = 'all';
   bool _busy = true;
   String? _error;
   int _generation = 0;
+  String? _notice;
+  bool _backgrounded = false;
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _load();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.hidden ||
+        state == AppLifecycleState.paused) {
+      _backgrounded = true;
+    }
+    if (state == AppLifecycleState.resumed && _backgrounded) {
+      _backgrounded = false;
+      _load();
+    }
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _generation++;
+    super.dispose();
   }
 
   Future<void> _load({String? cursor}) async {
@@ -53,6 +77,7 @@ class _SnapshotComparisonPageState extends State<SnapshotComparisonPage> {
       _busy = true;
       _error = null;
       _page = null;
+      _notice = null;
     });
     try {
       while (mounted && generation == _generation) {
@@ -64,6 +89,11 @@ class _SnapshotComparisonPageState extends State<SnapshotComparisonPage> {
           cursor: cursor,
         );
         if (!mounted || generation != _generation) return;
+        if (page.status == 'stale-cursor' && cursor != null) {
+          cursor = null;
+          _notice = '快照内容已更新，已丢弃旧游标并返回第一页。';
+          continue;
+        }
         setState(() => _page = page);
         if (page.status != 'building') break;
         await Future<void>.delayed(const Duration(milliseconds: 80));
@@ -111,6 +141,23 @@ class _SnapshotComparisonPageState extends State<SnapshotComparisonPage> {
                           '${page!.base!.rootPath}\n基准 ${formatTime(page.base!.started)} → ${formatTime(page.base!.ended)}\n新快照 ${formatTime(page.target!.started)} → ${formatTime(page.target!.ended)}',
                         ),
                       ),
+                    if (page?.base != null &&
+                        page!.base!.localUpdate.updated) ...[
+                      const Text('基准快照的局部更新'),
+                      LocalUpdateSummary(
+                        update: page.base!.localUpdate,
+                        revision: page.base!.revision,
+                      ),
+                    ],
+                    if (page?.target != null &&
+                        page!.target!.localUpdate.updated) ...[
+                      const Text('新快照的局部更新'),
+                      LocalUpdateSummary(
+                        update: page.target!.localUpdate,
+                        revision: page.target!.revision,
+                      ),
+                    ],
+                    if (_notice != null) Text(_notice!),
                     Wrap(
                       spacing: 12,
                       runSpacing: 12,
@@ -168,6 +215,8 @@ class _SnapshotComparisonPageState extends State<SnapshotComparisonPage> {
                       Text(
                         page.status == 'not-found'
                             ? '快照已删除，请返回刷新。'
+                            : page.status == 'busy'
+                            ? '正在扫描或应用快照更新，请等待结束后重新对比。'
                             : '对比数据已失效，请重新对比（${page.status}）。',
                       ),
                     if (page?.status == 'ok') ...[

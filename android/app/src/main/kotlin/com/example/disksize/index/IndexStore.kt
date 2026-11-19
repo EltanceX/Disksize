@@ -24,7 +24,10 @@ internal class IndexStore(context: Context, filename: String = "scan-index.db", 
     private fun identity(root: String) = JSONObject(scanIdentity).put("volumeUuid", try {
         storage.getUuidForPath(File(root)).toString()
     } catch (_: Exception) { "" }).toString()
+    internal fun currentIdentity(root: String) = JSONObject(identity(root))
     val snapshots by lazy { SnapshotQueries(this) }
+    val rescans by lazy { SnapshotRescanStore(this) }
+    internal val snapshotMutationLock = java.util.concurrent.locks.ReentrantLock()
     init { setWriteAheadLoggingEnabled(true) }
     override fun onConfigure(db: SQLiteDatabase) {
         db.setForeignKeyConstraintsEnabled(true)
@@ -37,7 +40,8 @@ internal class IndexStore(context: Context, filename: String = "scan-index.db", 
             provisional INTEGER NOT NULL DEFAULT 1, started INTEGER NOT NULL, ended INTEGER NOT NULL DEFAULT 0,
             nodes INTEGER NOT NULL DEFAULT 0, issues INTEGER NOT NULL DEFAULT 0, reason TEXT NOT NULL DEFAULT '',
             scanner_uid INTEGER NOT NULL, scanner_pid INTEGER NOT NULL, metrics TEXT NOT NULL DEFAULT '{}',
-            volume TEXT NOT NULL DEFAULT '{}', identity TEXT NOT NULL DEFAULT '{}')""")
+            volume TEXT NOT NULL DEFAULT '{}', identity TEXT NOT NULL DEFAULT '{}',
+            node_id_high_water INTEGER NOT NULL DEFAULT 0 CHECK(node_id_high_water>=0))""")
         db.execSQL("CREATE INDEX sessions_recent ON sessions(started DESC,id DESC)")
         db.execSQL("""CREATE TABLE nodes(sid TEXT NOT NULL REFERENCES sessions(id), id INTEGER NOT NULL,
             parent INTEGER NOT NULL, depth INTEGER NOT NULL, name BLOB NOT NULL, name_key TEXT NOT NULL,
@@ -70,11 +74,13 @@ internal class IndexStore(context: Context, filename: String = "scan-index.db", 
         db.execSQL("CREATE INDEX issue_node ON issues(sid,node,id)")
         db.execSQL("""CREATE TABLE snapshots(id TEXT PRIMARY KEY, sid TEXT NOT NULL UNIQUE REFERENCES sessions(id),
             revision INTEGER NOT NULL, created INTEGER NOT NULL, logical INTEGER NOT NULL, allocated INTEGER NOT NULL,
-            complete INTEGER NOT NULL, retained INTEGER NOT NULL DEFAULT 0)""")
+            complete INTEGER NOT NULL, retained INTEGER NOT NULL DEFAULT 0,
+            local_updated INTEGER NOT NULL DEFAULT 0, local_updates INTEGER NOT NULL DEFAULT 0)""")
         createDiffSchema(db)
+        SnapshotRescanStore.createSchema(db)
     }
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        require(oldVersion in 1..3 && newVersion == SCHEMA_VERSION) {
+        require(oldVersion in 1 until SCHEMA_VERSION && newVersion == SCHEMA_VERSION) {
             "Unsupported index migration $oldVersion -> $newVersion; existing data preserved"
         }
         if (oldVersion == 1) {
@@ -84,9 +90,16 @@ internal class IndexStore(context: Context, filename: String = "scan-index.db", 
             db.execSQL("ALTER TABLE sessions ADD COLUMN volume TEXT NOT NULL DEFAULT '{}'")
             db.execSQL("CREATE INDEX sessions_recent ON sessions(started DESC,id DESC)")
         }
-        db.execSQL("ALTER TABLE sessions ADD COLUMN identity TEXT NOT NULL DEFAULT '{}'")
-        db.execSQL("ALTER TABLE snapshots ADD COLUMN retained INTEGER NOT NULL DEFAULT 0")
-        createDiffSchema(db)
+        if (oldVersion < 4) {
+            db.execSQL("ALTER TABLE sessions ADD COLUMN identity TEXT NOT NULL DEFAULT '{}'")
+            db.execSQL("ALTER TABLE snapshots ADD COLUMN retained INTEGER NOT NULL DEFAULT 0")
+            createDiffSchema(db)
+        }
+        db.execSQL("ALTER TABLE sessions ADD COLUMN node_id_high_water INTEGER NOT NULL DEFAULT 0 CHECK(node_id_high_water>=0)")
+        db.execSQL("UPDATE sessions SET node_id_high_water=COALESCE((SELECT MAX(id) FROM nodes WHERE sid=sessions.id),0)")
+        db.execSQL("ALTER TABLE snapshots ADD COLUMN local_updated INTEGER NOT NULL DEFAULT 0")
+        db.execSQL("ALTER TABLE snapshots ADD COLUMN local_updates INTEGER NOT NULL DEFAULT 0")
+        SnapshotRescanStore.createSchema(db)
     }
     private fun createDiffSchema(db: SQLiteDatabase) {
         db.execSQL("CREATE TABLE diff_cache(id INTEGER PRIMARY KEY CHECK(id=1), signature TEXT NOT NULL, ready INTEGER NOT NULL)")
@@ -97,14 +110,21 @@ internal class IndexStore(context: Context, filename: String = "scan-index.db", 
         db.execSQL("CREATE INDEX diff_allocated ON diff_rows(COALESCE(allocated_delta,-9223372036854775808) DESC,path DESC)")
         db.execSQL("CREATE INDEX diff_status ON diff_rows(status,path)")
     }
-    companion object { const val SCHEMA_VERSION = 4 }
+    companion object { const val SCHEMA_VERSION = 5 }
     fun recover() {
         writableDatabase.execSQL("""UPDATE sessions SET state='interrupted', phase='interrupted',
             reason='process-interrupted', revision=revision+1, ended=? WHERE state IN ('running','finalizing')""", arrayOf(now()))
+        rescans.recover()
     }
     fun begin(id: String, root: String, backend: String, uid: Int, pid: Int): Import {
-        writableDatabase.execSQL("INSERT INTO sessions(id,root,backend,state,phase,started,scanner_uid,scanner_pid,identity) VALUES(?,?,?,'running','scanning',?,?,?,?)",
-            arrayOf<Any>(id, root, backend, now(), uid, pid, identity(root)))
+        val db = writableDatabase
+        db.beginTransactionNonExclusive()
+        try {
+            check(!rescans.hasActive(db)) { "A snapshot rescan is active" }
+            db.execSQL("INSERT INTO sessions(id,root,backend,state,phase,started,scanner_uid,scanner_pid,identity) VALUES(?,?,?,'running','scanning',?,?,?,?)",
+                arrayOf<Any>(id, root, backend, now(), uid, pid, identity(root)))
+            db.setTransactionSuccessful()
+        } finally { db.endTransaction() }
         return Import(id)
     }
     enum class FlushReason { LIMIT, PROGRESS, SUMMARY, INTERVAL }
@@ -119,6 +139,7 @@ internal class IndexStore(context: Context, filename: String = "scan-index.db", 
         private var maxActiveNanos = 0L
         private var deferredProgress = 0L
         private var discovered = 0L; private var issueCount = 0L
+        private var maxNodeId = 0L
         override var writeNanos = 0L
             private set
         private var volumeNanos = 0L
@@ -208,6 +229,7 @@ internal class IndexStore(context: Context, filename: String = "scan-index.db", 
             }
             if (n.kind == 1) cached(n.id, path, n.depth)
             discovered++
+            maxNodeId = maxOf(maxNodeId, n.id)
             finishAction(before)
         }
         override fun directory(node: Long, enumerated: Boolean, complete: Boolean, skip: Int) {
@@ -248,7 +270,8 @@ internal class IndexStore(context: Context, filename: String = "scan-index.db", 
             }
             val batch = actions
             try {
-                db.execSQL("UPDATE sessions SET revision=revision+1,nodes=?,issues=? WHERE id=?", arrayOf<Any>(discovered, issueCount, id))
+                db.execSQL("UPDATE sessions SET revision=revision+1,nodes=?,issues=?,node_id_high_water=MAX(node_id_high_water,?) WHERE id=?",
+                    arrayOf<Any>(discovered, issueCount, maxNodeId, id))
                 db.setTransactionSuccessful()
             } finally {
                 db.endTransaction(); transaction = false; actions = 0
@@ -286,7 +309,8 @@ internal class IndexStore(context: Context, filename: String = "scan-index.db", 
                 arrayOf<Any>(state, state, reason, now(), id))
         }
     }
-    private fun collectAllOwners(db: SQLiteDatabase, id: String, signal: CancellationSignal, check: () -> Unit) {
+    private fun collectAllOwners(db: SQLiteDatabase, id: String, signal: CancellationSignal, check: () -> Unit,
+        batch: ((SQLiteDatabase) -> Unit) -> Unit = { transaction(id, it) }) {
         // Page groups too: Android CursorWindow refills can otherwise re-run an
         // unbounded GROUP BY from its start for each window, causing quadratic work.
         var lastDevice = ""; var lastInode = ""
@@ -297,7 +321,7 @@ internal class IndexStore(context: Context, filename: String = "scan-index.db", 
                 // rawQuery only accepts string bindings, so use typed BLOB literals.
                 val after = if (lastDevice.isEmpty()) "" else " AND (device,inode)>(X'$lastDevice',X'$lastInode')"
                 var rows = 0
-                transaction(id) {
+                batch {
                     db.rawQuery("""SELECT device,inode,MIN(path),
                         (MIN(size)<>MAX(size) OR MIN(allocated)<>MAX(allocated) OR MIN(seconds)<>MAX(seconds) OR MIN(nanos)<>MAX(nanos))
                         FROM nodes WHERE sid=? AND valid=1 AND skip=0 AND kind<>1$after
@@ -315,7 +339,8 @@ internal class IndexStore(context: Context, filename: String = "scan-index.db", 
         }
     }
 
-    private fun collectSharedOwners(db: SQLiteDatabase, id: String, signal: CancellationSignal, check: () -> Unit) {
+    private fun collectSharedOwners(db: SQLiteDatabase, id: String, signal: CancellationSignal, check: () -> Unit,
+        batch: ((SQLiteDatabase) -> Unit) -> Unit = { transaction(id, it) }) {
         // Count all aliases, but elect and compare only eligible members.
         // A singleton would leave its preinitialized owner and totals intact.
         val eligible = "valid=1 AND skip=0 AND kind<>1"
@@ -341,7 +366,7 @@ internal class IndexStore(context: Context, filename: String = "scan-index.db", 
                     if (it.moveToFirst()) "(X'${it.getBlob(0).hex()}',X'${it.getBlob(1).hex()}')" else null
                 }
                 val ceiling = if (upper == null) "" else " AND $key<$upper"
-                transaction(id) {
+                batch {
                     it.execSQL("$insert SELECT ?,$fields $source$lower$ceiling$grouping", arrayOf(id, id))
                     if (upper != null) {
                         it.rawQuery("SELECT $fields $source AND $key=$upper$grouping", arrayOf(id), signal).use { group ->
@@ -363,14 +388,20 @@ internal class IndexStore(context: Context, filename: String = "scan-index.db", 
         }
     }
 
-    private fun applyOwners(db: SQLiteDatabase, id: String, nodes: Long, signal: CancellationSignal, check: () -> Unit) {
+    private fun nodePageEnd(db: SQLiteDatabase, id: String, after: Long, signal: CancellationSignal): Long =
+        db.rawQuery("SELECT MAX(id) FROM (SELECT id FROM nodes WHERE sid=? AND id>? ORDER BY id LIMIT 4096)",
+            arrayOf(id, after.toString()), signal).use { it.moveToFirst(); if (it.isNull(0)) after else it.getLong(0) }
+
+    private fun applyOwners(db: SQLiteDatabase, id: String, signal: CancellationSignal, check: () -> Unit,
+        batch: ((SQLiteDatabase) -> Unit) -> Unit = { transaction(id, it) }) {
         val sparse = finalizePolicy.sparseOwners
         if (sparse && db.rawQuery("SELECT 1 FROM hardlinks WHERE sid=? LIMIT 1", arrayOf(id), signal).use { !it.moveToFirst() }) return
-        var from = 1L
-        while (from <= nodes) {
-            check(); val to = from + 4095
-            transaction(id) {
-                val range = arrayOf<Any>(id, from, to)
+        var after = 0L
+        while (true) {
+            check(); val last = nodePageEnd(db, id, after, signal)
+            if (last == after) break
+            batch {
+                val range = arrayOf<Any>(id, after, last)
                 if (sparse) {
                     // Imported rows already carry the correct default contribution.
                     // Update only displaced owners and members of changed identities.
@@ -385,26 +416,27 @@ internal class IndexStore(context: Context, filename: String = "scan-index.db", 
                         FROM nodes n CROSS JOIN hardlinks h ON h.sid=n.sid AND h.device=n.device AND h.inode=n.inode
                         CROSS JOIN nodes o ON o.sid=h.sid AND o.path=h.path
                         CROSS JOIN aggregates a ON a.sid=n.sid AND a.id=n.id
-                        WHERE n.sid=? AND n.id BETWEEN ? AND ? AND (o.id<>a.id OR (h.changed=1 AND a.complete<>0))""", range)
+                        WHERE n.sid=? AND n.id>? AND n.id<=? AND (o.id<>a.id OR (h.changed=1 AND a.complete<>0))""", range)
                 } else {
                     it.execSQL("""UPDATE aggregates SET
                     owner=COALESCE((SELECT o.id FROM nodes n JOIN hardlinks h ON h.sid=n.sid AND h.device=n.device AND h.inode=n.inode
                         JOIN nodes o ON o.sid=h.sid AND o.path=h.path WHERE n.sid=aggregates.sid AND n.id=aggregates.id),id),
                     complete=complete AND NOT EXISTS(SELECT 1 FROM nodes n JOIN hardlinks h ON h.sid=n.sid AND h.device=n.device AND h.inode=n.inode
                         WHERE n.sid=aggregates.sid AND n.id=aggregates.id AND h.changed=1)
-                    WHERE sid=? AND id BETWEEN ? AND ?""", range)
-                    it.execSQL("UPDATE aggregates SET own_logical=0,own_allocated=0,logical=0,allocated=0 WHERE sid=? AND id BETWEEN ? AND ? AND kind<>1 AND owner<>id",
+                    WHERE sid=? AND id>? AND id<=?""", range)
+                    it.execSQL("UPDATE aggregates SET own_logical=0,own_allocated=0,logical=0,allocated=0 WHERE sid=? AND id>? AND id<=? AND kind<>1 AND owner<>id",
                         range)
                 }
                 it.execSQL("""INSERT INTO issues(sid,node,code,errno,operation) SELECT n.sid,n.id,6,116,'hardlink-metadata-changed'
                     FROM nodes n JOIN hardlinks h ON h.sid=n.sid AND h.device=n.device AND h.inode=n.inode
-                    WHERE n.sid=? AND n.id BETWEEN ? AND ? AND n.kind<>1 AND h.changed=1""", range)
+                    WHERE n.sid=? AND n.id>? AND n.id<=? AND n.kind<>1 AND h.changed=1""", range)
             }
-            from = to + 1
+            after = last
         }
     }
 
-    private fun aggregate(db: SQLiteDatabase, id: String, signal: CancellationSignal, check: () -> Unit) {
+    private fun aggregate(db: SQLiteDatabase, id: String, signal: CancellationSignal, check: () -> Unit,
+        cancellableReads: Boolean = false, batch: ((SQLiteDatabase) -> Unit) -> Unit = { transaction(id, it) }) {
         // Import requires directory parents, so every non-directory is already
         // final after applyOwners().
         val directories = finalizePolicy.directoriesOnly
@@ -424,7 +456,7 @@ internal class IndexStore(context: Context, filename: String = "scan-index.db", 
                     last
                 }
                 if (last == after) break
-                transaction(id) {
+                batch {
                     val range = arrayOf<Any>(id, level, after, last)
                     val values = if (directories) """(logical,allocated,complete)=(
                         SELECT aggregates.own_logical+COALESCE(SUM(c.logical),0),
@@ -434,7 +466,25 @@ internal class IndexStore(context: Context, filename: String = "scan-index.db", 
                     else """logical=own_logical+COALESCE((SELECT SUM(c.logical) FROM aggregates c WHERE c.sid=aggregates.sid AND c.parent=aggregates.id),0),
                         allocated=own_allocated+COALESCE((SELECT SUM(c.allocated) FROM aggregates c WHERE c.sid=aggregates.sid AND c.parent=aggregates.id),0),
                         complete=complete AND NOT EXISTS(SELECT 1 FROM aggregates c WHERE c.sid=aggregates.sid AND c.parent=aggregates.id AND c.complete=0)"""
-                    it.execSQL("UPDATE aggregates SET $values WHERE sid=? AND depth=? AND id>? AND id<=?$kind", range)
+                    if (!cancellableReads) it.execSQL("UPDATE aggregates SET $values WHERE sid=? AND depth=? AND id>? AND id<=?$kind", range)
+                    else {
+                        // Wide child sums run through a cancellable SELECT; each following write updates one row.
+                        it.compileStatement("UPDATE aggregates SET logical=?,allocated=?,complete=? WHERE sid=? AND id=?").use { update ->
+                            it.rawQuery("""SELECT a.id,a.own_logical+COALESCE(SUM(c.logical),0),
+                                a.own_allocated+COALESCE(SUM(c.allocated),0),a.complete AND COALESCE(MIN(c.complete),1)
+                                FROM aggregates a LEFT JOIN aggregates c INDEXED BY aggregate_parent ON c.sid=a.sid AND c.parent=a.id
+                                WHERE a.sid=? AND a.depth=? AND a.id>? AND a.id<=?${if (directories) " AND a.kind=1" else ""}
+                                GROUP BY a.id ORDER BY a.id""", arrayOf(id, level.toString(), after.toString(), last.toString()), signal).use { rows ->
+                                while (rows.moveToNext()) {
+                                    check()
+                                    kotlin.check(rows.getType(1) == android.database.Cursor.FIELD_TYPE_INTEGER &&
+                                        rows.getType(2) == android.database.Cursor.FIELD_TYPE_INTEGER) { "Aggregate counter overflow" }
+                                    update.bindLong(1, rows.getLong(1)); update.bindLong(2, rows.getLong(2)); update.bindLong(3, rows.getLong(3))
+                                    update.bindString(4, id); update.bindLong(5, rows.getLong(0)); update.executeUpdateDelete()
+                                }
+                            }
+                        }
+                    }
                     it.rawQuery("""SELECT 1 FROM aggregates WHERE sid=? AND depth=? AND id>? AND id<=?$kind
                         AND (typeof(logical)<>'integer' OR typeof(allocated)<>'integer') LIMIT 1""",
                         arrayOf(id, level.toString(), after.toString(), last.toString()), signal).use { overflow ->
@@ -444,6 +494,73 @@ internal class IndexStore(context: Context, filename: String = "scan-index.db", 
                 after = last
             }
         }
+    }
+
+    internal enum class RebuildPoint { INITIALIZED, OWNERS_COLLECTED, OWNERS_APPLIED, AGGREGATED }
+
+    /** Raw metadata is authoritative. No commits, revision increments, or snapshot publication here. */
+    internal fun rebuildSnapshot(id: String, signal: CancellationSignal, check: () -> Unit, point: (RebuildPoint) -> Unit) {
+        val db = writableDatabase
+        require(db.inTransaction())
+        fun deletePages(sql: String) {
+            db.compileStatement(sql).use { statement ->
+                statement.bindString(1, id)
+                do { check(); val count = statement.executeUpdateDelete() } while (count == 4096)
+            }
+        }
+        // Remove obsolete IDs, but retain rows already equal to their authoritative raw baseline.
+        // Replacing every unchanged singleton also rewrites all secondary indexes and creates a
+        // snapshot-sized WAL even for a tiny refresh. All nodes are still checked and owners and
+        // directories are still recomputed globally inside the same transaction.
+        var aggregateAfter = 0L
+        while (true) {
+            check()
+            val last = db.rawQuery("SELECT MAX(id) FROM (SELECT id FROM aggregates WHERE sid=? AND id>? ORDER BY id LIMIT 4096)",
+                arrayOf(id, aggregateAfter.toString()), signal).use { it.moveToFirst(); if (it.isNull(0)) aggregateAfter else it.getLong(0) }
+            if (last == aggregateAfter) break
+            db.execSQL("""DELETE FROM aggregates WHERE sid=? AND id>? AND id<=? AND NOT EXISTS
+                (SELECT 1 FROM nodes n WHERE n.sid=aggregates.sid AND n.id=aggregates.id)""", arrayOf<Any>(id, aggregateAfter, last))
+            aggregateAfter = last
+        }
+        deletePages("DELETE FROM hardlinks WHERE (sid,device,inode) IN (SELECT sid,device,inode FROM hardlinks WHERE sid=? LIMIT 4096)")
+        var issueAfter = 0L
+        while (true) {
+            check()
+            val last = db.rawQuery("SELECT MAX(id) FROM (SELECT id FROM issues WHERE sid=? AND id>? ORDER BY id LIMIT 4096)",
+                arrayOf(id, issueAfter.toString()), signal).use { it.moveToFirst(); if (it.isNull(0)) issueAfter else it.getLong(0) }
+            if (last == issueAfter) break
+            db.execSQL("DELETE FROM issues WHERE sid=? AND id>? AND id<=? AND code=6 AND errno=116 AND operation='hardlink-metadata-changed'",
+                arrayOf<Any>(id, issueAfter, last))
+            issueAfter = last
+        }
+        var after = 0L
+        while (true) {
+            check(); val last = nodePageEnd(db, id, after, signal)
+            if (last == after) break
+            db.execSQL("""INSERT OR REPLACE INTO aggregates
+                SELECT n.sid,n.id,n.parent,n.depth,n.kind,n.name_key,n.id,
+                    CASE WHEN n.valid=1 AND n.skip=0 AND n.kind=2 THEN n.size ELSE 0 END,
+                    CASE WHEN n.valid=1 AND n.skip=0 THEN n.allocated ELSE 0 END,
+                    CASE WHEN n.valid=1 AND n.skip=0 AND n.kind=2 THEN n.size ELSE 0 END,
+                    CASE WHEN n.valid=1 AND n.skip=0 THEN n.allocated ELSE 0 END,n.complete
+                FROM nodes n LEFT JOIN aggregates a ON a.sid=n.sid AND a.id=n.id
+                WHERE n.sid=? AND n.id>? AND n.id<=? AND (a.id IS NULL OR
+                    (a.parent,a.depth,a.kind,a.name_key,a.owner,a.own_logical,a.own_allocated,a.logical,a.allocated,a.complete)<>
+                    (n.parent,n.depth,n.kind,n.name_key,n.id,
+                    CASE WHEN n.valid=1 AND n.skip=0 AND n.kind=2 THEN n.size ELSE 0 END,
+                    CASE WHEN n.valid=1 AND n.skip=0 THEN n.allocated ELSE 0 END,
+                    CASE WHEN n.valid=1 AND n.skip=0 AND n.kind=2 THEN n.size ELSE 0 END,
+                    CASE WHEN n.valid=1 AND n.skip=0 THEN n.allocated ELSE 0 END,n.complete))""", arrayOf<Any>(id, after, last))
+            after = last
+        }
+        point(RebuildPoint.INITIALIZED); check()
+        val batch: ((SQLiteDatabase) -> Unit) -> Unit = { operation -> check(); operation(db); check() }
+        if (finalizePolicy.sparseOwners) collectSharedOwners(db, id, signal, check, batch) else collectAllOwners(db, id, signal, check, batch)
+        point(RebuildPoint.OWNERS_COLLECTED); check()
+        applyOwners(db, id, signal, check, batch)
+        point(RebuildPoint.OWNERS_APPLIED); check()
+        aggregate(db, id, signal, check, cancellableReads = true, batch = batch)
+        point(RebuildPoint.AGGREGATED); check()
     }
 
     fun finalize(id: String, summary: StreamSummary, signal: CancellationSignal = CancellationSignal(), cancelled: () -> Boolean): JSONObject {
@@ -461,7 +578,7 @@ internal class IndexStore(context: Context, filename: String = "scan-index.db", 
         transaction(id) { it.execSQL("UPDATE sessions SET phase='aggregating' WHERE id=?", arrayOf(id)) }
         val dedupMillis = android.os.SystemClock.elapsedRealtime() - start
         val initializeStart = System.nanoTime()
-        applyOwners(db, id, summary.nodes, signal, ::check)
+        applyOwners(db, id, signal, ::check)
         val initializeMillis = android.os.SystemClock.elapsedRealtime() - start - dedupMillis
         val aggregateStart = System.nanoTime()
         aggregate(db, id, signal, ::check)

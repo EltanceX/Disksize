@@ -5,6 +5,7 @@ plugins {
 }
 
 val scanBenchmark = providers.gradleProperty("disksizeBenchmark").orNull == "true"
+val rescanTestHost = providers.gradleProperty("disksizeRescanTestHost").orNull == "true"
 
 android {
     namespace = "com.example.disksize"
@@ -38,6 +39,7 @@ android {
         targetSdk = 36
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         buildConfigField("boolean", "SCAN_BENCHMARK", "false")
+        buildConfigField("boolean", "RESCAN_TEST_HOST", "false")
         ndk {
             abiFilters += listOf("arm64-v8a", "x86_64")
         }
@@ -56,6 +58,9 @@ android {
     }
 
     buildTypes {
+        debug {
+            if (rescanTestHost) buildConfigField("boolean", "RESCAN_TEST_HOST", "true")
+        }
         named("profile") {
             if (scanBenchmark) {
                 buildConfigField("boolean", "SCAN_BENCHMARK", "true")

@@ -18,6 +18,8 @@ class TreemapPanel extends StatefulWidget {
     required this.onOpen,
     this.onDoubleTapOpen,
     this.onOpenExternal,
+    this.onRescan,
+    this.selectedId,
     required this.onDetail,
     required this.onShowList,
     required this.depth,
@@ -30,6 +32,8 @@ class TreemapPanel extends StatefulWidget {
   final ValueChanged<IndexedEntry> onOpen, onDetail;
   final ValueChanged<IndexedEntry>? onDoubleTapOpen;
   final Future<void> Function(IndexedEntry)? onOpenExternal;
+  final ValueChanged<IndexedEntry>? onRescan;
+  final int? selectedId;
   final ValueChanged<int> onShowList;
   @override
   State<TreemapPanel> createState() => _TreemapPanelState();
@@ -40,13 +44,22 @@ class _TreemapPanelState extends State<TreemapPanel> {
   int? _tapId;
 
   @override
+  void initState() {
+    super.initState();
+    _selected = widget.selectedId;
+  }
+
+  @override
   void didUpdateWidget(TreemapPanel oldWidget) {
     super.didUpdateWidget(oldWidget);
+    if (oldWidget.selectedId != widget.selectedId) {
+      _selected = widget.selectedId;
+    }
     if (oldWidget.page.revision != widget.page.revision ||
         oldWidget.directory.entry.id != widget.directory.entry.id ||
         oldWidget.allocated != widget.allocated ||
         oldWidget.depth != widget.depth) {
-      _selected = null;
+      _selected = widget.selectedId;
       _tapId = null;
     }
   }
@@ -242,6 +255,13 @@ class _TreemapPanelState extends State<TreemapPanel> {
                     ExternalOpenButton(
                       key: const Key('treemap-open-external'),
                       onOpen: () => widget.onOpenExternal!(selected),
+                    ),
+                  if (selected.kind == 'directory' && widget.onRescan != null)
+                    OutlinedButton.icon(
+                      key: const Key('treemap-rescan'),
+                      onPressed: () => widget.onRescan!(selected),
+                      icon: const Icon(Icons.manage_search),
+                      label: const Text('重新扫描此文件夹'),
                     ),
                 ],
               ),

@@ -1,6 +1,7 @@
 import 'dart:convert';
 
 import 'generated/scanner_api.g.dart';
+import 'snapshot_client.dart';
 
 enum IndexQueryKind {
   session,
@@ -10,6 +11,7 @@ enum IndexQueryKind {
   issues,
   ancestors,
   treemap,
+  locate,
 }
 
 enum IndexSort { logical, allocated, name }
@@ -24,12 +26,16 @@ final class IndexRequest {
     this.limit = 100,
     this.depth = 3,
     this.cursor,
+    this.expectedRevision,
+    this.pathHex,
   });
   final String sessionId;
   final IndexQueryKind kind;
   final int parentId, nodeId, limit, depth;
   final IndexSort sort;
   final String? cursor;
+  final int? expectedRevision;
+  final String? pathHex;
 
   Map<String, Object?> toJson() => {
     'sessionId': sessionId,
@@ -40,6 +46,8 @@ final class IndexRequest {
     'limit': limit,
     if (kind == IndexQueryKind.treemap) 'depth': depth,
     'cursor': cursor ?? '',
+    if (expectedRevision != null) 'expectedRevision': expectedRevision,
+    if (pathHex != null) 'pathHex': pathHex,
   };
 }
 
@@ -116,6 +124,7 @@ final class IndexPage {
       issueCount = value['issueCount'] as int? ?? 0,
       nextCursor = value['nextCursor'] as String?,
       previousCursor = value['previousCursor'] as String?,
+      pathMatched = value['pathMatched'] as bool? ?? false,
       session = IndexSession.fromJson(value),
       ancestors = List.unmodifiable(
         (value['ancestors'] as List? ?? []).map(
@@ -141,6 +150,7 @@ final class IndexPage {
   final String status, state, phase;
   final int revision, nodeCount, issueCount;
   final bool provisional;
+  final bool pathMatched;
   final String? nextCursor, previousCursor;
   final IndexSession session;
   final List<IndexAncestor> ancestors;
@@ -232,14 +242,83 @@ final class IndexSession {
       nodeCount = value['nodeCount'] as int? ?? 0,
       issueCount = value['issueCount'] as int? ?? 0,
       provisional = value['provisional'] as bool? ?? true,
+      snapshotId = value['snapshotId'] as String?,
+      retained = value['retained'] as bool? ?? false,
+      localUpdate = SnapshotLocalUpdate.fromMetadata(value),
+      latestRescanTaskId = value['latestRescanTaskId'] as String?,
       volume = VolumeStats.fromJson(
         value['volume'] as Map<String, dynamic>? ?? {},
       );
   final String id, rootPath, backend, state, phase, reason;
   final int startedAtMillis, endedAtMillis, nodeCount, issueCount;
   final bool provisional;
+  final String? snapshotId, latestRescanTaskId;
+  final bool retained;
+  final SnapshotLocalUpdate localUpdate;
   final VolumeStats volume;
   bool get active => state == 'running' || state == 'finalizing';
+}
+
+/// Resolve raw names in bounded chunks. A missing suffix returns the nearest
+/// surviving ancestor; no decoded display name is ever used as query input.
+Future<IndexPage> locateIndexedPath(
+  IndexClient client,
+  String sessionId,
+  String pathHex,
+  int revision,
+) async {
+  final components = <String>[];
+  var start = 0;
+  for (var i = 0; i < pathHex.length; i += 2) {
+    if (pathHex.substring(i, i + 2) == '2f') {
+      components.add(pathHex.substring(start, i));
+      start = i + 2;
+    }
+  }
+  if (pathHex.isNotEmpty) components.add(pathHex.substring(start));
+  var parent = 1;
+  var offset = 0;
+  while (true) {
+    final chunk = <String>[];
+    var size = 0;
+    while (offset < components.length &&
+        size + components[offset].length + (chunk.isEmpty ? 0 : 2) <= 5400) {
+      final component = components[offset++];
+      size += component.length + (chunk.isEmpty ? 0 : 2);
+      chunk.add(component);
+    }
+    if (chunk.isEmpty && offset < components.length) {
+      throw const FormatException('Invalid indexed path component');
+    }
+    final page = await client.query(
+      IndexRequest(
+        sessionId: sessionId,
+        kind: IndexQueryKind.locate,
+        parentId: parent,
+        pathHex: chunk.join('2f'),
+        expectedRevision: revision,
+      ),
+    );
+    if (page.status != 'ok' ||
+        !page.pathMatched ||
+        offset == components.length) {
+      return page;
+    }
+    if (page.detail?.entry.kind != 'directory') {
+      // Including the next component proves the old directory is now a file;
+      // the server then returns its surviving directory ancestor.
+      return client.query(
+        IndexRequest(
+          sessionId: sessionId,
+          kind: IndexQueryKind.locate,
+          parentId: parent,
+          pathHex: [...chunk, components[offset]].join('2f'),
+          expectedRevision: revision,
+        ),
+      );
+    }
+    parent = page.detail!.entry.id;
+  }
 }
 
 abstract interface class IndexClient {

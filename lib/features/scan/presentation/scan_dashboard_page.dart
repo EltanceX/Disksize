@@ -258,12 +258,20 @@ class _ScanDashboardPageState extends State<ScanDashboardPage>
           ),
         ],
       ),
-      body: Align(
-        alignment: Alignment.topCenter,
-        child: ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 760),
-          child: ListView(
-            padding: const EdgeInsets.fromLTRB(20, 12, 20, 32),
+      body: LayoutBuilder(
+        builder: (context, constraints) {
+          // Keep the centered content width while allowing drags in both margins.
+          final horizontalPadding =
+              20 +
+              ((constraints.maxWidth - 760) / 2).clamp(0.0, double.infinity);
+          return ListView(
+            key: const Key('dashboard-scroll'),
+            padding: EdgeInsets.fromLTRB(
+              horizontalPadding,
+              12,
+              horizontalPadding,
+              32,
+            ),
             children: [
               Text('扫描设备空间', style: text.headlineMedium),
               const SizedBox(height: 8),
@@ -666,8 +674,8 @@ class _ScanDashboardPageState extends State<ScanDashboardPage>
                   child: Text(_libraryError!),
                 ),
             ],
-          ),
-        ),
+          );
+        },
       ),
     );
   }

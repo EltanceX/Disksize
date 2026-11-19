@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "before": {
+    "directories": ["", "a", "a/replaced", "a-", "a2", "outside", "empty"],
+    "symlinks": {"a/link": "../outside/keep"},
+    "owners": {},
+    "logical": {
+      "": 65,
+      "a": 17,
+      "a/change": 3,
+      "a/deleted": 5,
+      "a/link": 0,
+      "a/replaced": 2,
+      "a/replaced/old": 2,
+      "a/shared": 7,
+      "a-": 11,
+      "a-/keep": 11,
+      "a2": 13,
+      "a2/keep": 13,
+      "empty": 0,
+      "outside": 24,
+      "outside/keep": 17,
+      "outside/shared": 7
+    }
+  },
+  "after": {
+    "directories": ["", "a", "a-", "a2", "outside", "empty"],
+    "symlinks": {"a/link": "../outside/keep"},
+    "owners": {},
+    "logical": {
+      "": 80,
+      "a": 32,
+      "a/change": 9,
+      "a/link": 0,
+      "a/new": 19,
+      "a/replaced": 4,
+      "a-": 11,
+      "a-/keep": 11,
+      "a2": 13,
+      "a2/keep": 13,
+      "empty": 0,
+      "outside": 24,
+      "outside/keep": 17,
+      "outside/shared": 7
+    }
+  }
+}

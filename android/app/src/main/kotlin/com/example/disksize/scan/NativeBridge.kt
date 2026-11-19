@@ -29,6 +29,7 @@ internal object NativeBridge {
     private external fun nativeAbi(): String
     private external fun nativeRuntimeInfo(): LongArray
     external fun nativeCreateScan(rootPath: ByteArray): Long
+    external fun nativeCreateSubtreeScan(rootPath: ByteArray, relativePath: ByteArray, identities: LongArray, filesystem: Long): Long
     external fun nativeRunScan(handle: Long, observer: NativeScanObserver): String
     external fun nativeRunScanToPipe(handle: Long, outputFd: Int, sessionId: ByteArray)
     external fun nativeStreamScan(handle: Long, outputFd: Int, sessionId: ByteArray, pipeline: Int)

@@ -11,7 +11,6 @@ import android.util.AtomicFile
 import android.util.Base64
 import androidx.test.platform.app.InstrumentationRegistry
 import com.example.disksize.BuildConfig
-import com.example.disksize.MainActivity
 import com.example.disksize.root.RootBackend
 import com.example.disksize.scan.BenchmarkStorage
 import com.example.disksize.scan.CoordinatorConnection
@@ -105,7 +104,7 @@ class ScanPerformanceTest {
             return
         }
         require(action == "scan")
-        val mode = requireNotNull(args.getString("mode")).also { require(it in setOf("A", "B", "C", "Replay")) }
+        val mode = requireNotNull(args.getString("mode")).also { require(it in setOf("A", "B", "C", "Replay", "Interaction")) }
         val policy = args.getString("importVariant")?.let(ImportPolicy::benchmark) ?: ImportPolicy.DEFAULT
         val finalizer = args.getString("finalizeVariant")?.let(FinalizePolicy::benchmark) ?: FinalizePolicy.DEFAULT
         val pipeline = args.getString("pipelineVariant")?.let(ScanPipeline::benchmark) ?: ScanPipeline.OPTIMIZED
@@ -121,6 +120,7 @@ class ScanPerformanceTest {
         require(!live || (backend == "root" && mode == "C" && args.getString("allowLiveAppData") == "true"))
         require(view != "emulated-direct" || backend == "root")
         require(mode != "Replay" || (backend == "ordinary" && view == "internal"))
+        require(mode != "Interaction" || (view == "internal" && size == 100_000))
         val target = when {
             live -> "/data/data"
             mode == "Replay" -> null
@@ -132,9 +132,10 @@ class ScanPerformanceTest {
         val result = when (mode) {
             "C" -> complete(checkNotNull(target), view, backend, policy, finalizer, pipeline)
             "Replay" -> replay(checkNotNull(recipe), policy, finalizer)
+            "Interaction" -> interaction(checkNotNull(target), backend, policy, finalizer, pipeline)
             else -> stream(checkNotNull(target), backend, mode, pipeline, measureMetadata)
         }
-        if (mode == "C" || mode == "Replay") {
+        if (mode in setOf("C", "Replay", "Interaction")) {
             val timings = result.getJSONObject("performance")
             check(timings.getJSONObject("consumer").getString("importVariant") == policy.name)
             check(timings.getJSONObject("finalize").getString("variant") == finalizer.wireName)
@@ -158,7 +159,7 @@ class ScanPerformanceTest {
             check(result.getString("state") == state && result.getLong("issues") == issues) {
                 "Fixed fixture did not complete"
             }
-            if (mode == "C") check(result.getBoolean("complete"))
+            if (mode == "C" || mode == "Interaction") check(result.getBoolean("complete"))
             check(result.getLong("nodes") == size + 1L && result.getLong("logicalBytes") == (recipe?.logical ?: 0L))
             if (recipe != null) check(result.getLong("allocatedBytes") == recipe.allocated)
             val kinds = result.getJSONObject("nodesByKind")
@@ -266,15 +267,31 @@ class ScanPerformanceTest {
         return try { action(handle) } finally { NativeBridge.nativeReleaseScan(handle) }
     }
 
-    private fun complete(path: String, view: String, backend: String, policy: ImportPolicy,
-        finalizer: FinalizePolicy, pipeline: ScanPipeline): JSONObject {
+    private fun configureService(policy: ImportPolicy, finalizer: FinalizePolicy, pipeline: ScanPipeline): File {
         clearIndex()
         val storage = BenchmarkStorage.context(context).noBackupFilesDir
         File(storage, BenchmarkStorage.IMPORT_VARIANT).writeText(policy.name)
         File(storage, BenchmarkStorage.FINALIZE_VARIANT).writeText(finalizer.wireName)
         File(storage, BenchmarkStorage.PIPELINE_VARIANT).writeText(pipeline.wireName)
-        context.startActivity(Intent(context, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-        test.waitForIdleSync()
+        test.openBenchmarkActivity()
+        return storage
+    }
+
+    private fun startScan(remote: IScanCoordinator, path: String, source: String): String {
+        val id = remote.prepareScan(path, source)
+        try {
+            context.startForegroundService(Intent(context, CoordinatorService::class.java)
+                .setAction(CoordinatorService.ACTION_START).putExtra(CoordinatorService.EXTRA_SESSION, id))
+        } catch (error: Throwable) {
+            remote.cancelScan(id)
+            throw error
+        }
+        return id
+    }
+
+    private fun complete(path: String, view: String, backend: String, policy: ImportPolicy,
+        finalizer: FinalizePolicy, pipeline: ScanPipeline): JSONObject {
+        val storage = configureService(policy, finalizer, pipeline)
         val connect = System.nanoTime()
         CoordinatorConnection(context).use { connection ->
             val remote = runBlocking { withTimeout(10_000) { connection.getService() } }
@@ -287,11 +304,9 @@ class ScanPerformanceTest {
             val rootMicros = if (backend == "root") micros(rootStart) else null
             val started = System.nanoTime()
             val source = if (backend == "root") "root" else if (view == "fuse") "external-own" else "own"
-            val id = remote.prepareScan(path, source)
+            val id = startScan(remote, path, source)
             val result = try {
-                context.startForegroundService(Intent(context, CoordinatorService::class.java)
-                    .setAction(CoordinatorService.ACTION_START).putExtra(CoordinatorService.EXTRA_SESSION, id))
-                terminal(remote, id)
+                terminal(remote, id, timeoutMillis = if (view == "live-app-data") 1_800_000 else 600_000)
             } catch (error: Throwable) {
                 remote.cancelScan(id)
                 throw error
@@ -301,6 +316,7 @@ class ScanPerformanceTest {
             check(performance.getString("pipelineVariant") == pipeline.wireName)
             val servicePid = result.getInt("servicePid")
             val scannerPid = result.getInt("scannerPid")
+            check(result.getInt("serviceUid") == Process.myUid() && ((scannerPid != servicePid) == (backend == "root")))
             val query = JSONObject().put("sessionId", id).put("kind", "large-files").put("limit", 100).toString()
             val queryStart = System.nanoTime()
             val first = JSONObject(remote.queryIndex(query))
@@ -324,6 +340,13 @@ class ScanPerformanceTest {
                     headRows.getJSONObject(99).getLong("id") > tailRows.getJSONObject(0).getLong("id"))
                 time
             } else null
+            val directoryQuery = JSONObject().put("sessionId", id).put("kind", "children")
+                .put("parentId", 1).put("limit", 100).toString()
+            val directoryStart = System.nanoTime()
+            val directory = JSONObject(remote.queryIndex(directoryQuery))
+            val directoryMicros = micros(directoryStart)
+            check(directory.getString("status") == "ok" && !directory.getBoolean("provisional"))
+            if (view != "live-app-data") check(directory.getJSONArray("entries").length() == 100)
             return JSONObject().put("state", result.getString("state")).put("complete", result.getBoolean("complete"))
                 .put("nodes", result.getLong("nodeCount")).put("issues", result.getLong("issueCount"))
                 .put("logicalBytes", result.getLong("logicalBytes")).put("allocatedBytes", result.getLong("allocatedBytes"))
@@ -335,20 +358,154 @@ class ScanPerformanceTest {
                 .put("nodesByKind", performance.getJSONObject("producer").getJSONObject("nodesByKind"))
                 .put("performance", performance).put("elapsedMicros", performance.getJSONObject("publication").getLong("prepareToPublishMicros"))
                 .put("clientObservedMicros", observed).put("firstPageMicros", queryMicros).put("lastPageMicros", tailMicros)
+                .put("directoryPageMicros", directoryMicros)
                 .put("coordinatorBindMicros", connectMicros).put("rootReadyMicros", rootMicros)
                 .put("databaseBytes", File(storage, BenchmarkStorage.INDEX).length())
                 .put("walBytes", File(storage, BenchmarkStorage.INDEX + "-wal").length())
         }
     }
 
-    private fun terminal(remote: IScanCoordinator, id: String): JSONObject {
-        val deadline = SystemClock.elapsedRealtime() + 1_800_000
-        while (SystemClock.elapsedRealtime() < deadline) {
-            val value = JSONObject(remote.scanSnapshot)
-            if (value.optString("sessionId") == id && !value.getBoolean("active")) return value
-            SystemClock.sleep(50)
+    private fun interaction(path: String, backend: String, policy: ImportPolicy, finalizer: FinalizePolicy,
+        pipeline: ScanPipeline): JSONObject {
+        configureService(policy, finalizer, pipeline)
+        val file = File(path, "d0/f0")
+        check(file.isFile && file.length() == 0L)
+        return CoordinatorConnection(context).use { connection ->
+            val remote = runBlocking { withTimeout(10_000) { connection.getService() } }
+            val source = if (backend == "root") {
+                remote.requestRootAccess()
+                rootReady { remote.rootStatus }
+                "root"
+            } else "own"
+            fun query(kind: String, vararg fields: Pair<String, Any>): JSONObject {
+                val request = JSONObject().put("kind", kind)
+                fields.forEach { request.put(it.first, it.second) }
+                return JSONObject(remote.queryIndex(request.toString()))
+            }
+            val id = startScan(remote, path, source)
+            val activePage: JSONObject
+            val activeMicros: Long
+            val activeNodes: Long
+            val cancelled: JSONObject
+            val cancelMicros: Long
+            try {
+                val deadline = SystemClock.elapsedRealtime() + 15_000
+                var scan: JSONObject
+                do {
+                    scan = JSONObject(remote.scanSnapshot)
+                    if (scan.optString("sessionId") == id && scan.optLong("nodeCount") >= 4096) break
+                    check(SystemClock.elapsedRealtime() < deadline) { "No progress observed before cancellation" }
+                    SystemClock.sleep(10)
+                } while (true)
+                check(scan.getBoolean("active") && scan.getLong("nodeCount") < size + 1L)
+                activeNodes = scan.getLong("nodeCount")
+                val queryStart = System.nanoTime()
+                activePage = query("children", "sessionId" to id, "parentId" to 1, "limit" to 100)
+                activeMicros = micros(queryStart)
+                val cancelStart = System.nanoTime()
+                remote.cancelScan(id)
+                cancelled = terminal(remote, id, timeoutMillis = 15_000, pollMillis = 10)
+                cancelMicros = micros(cancelStart)
+            } finally {
+                remote.cancelScan(id)
+            }
+            check(activePage.getString("status") in setOf("ok", "stale-cursor"))
+            if (activePage.getString("status") == "ok") {
+                check(activePage.getBoolean("provisional") && activePage.getJSONArray("entries").length() > 0)
+            }
+            check(cancelled.getString("state") == "cancelled" && cancelled.getBoolean("provisional"))
+            val listed = query("snapshot-list")
+            check(listed.getString("status") == "ok" && listed.getJSONArray("snapshots").length() == 0)
+
+            fun capture(logical: Long): JSONObject {
+                // Capture is untimed. Start each dataSync service from a renewed foreground task.
+                test.returnToBenchmarkActivity()
+                val session = startScan(remote, path, source)
+                val result = try { terminal(remote, session) } catch (error: Throwable) {
+                    remote.cancelScan(session)
+                    throw error
+                }
+                check(result.getString("state") == "completed" && result.getBoolean("complete") &&
+                    result.getLong("logicalBytes") == logical && result.getLong("nodeCount") == size + 1L &&
+                    result.getLong("issueCount") == 0L && result.getLong("openFdsAtFinish") == 0L &&
+                    result.getInt("serviceUid") == Process.myUid()) {
+                    "Expected complete snapshot with $logical logical bytes: state=${result.optString("state")}, " +
+                        "reason=${result.optString("reason")}, nodes=${result.optLong("nodeCount")}, " +
+                        "issues=${result.optLong("issueCount")}, logical=${result.optLong("logicalBytes")}"
+                }
+                val perf = result.getJSONObject("performance")
+                check(perf.getString("pipelineVariant") == pipeline.wireName &&
+                    perf.getJSONObject("consumer").getString("importVariant") == policy.name &&
+                    perf.getJSONObject("finalize").getString("variant") == finalizer.wireName)
+                return result
+            }
+            val before = capture(0)
+            val beforeId = before.getString("sessionId")
+            check(query("snapshot-retain", "snapshotId" to beforeId, "retained" to true).getString("status") == "ok")
+            val after = try {
+                file.writeBytes(byteArrayOf(1))
+                capture(1)
+            } finally {
+                file.writeBytes(byteArrayOf())
+            }
+            val afterId = after.getString("sessionId")
+            fun compare() = query("snapshot-compare", "baseId" to beforeId, "targetId" to afterId, "limit" to 50)
+            val start = System.nanoTime()
+            var comparison = compare()
+            var calls = 1
+            // Requests synchronously advance the build, without client sleep between batches.
+            while (comparison.getString("status") == "building" && calls < 10_000) {
+                comparison = compare()
+                calls++
+            }
+            val buildMicros = micros(start)
+            check(comparison.getString("status") == "ok" && calls > 1 && comparison.getLong("logicalDelta") == 1L)
+            val entries = comparison.getJSONArray("entries")
+            val changedPaths = (0 until entries.length()).map {
+                val change = entries.getJSONObject(it)
+                check(change.getString("status") == "changed" && change.getLong("logicalDelta") == 1L)
+                change.getString("pathHex")
+            }.toSet()
+            check(entries.length() == 2 && changedPaths == setOf("d0".toByteArray().hex(), "d0/f0".toByteArray().hex()))
+            val cachedStart = System.nanoTime()
+            val cached = compare()
+            val cachedMicros = micros(cachedStart)
+            check(cached.getString("status") == "ok" && cached.getLong("logicalDelta") == 1L &&
+                cached.getJSONArray("entries").toString() == entries.toString())
+            val history = query("snapshot-list").getJSONArray("snapshots")
+            check(history.length() == 2 && (0 until history.length()).all {
+                val snapshot = history.getJSONObject(it)
+                snapshot.getBoolean("available") && snapshot.getLong("estimatedStorageBytes") > 0 &&
+                    snapshot.getBoolean("retained") == (snapshot.getString("id") == beforeId)
+            })
+            // Report counts and volumes of the unchanged pair member for across-strategy verification.
+            JSONObject().put("state", before.getString("state")).put("complete", before.getBoolean("complete"))
+                .put("nodes", before.getLong("nodeCount")).put("issues", before.getLong("issueCount"))
+                .put("logicalBytes", before.getLong("logicalBytes")).put("allocatedBytes", before.getLong("allocatedBytes"))
+                .put("scannerUid", before.getInt("scannerUid")).put("filesystemMagic", before.getLong("rootFilesystemType"))
+                .put("mountId", before.getLong("rootMountId")).put("openFdsAtFinish", before.getLong("openFdsAtFinish"))
+                .put("nodesByKind", before.getJSONObject("performance").getJSONObject("producer").getJSONObject("nodesByKind"))
+                .put("performance", before.getJSONObject("performance"))
+                .put("activeNodesAtQuery", activeNodes).put("activePageStatus", activePage.getString("status"))
+                .put("activeDirectoryMicros", activeMicros).put("cancelToTerminalMicros", cancelMicros)
+                .put("comparisonBuildMicros", buildMicros).put("comparisonCalls", calls)
+                .put("comparisonCachedPageMicros", cachedMicros).put("comparisonDeltaBytes", 1)
+                .put("elapsedMicros", buildMicros)
         }
-        error("Scan timed out")
+    }
+
+    private fun terminal(remote: IScanCoordinator, id: String, timeoutMillis: Long = 600_000,
+        pollMillis: Long = 50): JSONObject {
+        val deadline = SystemClock.elapsedRealtime() + timeoutMillis
+        var value: JSONObject
+        do {
+            value = JSONObject(remote.scanSnapshot)
+            if (value.optString("sessionId") == id && !value.getBoolean("active")) return value
+            SystemClock.sleep(pollMillis)
+        } while (SystemClock.elapsedRealtime() < deadline)
+        error("Scan timed out after ${timeoutMillis}ms: matchedSession=${value.optString("sessionId") == id}, " +
+            "state=${value.optString("state")}, active=${value.optBoolean("active")}, " +
+            "nodes=${value.optLong("nodeCount", -1)}")
     }
 
     private fun rootReady(read: () -> String): JSONObject {

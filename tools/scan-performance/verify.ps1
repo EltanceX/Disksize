@@ -1,7 +1,7 @@
 param(
     [Parameter(Mandatory)][ValidatePattern('^[A-Za-z0-9._:-]+$')][string]$Serial,
     [ValidateSet('Smoke','Baseline','Custom')][string]$Suite = 'Smoke',
-    [ValidateSet('A','B','C','Replay')][string[]]$Mode = @('A','B','C','Replay'),
+    [ValidateSet('A','B','C','Replay','Interaction')][string[]]$Mode = @('A','B','C','Replay'),
     [ValidateSet('ordinary','root')][string]$Backend = 'ordinary',
     [ValidateSet('internal','fuse','emulated-direct')][string]$View = 'internal',
     [ValidateSet(10000,100000,1000000)][int]$Size = 10000,
@@ -16,6 +16,7 @@ param(
     [switch]$RootInstall,
     [switch]$SampleResources,
     [switch]$MeasureMetadata,
+    [switch]$CompareOverall,
     [switch]$LiveAppData
 )
 $ErrorActionPreference = 'Stop'
@@ -132,6 +133,30 @@ function Read-Battery {
 function New-Group([string]$Name, [int]$Entries, [string]$Location, [string[]]$Cases, [int]$Count, [int]$Warm) {
     return @{ name = $Name; size = $Entries; location = $Location; cases = $Cases; repeats = $Count; warmups = $Warm }
 }
+function Get-OverallCases([string]$Target, [string]$ModeName) {
+    # Keep the two variants adjacent in the case list before round rotation.
+    switch ($ModeName) {
+        'Replay' {
+            "$Target/Replay/256-eager-list/baseline"
+            "$Target/Replay"
+        }
+        { $_ -in 'C','Interaction' } {
+            "$Target/$ModeName/256-eager-list/baseline/baseline"
+            "$Target/$ModeName///optimized"
+        }
+        default {
+            "$Target/$ModeName///baseline"
+            "$Target/$ModeName///optimized"
+        }
+    }
+}
+function Get-Range([long[]]$Values) {
+    $sorted = @($Values | Sort-Object)
+    $middle = [int][Math]::Floor($sorted.Count / 2)
+    [ordered]@{ samples = $sorted.Count; minMicros = $sorted[0]
+        medianMicros = if ($sorted.Count % 2 -eq 0) { ($sorted[$middle - 1] + $sorted[$middle]) / 2 } else { $sorted[$middle] }
+        maxMicros = $sorted[-1] }
+}
 function Run-Group([hashtable]$Group) {
     $id = [Guid]::NewGuid().ToString()
     $common = @{ fixture = $id; location = $Group.location; size = $Group.size }
@@ -168,7 +193,7 @@ function Run-Group([hashtable]$Group) {
             $value.warmup = $warm
             $value.batteryBefore = $battery
             $value.batteryAfter = Read-Battery
-            $value.entriesPerSecond = if ($value.elapsedMicros -gt 0) {
+            $value.entriesPerSecond = if ($modeName -ne 'Interaction' -and $value.elapsedMicros -gt 0) {
                 [Math]::Round($value.nodes * 1e6 / $value.elapsedMicros, 2)
             } else { $null }
             Write-Json $value "$namePart.json"
@@ -180,7 +205,11 @@ function Run-Group([hashtable]$Group) {
                 $digests[$recipe] = $value.resultSha256
             }
             if ($pipeline) {
-                $boundary = if ($modeName -eq 'C') { 'finalized' } else { 'before-dedup' }
+                $boundary = switch ($modeName) {
+                    'C' { 'finalized' }
+                    'Interaction' { 'interaction' }
+                    default { 'before-dedup' }
+                }
                 $comparison = "$source/$surface/$boundary"
                 $result = (@($value.state, $value.complete, $value.nodes, $value.issues, $value.logicalBytes,
                     $value.allocatedBytes, $value.reportedAllocatedBeforeDedupBytes, $value.maxDepth,
@@ -203,15 +232,24 @@ function Run-Group([hashtable]$Group) {
 function Write-Summary {
     $summary = @($records | Where-Object { -not $_.warmup } |
         Group-Object group, mode, backend, view, importVariant, finalizeVariant, pipelineVariant | ForEach-Object {
-            $samples = @($_.Group.elapsedMicros | Sort-Object)
-            $n = $samples.Count
-            $first = $_.Group[0]
-            $median = if ($n % 2 -eq 0) { ($samples[$n / 2 - 1] + $samples[$n / 2]) / 2 } else { $samples[[int][Math]::Floor($n / 2)] }
-            [ordered]@{ group = $first.group; mode = $first.mode; backend = $first.backend; view = $first.view
+            $runs = $_.Group
+            $first = $runs[0]
+            $range = Get-Range $runs.elapsedMicros
+            $report = [ordered]@{ group = $first.group; mode = $first.mode; backend = $first.backend; view = $first.view
                 importVariant = $first.importVariant; finalizeVariant = $first.finalizeVariant
                 pipelineVariant = $first.pipelineVariant
-                nodes = $first.nodes; samples = $n; minMicros = $samples[0]
-                medianMicros = $median; maxMicros = $samples[-1] }
+                nodes = $first.nodes; samples = $range.samples; minMicros = $range.minMicros
+                medianMicros = $range.medianMicros; maxMicros = $range.maxMicros }
+            if ($CompareOverall) {
+                $queries = [ordered]@{}
+                foreach ($key in 'firstPageMicros','lastPageMicros','directoryPageMicros','activeDirectoryMicros',
+                    'cancelToTerminalMicros','comparisonBuildMicros','comparisonCachedPageMicros') {
+                    $values = @($runs | ForEach-Object { $_[$key] } | Where-Object { $null -ne $_ })
+                    if ($values.Count -gt 0) { $queries[$key] = Get-Range $values }
+                }
+                if ($queries.Count -gt 0) { $report.queryTimings = $queries }
+            }
+            $report
         })
     Write-Json $summary 'summary.json'
 }
@@ -248,6 +286,13 @@ try {
     if ($MeasureMetadata -and ($Suite -ne 'Custom' -or $Mode.Count -ne 1 -or $Mode[0] -ne 'A')) {
         throw 'Use -MeasureMetadata with -Suite Custom -Mode A.'
     }
+    if ($CompareOverall -and ($Suite -ne 'Custom' -or $ImportVariant -or $FinalizeVariant -or $PipelineVariant -or
+        $LiveAppData -or $MeasureMetadata)) {
+        throw 'Use -CompareOverall with -Suite Custom on a fixed fixture, without other strategy or metadata timing switches.'
+    }
+    if ('Interaction' -in $Mode -and ($Suite -ne 'Custom' -or -not $CompareOverall -or $View -ne 'internal' -or $Size -ne 100000)) {
+        throw 'Use Interaction with -Suite Custom -CompareOverall -View internal -Size 100000.'
+    }
     if ($ReplayFixture -ne 'empty' -and ($Suite -ne 'Custom' -or 'Replay' -notin $Mode)) {
         throw 'Use -ReplayFixture with -Suite Custom and mode Replay.'
     }
@@ -282,7 +327,7 @@ try {
         replayFixture = $ReplayFixture
         clockTicksPerSecond = (Invoke-Adb @('shell','getconf','CLK_TCK'))
         cache = 'warmup rounds; no cache flush; new app process and fresh benchmark DB each case'
-        sampled = [bool]$SampleResources; measuredMetadata = [bool]$MeasureMetadata
+        sampled = [bool]$SampleResources; measuredMetadata = [bool]$MeasureMetadata; compareOverall = [bool]$CompareOverall
     }) 'environment.json'
     $runChangedApp = $true
     Install-App $app
@@ -304,10 +349,16 @@ try {
     } elseif ($Suite -eq 'Custom') {
         $Backend = $Backend.ToLowerInvariant()
         $View = $View.ToLowerInvariant()
-        $Mode = @($Mode | ForEach-Object { if ($_ -eq 'Replay') { 'Replay' } else { $_.ToUpperInvariant() } })
+        $Mode = @($Mode | ForEach-Object {
+            if ($_ -eq 'Replay') { 'Replay' }
+            elseif ($_ -eq 'Interaction') { 'Interaction' }
+            else { $_.ToUpperInvariant() }
+        })
         $location = if ($View -eq 'internal') { 'internal' } else { 'external' }
         $cases = foreach ($modeName in $Mode) {
-            if ($PipelineVariant) {
+            if ($CompareOverall) {
+                Get-OverallCases "$Backend/$View" $modeName
+            } elseif ($PipelineVariant) {
                 foreach ($pipeline in $PipelineVariant) { "$Backend/$View/$modeName///$($pipeline.ToLowerInvariant())" }
             } elseif ($FinalizeVariant) {
                 $variant = if ($ImportVariant) { $ImportVariant[0].ToLowerInvariant() } else { '' }

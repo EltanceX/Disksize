@@ -57,3 +57,13 @@ flutter test
 验证日志及截图保存在本机 `.local/phase6/` 与 `.local/phase6-*.log`，均不提交。16 KiB 页真机、其他 Android API、其他 root 管理器的运行矩阵继续留在阶段 9；本阶段没有重新声称这些环境已实测。
 
 后续已在目录和大文件详情中添加“使用其他应用打开”，支持系统文件管理器及兼容查看器；当前路径、临时授权与 Root 限制见[功能说明](external-open.md)。
+
+## 2026-11-19：主菜单与目录滚动
+
+主菜单的滚动视口扩展到页面全宽，内容仍按原来的 760 像素上限居中排列。左右留白及窄屏边缘均可上下滑动页面。
+
+空间浏览的目录行点击复用树图双击下钻的滚动保持逻辑：加载期间保留原内容高度，完成后恢复同一滚动偏移；新目录内容不足时收敛到有效范围。迟到的目录响应不会覆盖已执行的返回导航。
+
+`flutter analyze` 无问题，Flutter 全量 99 项测试通过，新增覆盖两侧滑动、手机/宽屏、大字体、较短目录/不可用目录及加载中返回。普通双 ABI Profile 构建、native 优化审计和 Android lint 通过（0 错误、8 条现有警告）。已覆盖安装并冷启动，安装前后正常库/WAL/journal 指纹一致。
+
+设备 APK SHA-256：`aa6c9f00c1662f4c3ce6302ebaa7bca2eb3abb5b48223c55bc42942dbe64bc65`。日志见 `.local/scroll-behavior-flutter-20261119-01.jsonl`、`.local/scroll-behavior-analyze-20261119-01.log` 和 `.local/scroll-behavior-delivery-20261119-01/`。

@@ -41,6 +41,7 @@ internal class RootBackend(private val context: Context) : AutoCloseable {
     private var bound = false
     private var closed = false
     private var currentRead: ParcelFileDescriptor? = null
+    private var currentId: String? = null
     private val client = Binder()
     @Volatile var status = JSONObject().put("state", "not-requested").toString()
         private set
@@ -110,19 +111,30 @@ internal class RootBackend(private val context: Context) : AutoCloseable {
     }
 
     fun run(id: String, root: String, writer: IndexConsumer, pipeline: ScanPipeline = ScanPipeline.OPTIMIZED,
+        progress: (Long, Long, Long) -> Unit): StreamSummary =
+        runPipe(id, root.toByteArray(Charsets.UTF_8), null, null, 0, writer, pipeline, { false }, progress)
+
+    fun runSubtree(id: String, root: ByteArray, relative: ByteArray, identities: LongArray, filesystem: Long,
+        writer: IndexConsumer, cancelled: () -> Boolean, progress: (Long, Long, Long) -> Unit): StreamSummary =
+        runPipe(id, root, relative, identities, filesystem, writer, ScanPipeline.OPTIMIZED, cancelled, progress)
+
+    private fun runPipe(id: String, path: ByteArray, relative: ByteArray?, identities: LongArray?, filesystem: Long,
+        writer: IndexConsumer, pipeline: ScanPipeline, cancelled: () -> Boolean,
         progress: (Long, Long, Long) -> Unit): StreamSummary {
         val service: IRootScanner
         val pid: Int
         val pipe = ParcelFileDescriptor.createPipe()
         synchronized(lock) {
             if (!ready() || closed) { pipe.forEach { it.close() }; throw RootFailure("root-unavailable") }
-            service = remote!!; pid = JSONObject(status).getInt("pid"); currentRead = pipe[0]
+            service = remote!!; pid = JSONObject(status).getInt("pid"); currentRead = pipe[0]; currentId = id
         }
         try {
-            val path = root.toByteArray(Charsets.UTF_8)
-            if (pipeline == ScanPipeline.OPTIMIZED) service.start(id, path, pipe[1], client)
+            if (cancelled()) throw RootFailure("cancelled-before-root-start")
+            if (relative != null) service.startSubtree(id, path, relative, requireNotNull(identities), filesystem, pipe[1], client)
+            else if (pipeline == ScanPipeline.OPTIMIZED) service.start(id, path, pipe[1], client)
             else service.startBenchmark(id, path, pipe[1], client, pipeline.nativeCode)
             pipe[1].close() // Binder owns an independent writer descriptor.
+            if (cancelled()) { cancel(id); throw RootFailure("cancelled-after-root-start") }
             return ParcelFileDescriptor.AutoCloseInputStream(pipe[0]).use {
                 IndexProtocol.read(it, id, 0, pid, writer, pipeline.reuseBuffers, progress)
             }
@@ -133,12 +145,19 @@ internal class RootBackend(private val context: Context) : AutoCloseable {
             throw RootFailure("root-pipe-or-protocol-failure", error)
         } finally {
             pipe.forEach { try { it.close() } catch (_: Exception) { } }
-            synchronized(lock) { currentRead = null }
+            synchronized(lock) { currentRead = null; currentId = null }
+            if (relative != null && service.asBinder().isBinderAlive) try {
+                if (!service.awaitIdle(id, 5000)) throw RootFailure("root-stop-timeout")
+            } catch (error: android.os.RemoteException) { throw RootFailure("root-process-died", error) }
         }
     }
 
     fun cancel(id: String) {
-        val service = synchronized(lock) { if (closed) return; remote } ?: return
+        val service = synchronized(lock) {
+            if (closed) return
+            if (currentId == id) try { currentRead?.close() } catch (_: Exception) { }
+            remote
+        } ?: return
         try { executor.execute { try { service.cancel(id) } catch (_: Exception) { } } }
         catch (_: RejectedExecutionException) { /* Service destruction already closed the pipe. */ }
     }

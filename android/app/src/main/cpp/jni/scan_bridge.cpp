@@ -130,6 +130,35 @@ Java_com_example_disksize_scan_NativeBridge_nativeCancelScan(JNIEnv* env, jobjec
     catch (...) { fail(env, "Unknown native scan"); }
 }
 
+extern "C" JNIEXPORT jlong JNICALL
+Java_com_example_disksize_scan_NativeBridge_nativeCreateSubtreeScan(
+    JNIEnv* env, jobject self, jbyteArray root, jbyteArray relative, jlongArray identities, jlong filesystem) {
+    jlong handle = 0;
+    try {
+        const auto length = env->GetArrayLength(relative), count = env->GetArrayLength(identities);
+        if (length > 512 * 256 || count < 3 || count > 513 * 3 || count % 3 != 0 || filesystem == 0)
+            throw std::invalid_argument("Invalid subtree scope");
+        handle = Java_com_example_disksize_scan_NativeBridge_nativeCreateScan(env, self, root);
+        if (env->ExceptionCheck()) return 0;
+        const auto session = session_for(handle);
+        disksize::SubtreeScope scope;
+        scope.relative_path.resize(length);
+        env->GetByteArrayRegion(relative, 0, length, reinterpret_cast<jbyte*>(scope.relative_path.data()));
+        std::vector<jlong> fields(count);
+        env->GetLongArrayRegion(identities, 0, count, fields.data());
+        if (env->ExceptionCheck()) throw std::runtime_error("Unable to read subtree scope");
+        for (int i = 0; i < count; i += 3) scope.chain.push_back({static_cast<std::uint64_t>(fields[i]),
+            static_cast<std::uint64_t>(fields[i + 1]), static_cast<std::uint64_t>(fields[i + 2])});
+        scope.filesystem = filesystem;
+        session->configuration.max_depth = 512 - (count / 3 - 1);
+        session->configuration.subtree = std::move(scope);
+        return handle;
+    } catch (...) {
+        if (handle) { std::lock_guard lock(sessions_mutex); sessions.erase(handle); }
+        fail(env, "Unable to create subtree scan"); return 0;
+    }
+}
+
 extern "C" JNIEXPORT void JNICALL
 Java_com_example_disksize_scan_NativeBridge_nativeReleaseScan(JNIEnv*, jobject, jlong handle) {
     std::lock_guard lock(sessions_mutex);

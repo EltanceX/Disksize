@@ -1,6 +1,6 @@
 # 扫描性能基准
 
-首次优化构建的真机结果见[基线报告](../../docs/scan-performance-baseline.md)，批量提交的对照见[导入改进报告](../../docs/scan-performance-import.md)。
+首次优化构建的真机结果见[基线报告](../../docs/scan-performance-baseline.md)，各项改动合并后的结果见[整体验收](../../docs/scan-performance-acceptance.md)。
 
 在已安装开发版 DiskSize 的测试设备上运行。需要 PowerShell 7、项目的 Android 开发环境和 ADB 调试。Root 用例需要开发包已有 Root 授权；`-RootInstall` 和 `-SampleResources` 另需要 ADB shell 已有 Root 权限。两者不更改 Root 管理器策略。
 
@@ -47,14 +47,26 @@
 
 `-MeasureMetadata` 仅模式 A 可用。`namedMetadata` 统计按目录 FD 和名称发起的 `fstatat`、`statx` 次数与各自累计耗时，以及需打开 `O_PATH` 再确认挂载的回退次数和耗时。不含根目录、打开的目录 FD 核验或结束检查；回退内部调用合在 `fdFallbackMicros`。此选项增加逐项计时，应单独运行，不与无诊断的吞吐结果混算。
 
+`-CompareOverall` 在同一构建、同一固定样本上比较优化前后的组合策略。C 和 Interaction 的对照使用 `256-eager-list` 和两项 `baseline`，候选使用 `4096-eager-list` 和两项 `optimized`。A/B 只切换流水线策略，Replay 只切换导入与最终处理策略。该开关不能和单项策略开关、`-MeasureMetadata` 或 `-LiveAppData` 一起使用。
+
+```powershell
+./tools/scan-performance/verify.ps1 -Serial '<device-id>' -Suite Custom -CompareOverall `
+  -Size 100000 -Mode A,B,C -Warmups 1 -Repeats 3 -RootInstall
+./tools/scan-performance/verify.ps1 -Serial '<device-id>' -Suite Custom -CompareOverall `
+  -Size 100000 -Mode Interaction -Warmups 1 -Repeats 3 -RootInstall
+```
+
 | 模式 | 实际执行 | 主计时 `elapsedMicros` |
 | --- | --- | --- |
 | A | APK 中的 `stream_directory`，回调仅累加 kind、深度和原始容量；无 pipe/SQLite | native 核心经过时间 |
 | B | 同一核心、v4 帧、真实 pipe、原有严格解码和有界计数消费者 | 后端派发至完整流校验、关闭 |
-| C | 真实 Binder → 前台 `CoordinatorService` → native pipe → SQLite 去重/聚合 → journal；固定样本验证大文件首末页 | 测量契约中的 `prepareToPublishMicros` |
+| C | 真实 Binder → 前台 `CoordinatorService` → native pipe → SQLite 去重/聚合 → journal；验证目录首页及固定样本的大文件首末页 | 测量契约中的 `prepareToPublishMicros` |
 | Replay | 以固定顺序生成合成节点/目录关闭事件，直接调用真实 `IndexStore.Import`/`finalize` | 开库、生成/写入事件、聚合及预览；没有文件遍历、pipe 或 journal |
+| Interaction | 仅限 100,001 节点内部树。导入途中查询目录并取消，验证不发布快照；再改变一个文件，核对两次扫描的快照、增长对比及缓存结果 | 连续请求直到对比结果就绪，含首页，不含两次扫描 |
 
 A、B 的容量是去重之前的原始统计；C 是最终快照统计。Replay 的事件顺序、inode、容量及路径名固定，不捕获真实路径，且不模拟生产者进度带来的额外提前提交。真实与合成样本都按 `empty-tree-v1` 配方生成，报告用 `recipeSha256` 标识配方并核对节点类型计数、容量和完整性；这不是扫描所有文件内容所得的哈希。
+
+Interaction 另记录 `activeDirectoryMicros`、`activeNodesAtQuery`、`activePageStatus`、`cancelToTerminalMicros` 和 `comparisonCachedPageMicros`。取消从 Binder 调用前计到客户端轮询到终态，含最多一轮 10 ms 的轮询间隔（系统调度可再延后）。查询和对比计时含 Binder 与 JSON 处理，不含 Flutter 绘制；运行中若 revision 已改变，记录为 `stale-cursor`。两次不计时的快照采集各自从重新进入前台的应用启动，不测试前一轮结束后立即重启前台服务。`-CompareOverall` 会把查询和取消的中位数与范围写入 `summary.json` 的 `queryTimings`。
 
 ## 构建与输出
 
@@ -66,7 +78,7 @@ A、B 的容量是去重之前的原始统计；C 是最终快照统计。Replay
 
 `-SampleResources` 可独立开启约每秒的 Linux 进程采样，记录 CPU ticks、RSS/HWM/PSS、打开的 FD 数和 PID 启动 ticks，并读取独立基准库主库与 WAL 的文件长度。按设备时间窗和 `(PID, start_ticks)` 关联，ticks 除以 `clockTicksPerSecond` 得到样点间的 CPU 秒。同一时刻不同进程行的库文件长度相同；应取最大值而非相加，采样峰值是下界。空列表示未取到样本；短用例可能没有两个样点，不可填零或据此推算 CPU 百分比。采样会影响负载，应和无采样运行分开报告。没有主动清空页面缓存，预热后仍可能受内存回收和温度变化影响。
 
-测试样本只在带归属标记的 app 私有目录和 app 专属外部目录生成与删除。FUSE 与直达对照使用同一批外部样本，通过 `/storage/emulated/<user>` 和其 Root 可见的 `/data/media/<user>` 入口分别扫描，核对各自的文件系统 magic。完整链路与回放使用设备保护存储中的独立基准数据库和日志，每次试验前重建，避免已保留快照大小影响结果。运行期间需要用基准 APK 覆盖安装开发包；脚本先检查普通扫描是否正在运行，保留已安装 APK，在结束或失败时恢复。不会卸载应用或清理原库。
+测试样本只在带归属标记的 app 私有目录和 app 专属外部目录生成与删除。FUSE 与直达对照使用同一批外部样本，通过 `/storage/emulated/<user>` 和其 Root 可见的 `/data/media/<user>` 入口分别扫描，核对各自的文件系统 magic。完整链路与回放使用设备保护存储中的独立基准数据库和日志，每次试验前重建，避免已保留快照大小影响结果。运行期间需要用基准 APK 覆盖安装开发包；脚本先检查普通扫描是否正在运行，保留已安装 APK，在结束或失败时恢复。不会卸载应用或清理原库。请保持测试设备解锁，不要在 C 或 Interaction 运行时切换应用；工具仅在测试窗口可见期间保持亮屏，不更改设备电源设置。
 
 真实 `/data/data` 仅通过以下显式选项单独运行，它采集应用元数据且允许 Partial；不会加入固定树汇总：
 
@@ -75,4 +87,4 @@ A、B 的容量是去重之前的原始统计；C 是最终快照统计。Replay
   -Mode C -Backend root -LiveAppData -Repeats 1 -Warmups 0 -RootInstall
 ```
 
-此报告不输出真实应用路径列表。若主机进程被强制结束，自动恢复可能来不及执行；原安装包在本次目录的 `restore-app.apk`，可通过现有覆盖安装工具恢复。清理测试目录前需要核对对应的本次归属标记。
+此报告不输出真实应用路径列表。若固定树扫描超时，日志会记录最后观察到的会话是否匹配、状态、活动标志和节点数。异常中止时 `summary.json` 可能只有部分成功样本，需核对每组 `samples` 和失败日志，不能当作完整批次。若主机进程被强制结束，自动恢复可能来不及执行；原安装包在本次目录的 `restore-app.apk`，可通过现有覆盖安装工具恢复。清理测试目录前需要核对对应的本次归属标记。

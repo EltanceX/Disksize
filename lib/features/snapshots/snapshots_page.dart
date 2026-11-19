@@ -5,6 +5,8 @@ import '../../platform/snapshot_client.dart';
 import '../explorer/explorer_format.dart';
 import '../explorer/explorer_page.dart';
 import 'snapshot_comparison_page.dart';
+import 'local_update_summary.dart';
+import '../../platform/snapshot_rescan_client.dart';
 
 class SnapshotsPage extends StatefulWidget {
   const SnapshotsPage({
@@ -12,15 +14,18 @@ class SnapshotsPage extends StatefulWidget {
     required this.client,
     required this.indexClient,
     this.initialBase,
+    this.rescanClient,
   });
   final SnapshotClient client;
   final IndexClient indexClient;
   final String? initialBase;
+  final SnapshotRescanClient? rescanClient;
   @override
   State<SnapshotsPage> createState() => _SnapshotsPageState();
 }
 
-class _SnapshotsPageState extends State<SnapshotsPage> {
+class _SnapshotsPageState extends State<SnapshotsPage>
+    with WidgetsBindingObserver {
   SnapshotList? _page;
   DiskSnapshot? _base;
   bool _busy = true;
@@ -34,7 +39,55 @@ class _SnapshotsPageState extends State<SnapshotsPage> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _load();
+  }
+
+  bool _backgrounded = false;
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.hidden) {
+      _backgrounded = true;
+    }
+    if (state == AppLifecycleState.resumed && _backgrounded) {
+      _backgrounded = false;
+      if (!_deleting) _load();
+    }
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  Future<void> _browse(DiskSnapshot item) async {
+    await Navigator.push<void>(
+      context,
+      MaterialPageRoute(
+        builder: (_) => ExplorerPage(
+          client: widget.indexClient,
+          sessionId: item.id,
+          rescanClient: widget.rescanClient,
+        ),
+      ),
+    );
+    if (mounted) await _load();
+  }
+
+  Future<void> _compare(DiskSnapshot item) async {
+    await Navigator.push<void>(
+      context,
+      MaterialPageRoute(
+        builder: (_) => SnapshotComparisonPage(
+          client: widget.client,
+          baseId: _base!.id,
+          targetId: item.id,
+        ),
+      ),
+    );
+    if (mounted) await _load();
   }
 
   Future<void> _load({String? cursor}) async {
@@ -228,7 +281,7 @@ class _SnapshotsPageState extends State<SnapshotsPage> {
                 padding: const EdgeInsets.all(16),
                 children: [
                   const Text(
-                    '完成及部分完成的扫描会自动保存为快照。保留标记可防止误删；取消保留后才能删除。扫描记录反映一段时间内的观察，并非文件系统原子快照。',
+                    '完成及部分完成的扫描会自动保存为快照。保留标记保护删除和局部重扫；取消保留后才能修改。扫描记录反映一段时间内的观察，并非文件系统原子快照。',
                   ),
                   const Text('快照大小为本地保存记录的估算占用；删除后空间可复用，不代表立即释放的空间。'),
                   if (!_selecting)
@@ -337,6 +390,10 @@ class _SnapshotsPageState extends State<SnapshotsPage> {
                             Text(
                               '${formatTime(item.started)} → ${formatTime(item.ended)}',
                             ),
+                            LocalUpdateSummary(
+                              update: item.localUpdate,
+                              revision: item.revision,
+                            ),
                             Text(
                               '逻辑 ${formatBytes(item.logical)} · 报告占用 ${formatBytes(item.allocated)}${item.complete ? '' : '（已知量）'}',
                             ),
@@ -364,31 +421,13 @@ class _SnapshotsPageState extends State<SnapshotsPage> {
                                             _base?.id == item.id ||
                                             !item.available
                                         ? null
-                                        : () => Navigator.push(
-                                            context,
-                                            MaterialPageRoute<void>(
-                                              builder: (_) =>
-                                                  SnapshotComparisonPage(
-                                                    client: widget.client,
-                                                    baseId: _base!.id,
-                                                    targetId: item.id,
-                                                  ),
-                                            ),
-                                          ),
+                                        : () => _compare(item),
                                     child: const Text('作为新快照对比'),
                                   ),
                                   TextButton(
-                                    onPressed: _busy
+                                    onPressed: _busy || !item.available
                                         ? null
-                                        : () => Navigator.push(
-                                            context,
-                                            MaterialPageRoute<void>(
-                                              builder: (_) => ExplorerPage(
-                                                client: widget.indexClient,
-                                                sessionId: item.id,
-                                              ),
-                                            ),
-                                          ),
+                                        : () => _browse(item),
                                     child: const Text('浏览索引'),
                                   ),
                                   TextButton(

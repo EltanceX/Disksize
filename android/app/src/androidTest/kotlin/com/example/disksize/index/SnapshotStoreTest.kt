@@ -252,6 +252,53 @@ class SnapshotStoreTest {
         assertEquals(10, store.preview(b).getLong("logicalBytes"))
         assertEquals(1, call(store, "snapshot-list").getJSONArray("snapshots").length())
     }
+    @Test fun deletionRestoresWriterSpillThresholdAndRollsBackAllTablesOnFailure() {
+        for (action in listOf("ABORT", "ROLLBACK")) withStore { store ->
+            val a = fixture(store, listOf(Item("file", 9)))
+            val b = fixture(store, listOf(Item("file", 10)))
+            val comparison = compare(store, a, b).getJSONArray("entries").toString()
+            val db = store.writableDatabase
+            fun writerSpill(): Long {
+                db.beginTransactionNonExclusive()
+                return try { db.compileStatement("PRAGMA cache_spill").use { it.simpleQueryForLong() } }
+                finally { db.endTransaction() }
+            }
+            // Exercise restoration of a numeric threshold whose low byte is zero.
+            db.execSQL("PRAGMA cache_spill=4096"); db.execSQL("PRAGMA cache_spill=ON")
+            val before = writerSpill()
+            assertTrue(before > 0)
+            val tables = listOf("snapshots", "sessions", "nodes", "aggregates", "issues", "hardlinks", "diff_rows", "diff_cache")
+            fun counts() = tables.associateWith { table ->
+                db.rawQuery("SELECT COUNT(*) FROM $table", null).use { it.moveToFirst(); it.getLong(0) }
+            }
+            val records = counts()
+            db.execSQL("CREATE TRIGGER fail_snapshot_delete BEFORE DELETE ON nodes WHEN OLD.sid='$a' BEGIN SELECT RAISE($action,'injected delete failure'); END")
+            try { call(store, "snapshot-delete", "snapshotId" to a); fail("Injected deletion succeeded") }
+            catch (error: android.database.sqlite.SQLiteException) { assertTrue(error.toString(), error.message!!.contains("injected delete failure")) }
+            assertEquals(before, writerSpill())
+            assertEquals(records, counts())
+            assertEquals(9, store.preview(a).getLong("logicalBytes"))
+            assertEquals(comparison, compare(store, a, b).getJSONArray("entries").toString())
+            db.execSQL("DROP TRIGGER fail_snapshot_delete")
+            assertEquals("ok", call(store, "snapshot-delete", "snapshotId" to a).getString("status"))
+            assertEquals(before, writerSpill())
+            store.close()
+            assertEquals(10, store.preview(b).getLong("logicalBytes"))
+            store.readableDatabase.rawQuery("PRAGMA integrity_check", null).use { it.moveToFirst(); assertEquals("ok", it.getString(0)) }
+            store.readableDatabase.rawQuery("PRAGMA foreign_key_check", null).use { assertFalse(it.moveToFirst()) }
+        }
+    }
+    @Test fun deletionPreservesDisabledAndAlreadyLargerSpillSettings() = withStore { store ->
+        val db = store.writableDatabase
+        for (threshold in listOf(0L, 32769L)) {
+            val id = fixture(store, listOf(Item("file", 1)))
+            db.execSQL("PRAGMA cache_spill=$threshold")
+            assertEquals("ok", call(store, "snapshot-delete", "snapshotId" to id).getString("status"))
+            db.beginTransactionNonExclusive()
+            try { assertEquals(threshold, db.compileStatement("PRAGMA cache_spill").use { it.simpleQueryForLong() }) }
+            finally { db.endTransaction() }
+        }
+    }
     @Test fun rawByteNamesRemainDistinctAndBuildRestartsAfterProcessStateLoss() = withStore { store ->
         val a = fixture(store, listOf(Item("fe", 5, raw = byteArrayOf(0xfe.toByte()))))
         val b = fixture(store, listOf(Item("ff", 3, raw = byteArrayOf(0xff.toByte())), Item("fe", 5, raw = byteArrayOf(0xfe.toByte())), Item("换行\n😀", 2)))
@@ -293,7 +340,7 @@ class SnapshotStoreTest {
                 db.execSQL("INSERT INTO snapshots VALUES(?,?,0,1,0,0,1)", arrayOf(id, id)); db.version = 3
             }
             IndexStore(context, name).use { store ->
-                assertEquals(4, store.readableDatabase.version)
+                assertEquals(IndexStore.SCHEMA_VERSION, store.readableDatabase.version)
                 val snapshot = call(store, "snapshot-list").getJSONArray("snapshots").getJSONObject(0)
                 assertEquals(id, snapshot.getString("id")); assertFalse(snapshot.getBoolean("retained"))
                 assertTrue(snapshot.getLong("estimatedStorageBytes") > 0)

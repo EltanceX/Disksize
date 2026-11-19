@@ -2,6 +2,38 @@ import 'dart:convert';
 
 import 'generated/scanner_api.g.dart';
 
+final class SnapshotLocalUpdate {
+  SnapshotLocalUpdate.fromMetadata(Map<String, dynamic> json)
+    : at = json['lastLocalUpdateAtMillis'] as int? ?? 0,
+      count = json['localUpdateCount'] as int? ?? 0,
+      pathHex =
+          (json['lastLocalUpdate'] as Map?)?['targetPathHex'] as String? ?? '',
+      pathTruncated =
+          (json['lastLocalUpdate'] as Map?)?['pathTruncated'] as bool? ?? false,
+      started =
+          (json['lastLocalUpdate'] as Map?)?['startedAtMillis'] as int? ?? 0,
+      scanned =
+          (json['lastLocalUpdate'] as Map?)?['scannedAtMillis'] as int? ?? 0,
+      ended = (json['lastLocalUpdate'] as Map?)?['endedAtMillis'] as int? ?? 0;
+  final int at, count, started, scanned, ended;
+  final String pathHex;
+  final bool pathTruncated;
+  bool get updated => count > 0;
+}
+
+final class SnapshotOperationException implements Exception {
+  const SnapshotOperationException(this.code);
+  final String code;
+  @override
+  String toString() => switch (code) {
+    'busy' => '正在扫描或应用快照更新，请等待任务结束后重试。',
+    'retained' => '请先取消保留，再修改或删除快照。',
+    'stale-cursor' => '快照内容已更新，请重新加载。',
+    'not-found' => '快照已不可用，请重新加载列表。',
+    _ => '快照操作失败（$code），请重新加载后重试。',
+  };
+}
+
 final class DiskSnapshot {
   DiskSnapshot.fromJson(Map<String, dynamic> json)
     : id = json['id'] as String,
@@ -15,7 +47,11 @@ final class DiskSnapshot {
       estimatedStorageBytes = json['estimatedStorageBytes'] as int?,
       complete = json['complete'] as bool,
       retained = json['retained'] as bool,
-      available = json['available'] as bool;
+      available = json['available'] as bool,
+      revision = json['revision'] as int? ?? 0,
+      localUpdate = SnapshotLocalUpdate.fromMetadata(json);
+  final int revision;
+  final SnapshotLocalUpdate localUpdate;
   final String id, rootPath, backend, state;
   final int started, ended, logical, allocated;
   final int? estimatedStorageBytes;
@@ -114,11 +150,7 @@ final class AndroidSnapshotClient implements SnapshotClient {
 
   void _check(Map<String, dynamic> json) {
     if (json['status'] != 'ok') {
-      throw StateError(
-        json['status'] == 'retained'
-            ? '请先取消保留再删除。'
-            : '快照操作失败（${json['status']}），请刷新。',
-      );
+      throw SnapshotOperationException(json['status'] as String);
     }
   }
 

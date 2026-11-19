@@ -1,14 +1,19 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../../platform/index_client.dart';
 import '../../platform/entry_opener.dart';
 import '../../platform/scan_client.dart';
+import '../../platform/snapshot_rescan_client.dart';
+import '../snapshots/local_update_summary.dart';
 import 'explorer_controller.dart';
 import 'explorer_detail.dart';
 import 'explorer_format.dart';
 import 'treemap_panel.dart';
+import 'snapshot_rescan_controller.dart';
+import 'snapshot_rescan_panel.dart';
 
 class ExplorerPage extends StatefulWidget {
   const ExplorerPage({
@@ -16,10 +21,12 @@ class ExplorerPage extends StatefulWidget {
     required this.client,
     required this.sessionId,
     this.opener,
+    this.rescanClient,
   });
   final IndexClient client;
   final String sessionId;
   final EntryOpener? opener;
+  final SnapshotRescanClient? rescanClient;
   @override
   State<ExplorerPage> createState() => _ExplorerPageState();
 }
@@ -28,7 +35,13 @@ class _ExplorerPageState extends State<ExplorerPage>
     with WidgetsBindingObserver {
   late final ExplorerController c;
   late final EntryOpener _opener;
+  late final SnapshotRescanController _rescan;
   int? _selected;
+  String? _selectedPathHex, _selectionToRestore;
+  int _contentEpoch = 0;
+  String? _handledCommit;
+  bool _confirmingRescan = false;
+  ModalRoute<void>? _detailRoute;
   Timer? _poll;
   final _scroll = ScrollController();
   bool _resumed = true;
@@ -42,6 +55,9 @@ class _ExplorerPageState extends State<ExplorerPage>
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _opener = widget.opener ?? AndroidEntryOpener();
+    _rescan = SnapshotRescanController(
+      widget.rescanClient ?? AndroidSnapshotRescanClient(),
+    )..addListener(_rescanChanged);
     c = ExplorerController(widget.client, widget.sessionId)
       ..addListener(_changed);
     unawaited(c.load());
@@ -49,10 +65,208 @@ class _ExplorerPageState extends State<ExplorerPage>
 
   void _changed() {
     if (!mounted) return;
+    if (c.contentEpoch != _contentEpoch) {
+      _contentEpoch = c.contentEpoch;
+      _selectionToRestore = _selectedPathHex;
+      _selected = null;
+      _selectedPathHex = null;
+      final route = _detailRoute;
+      _detailRoute = null;
+      if (route != null && route.isActive) {
+        Navigator.of(context).removeRoute(route);
+      }
+    }
     setState(() {
       if (c.treemap && c.loading) _selected = null;
     });
+    final taskId = c.page?.session.latestRescanTaskId;
+    if (taskId != null && !c.loading && !_rescan.starting) {
+      unawaited(_rescan.attach(taskId));
+    }
+    if (!c.loading && c.page != null && _selectionToRestore != null) {
+      final path = _selectionToRestore!;
+      _selectionToRestore = null;
+      unawaited(_restoreSelection(path, c.page!.revision));
+    }
     _schedulePoll();
+  }
+
+  void _rescanChanged() {
+    if (!mounted) return;
+    setState(() {});
+    final task = _rescan.task;
+    if (task?.committedRevision != null && _handledCommit != task!.id) {
+      _handledCommit = task.id;
+      if (c.page?.revision != task.committedRevision) {
+        unawaited(c.reloadAfterUpdate());
+      }
+    }
+  }
+
+  Future<void> _restoreSelection(String path, int revision) async {
+    final epoch = c.contentEpoch;
+    final navigation = _navigation;
+    final directory = c.directoryId;
+    try {
+      final result = await locateIndexedPath(
+        widget.client,
+        widget.sessionId,
+        path,
+        revision,
+      );
+      if (!mounted ||
+          epoch != c.contentEpoch ||
+          navigation != _navigation ||
+          directory != c.directoryId ||
+          c.page?.revision != revision ||
+          result.status != 'ok' ||
+          result.revision != revision ||
+          !result.pathMatched) {
+        return;
+      }
+      setState(() {
+        _selected = result.detail?.entry.id;
+        _selectedPathHex = path;
+      });
+    } catch (_) {
+      /* Selection is optional; the directory remains usable. */
+    }
+  }
+
+  void _select(int? id) {
+    setState(() {
+      _selected = id;
+      _selectedPathHex = null;
+    });
+    final revision = c.page?.revision;
+    if (id == null || revision == null) return;
+    unawaited(() async {
+      try {
+        final result = await widget.client.query(
+          IndexRequest(
+            sessionId: widget.sessionId,
+            kind: IndexQueryKind.detail,
+            nodeId: id,
+            expectedRevision: revision,
+          ),
+        );
+        if (mounted &&
+            _selected == id &&
+            c.page?.revision == revision &&
+            result.status == 'ok' &&
+            result.revision == revision) {
+          _selectedPathHex = result.detail?.pathHex;
+        }
+      } catch (_) {
+        /* A stale selection will be cleared on the next revision. */
+      }
+    }());
+  }
+
+  Future<void> _openEntry(int id, int revision) async {
+    final result = await widget.client.query(
+      IndexRequest(
+        sessionId: widget.sessionId,
+        kind: IndexQueryKind.detail,
+        nodeId: id,
+        expectedRevision: revision,
+      ),
+    );
+    if (!mounted ||
+        result.status != 'ok' ||
+        result.revision != revision ||
+        c.page?.revision != revision) {
+      if (mounted) unawaited(c.reloadAfterUpdate());
+      throw PlatformException(
+        code: 'entry-changed',
+        message: '索引已更新，请重新选择条目后再打开。',
+      );
+    }
+    await _opener.open(widget.sessionId, id);
+  }
+
+  bool get _canRescan =>
+      !_rescan.blocked &&
+      !_confirmingRescan &&
+      !c.loading &&
+      c.page?.session.snapshotId != null &&
+      !c.page!.provisional &&
+      !c.page!.session.retained &&
+      !c.page!.session.active;
+
+  Future<void> _startRescan(int id, int revision) async {
+    if (!_canRescan) return;
+    final snapshotId = c.page!.session.snapshotId!;
+    setState(() => _confirmingRescan = true);
+    try {
+      final target = await widget.client.query(
+        IndexRequest(
+          sessionId: widget.sessionId,
+          kind: IndexQueryKind.detail,
+          nodeId: id,
+          expectedRevision: revision,
+        ),
+      );
+      if (!mounted) return;
+      if (target.status != 'ok' ||
+          target.revision != revision ||
+          target.detail?.entry.kind != 'directory') {
+        throw const SnapshotRescanException('stale-revision');
+      }
+      final root = target.session.rootPath.replaceFirst(RegExp(r'/+$'), '');
+      final path = target.detail!.pathHex;
+      final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          key: const Key('rescan-confirmation'),
+          scrollable: true,
+          title: const Text('重新扫描此文件夹？'),
+          content: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              SelectableText(
+                '$root/${path.isEmpty ? '' : displayScanPath(path)}',
+              ),
+              const SizedBox(height: 12),
+              Text(
+                '使用原${target.session.backend == 'root' ? ' Root' : '普通'}扫描方式，包含全部后代。完整成功后更新当前快照，不新增快照；旧子树会被替换，无法撤销。',
+              ),
+              const SizedBox(height: 8),
+              const Text('扫描只读取文件元数据。提交前失败或取消保留旧结果；其余目录沿用原采集时间。'),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('返回'),
+            ),
+            FilledButton(
+              key: const Key('rescan-confirm'),
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('重新扫描并更新'),
+            ),
+          ],
+        ),
+      );
+      if (!mounted || confirmed != true) return;
+      await _rescan.start(snapshotId, id, revision);
+      // Also discover a task accepted before a bridge timeout or activity loss.
+      if (mounted) unawaited(c.resume());
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              e is SnapshotRescanException
+                  ? rescanErrorMessage(e.code)
+                  : '无法确认扫描范围，请重新加载后重试。',
+            ),
+          ),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _confirmingRescan = false);
+    }
   }
 
   void _schedulePoll() {
@@ -67,6 +281,7 @@ class _ExplorerPageState extends State<ExplorerPage>
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     _resumed = state == AppLifecycleState.resumed;
+    _rescan.setResumed(_resumed);
     if (state == AppLifecycleState.hidden ||
         state == AppLifecycleState.paused) {
       _backgrounded = true;
@@ -90,6 +305,8 @@ class _ExplorerPageState extends State<ExplorerPage>
         ? 0
         : _scroll.position.maxScrollExtent + _scroll.position.viewportDimension;
     _selected = null;
+    _selectedPathHex = null;
+    _selectionToRestore = null;
     unawaited(
       c.navigate(id).then((_) {
         if (!mounted ||
@@ -101,7 +318,7 @@ class _ExplorerPageState extends State<ExplorerPage>
           if (!mounted || navigation != _navigation) return;
           final offset = _preservedScrollOffset!;
           _preservedScrollOffset = null;
-          if (_scroll.hasClients && c.treemap && c.directoryId == id) {
+          if (_scroll.hasClients && c.directoryId == id) {
             final position = _scroll.position;
             _scroll.jumpTo(
               offset.clamp(position.minScrollExtent, position.maxScrollExtent),
@@ -119,43 +336,54 @@ class _ExplorerPageState extends State<ExplorerPage>
   }
 
   void _detail(int id, bool wide) {
-    setState(() => _selected = id);
+    _select(id);
     if (wide) return;
     unawaited(
       showModalBottomSheet<void>(
         context: context,
         isScrollControlled: true,
         useSafeArea: true,
-        builder: (sheetContext) => FractionallySizedBox(
-          heightFactor: .92,
-          child: Column(
-            children: [
-              Row(
-                children: [
-                  const SizedBox(width: 20),
-                  const Expanded(child: Text('条目详情')),
-                  IconButton(
-                    tooltip: '关闭详情',
-                    onPressed: () => Navigator.pop(sheetContext),
-                    icon: const Icon(Icons.close),
-                  ),
-                ],
-              ),
-              Expanded(
-                child: ExplorerDetail(
-                  opener: _opener,
-                  client: widget.client,
-                  sessionId: widget.sessionId,
-                  nodeId: id,
-                  onLocate: (parent) {
-                    Navigator.pop(sheetContext);
-                    _locate(parent);
-                  },
+        builder: (sheetContext) {
+          _detailRoute = ModalRoute.of<void>(sheetContext);
+          return FractionallySizedBox(
+            heightFactor: .92,
+            child: Column(
+              children: [
+                Row(
+                  children: [
+                    const SizedBox(width: 20),
+                    const Expanded(child: Text('条目详情')),
+                    IconButton(
+                      tooltip: '关闭详情',
+                      onPressed: () => Navigator.pop(sheetContext),
+                      icon: const Icon(Icons.close),
+                    ),
+                  ],
                 ),
-              ),
-            ],
-          ),
-        ),
+                Expanded(
+                  child: ExplorerDetail(
+                    opener: _opener,
+                    client: widget.client,
+                    sessionId: widget.sessionId,
+                    nodeId: id,
+                    expectedRevision: c.page?.revision,
+                    rescanEnabled: _canRescan,
+                    onRescan: c.page?.session.snapshotId == null
+                        ? null
+                        : (node, revision) {
+                            Navigator.pop(sheetContext);
+                            unawaited(_startRescan(node, revision));
+                          },
+                    onLocate: (parent) {
+                      Navigator.pop(sheetContext);
+                      _locate(parent);
+                    },
+                  ),
+                ),
+              ],
+            ),
+          );
+        },
       ),
     );
   }
@@ -164,6 +392,8 @@ class _ExplorerPageState extends State<ExplorerPage>
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _poll?.cancel();
+    _rescan.removeListener(_rescanChanged);
+    _rescan.dispose();
     c.removeListener(_changed);
     c.dispose();
     _scroll.dispose();
@@ -195,7 +425,7 @@ class _ExplorerPageState extends State<ExplorerPage>
           actions: [
             IconButton(
               key: const Key('explorer-refresh'),
-              tooltip: '刷新索引',
+              tooltip: '重新加载索引',
               onPressed: c.loading ? null : () => c.load(),
               icon: const Icon(Icons.refresh),
             ),
@@ -234,7 +464,16 @@ class _ExplorerPageState extends State<ExplorerPage>
                                     Text('结束原因：${session.reason}'),
                                   const SizedBox(height: 8),
                                   SelectableText(session.rootPath),
+                                  LocalUpdateSummary(
+                                    update: session.localUpdate,
+                                    revision: c.page?.revision,
+                                  ),
+                                  if (session.retained)
+                                    const Text('此快照已保留，取消保留后可重新扫描。'),
                                 ],
+                                if (session?.snapshotId != null)
+                                  const Text('重新加载只读取已有索引；重新扫描会读取设备目录并更新当前快照。'),
+                                SnapshotRescanPanel(controller: _rescan),
                                 SingleChildScrollView(
                                   scrollDirection: Axis.horizontal,
                                   child: Row(
@@ -290,6 +529,18 @@ class _ExplorerPageState extends State<ExplorerPage>
                                   ))
                                     Text(state),
                                   const SizedBox(height: 8),
+                                  if (session?.snapshotId != null)
+                                    OutlinedButton.icon(
+                                      key: const Key('directory-rescan'),
+                                      onPressed: _canRescan
+                                          ? () => _startRescan(
+                                              c.directoryId,
+                                              c.page!.revision,
+                                            )
+                                          : null,
+                                      icon: const Icon(Icons.manage_search),
+                                      label: const Text('重新扫描此文件夹'),
+                                    ),
                                 ],
                                 Wrap(
                                   spacing: 10,
@@ -322,6 +573,7 @@ class _ExplorerPageState extends State<ExplorerPage>
                                           ? null
                                           : (v) {
                                               _selected = null;
+                                              _selectedPathHex = null;
                                               unawaited(
                                                 v.single ==
                                                         IndexQueryKind.treemap
@@ -461,16 +713,22 @@ class _ExplorerPageState extends State<ExplorerPage>
                               directory: c.directory!,
                               allocated: c.allocated,
                               depth: c.treemapDepth,
-                              onSelect: (entry) =>
-                                  setState(() => _selected = entry?.id),
+                              selectedId: _selected,
+                              onSelect: (entry) => _select(entry?.id),
                               onOpen: (entry) => _navigate(entry.id),
                               onDoubleTapOpen: (entry) =>
                                   _navigate(entry.id, preserveScroll: true),
                               onDetail: (entry) => _detail(entry.id, wide),
                               onOpenExternal: (entry) =>
-                                  _opener.open(widget.sessionId, entry.id),
+                                  _openEntry(entry.id, c.page!.revision),
+                              onRescan: _canRescan
+                                  ? (entry) => unawaited(
+                                      _startRescan(entry.id, c.page!.revision),
+                                    )
+                                  : null,
                               onShowList: (id) {
                                 _selected = null;
+                                _selectedPathHex = null;
                                 c.directoryId = id;
                                 unawaited(c.setLargeFiles(false));
                               },
@@ -515,9 +773,18 @@ class _ExplorerPageState extends State<ExplorerPage>
                                 index: i,
                                 selected: entry.id == _selected,
                                 onTap: () => entry.kind == 'directory'
-                                    ? _navigate(entry.id)
+                                    ? _navigate(entry.id, preserveScroll: true)
                                     : _detail(entry.id, wide),
                                 onDetail: () => _detail(entry.id, wide),
+                                onRescan:
+                                    _canRescan && entry.kind == 'directory'
+                                    ? () => unawaited(
+                                        _startRescan(
+                                          entry.id,
+                                          c.page!.revision,
+                                        ),
+                                      )
+                                    : null,
                               );
                             },
                           ),
@@ -542,16 +809,24 @@ class _ExplorerPageState extends State<ExplorerPage>
                   const VerticalDivider(width: 1),
                   SizedBox(
                     width: 360,
-                    child: ExplorerDetail(
-                      opener: _opener,
-                      key: ValueKey(
-                        '${_selected ?? c.directoryId}-${c.page?.revision}',
-                      ),
-                      client: widget.client,
-                      sessionId: widget.sessionId,
-                      nodeId: _selected ?? c.directoryId,
-                      onLocate: _locate,
-                    ),
+                    child: c.page == null || c.loading
+                        ? const Center(child: Text('重新加载后显示详情'))
+                        : ExplorerDetail(
+                            opener: _opener,
+                            key: ValueKey(
+                              '${_selected ?? c.directoryId}-${c.page?.revision}',
+                            ),
+                            client: widget.client,
+                            sessionId: widget.sessionId,
+                            nodeId: _selected ?? c.directoryId,
+                            expectedRevision: c.page?.revision,
+                            rescanEnabled: _canRescan,
+                            onRescan: c.page?.session.snapshotId == null
+                                ? null
+                                : (node, revision) =>
+                                      unawaited(_startRescan(node, revision)),
+                            onLocate: _locate,
+                          ),
                   ),
                 ],
               );
@@ -564,6 +839,7 @@ class _ExplorerPageState extends State<ExplorerPage>
 
   Future<void> _loadPage(String cursor, int number) async {
     _selected = null;
+    _selectedPathHex = null;
     await c.load(cursor: cursor, number: number);
     if (mounted && _scroll.hasClients) _scroll.jumpTo(0);
   }
@@ -614,12 +890,14 @@ class _EntryRow extends StatelessWidget {
     required this.selected,
     required this.onTap,
     required this.onDetail,
+    this.onRescan,
   });
   final IndexedEntry entry;
   final bool allocated, selected;
   final double? fraction;
   final int index;
   final VoidCallback onTap, onDetail;
+  final VoidCallback? onRescan;
 
   @override
   Widget build(BuildContext context) => LayoutBuilder(
@@ -730,6 +1008,15 @@ class _EntryRow extends StatelessWidget {
                   onPressed: onDetail,
                   icon: const Icon(Icons.info_outline, size: 20),
                 ),
+                if (onRescan != null)
+                  PopupMenuButton<String>(
+                    key: ValueKey('entry-menu-${entry.id}'),
+                    tooltip: '目录操作',
+                    onSelected: (_) => onRescan!(),
+                    itemBuilder: (_) => const [
+                      PopupMenuItem(value: 'rescan', child: Text('重新扫描此文件夹')),
+                    ],
+                  ),
                 if (entry.kind == 'directory')
                   const Padding(
                     padding: EdgeInsets.only(top: 12, right: 4),

@@ -6,10 +6,12 @@ import android.os.SystemClock
 import android.util.Log
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
+import com.example.disksize.BuildConfig
 import com.example.disksize.MainActivity
 import com.example.disksize.scan.CoordinatorConnection
 import com.example.disksize.scan.CoordinatorService
 import com.example.disksize.scan.ipc.IScanCoordinator
+import com.topjohnwu.superuser.Shell
 import kotlinx.coroutines.runBlocking
 import org.json.JSONObject
 import org.junit.Assert.*
@@ -24,8 +26,12 @@ import java.util.UUID
 class IndexDeviceTest {
     private val context get() = InstrumentationRegistry.getInstrumentation().targetContext
     private fun service(): Pair<CoordinatorConnection, IScanCoordinator> {
-        context.startActivity(Intent(context, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-        SystemClock.sleep(1200)
+        if (BuildConfig.SCAN_BENCHMARK) {
+            InstrumentationRegistry.getInstrumentation().openBenchmarkActivity()
+        } else {
+            context.startActivity(Intent(context, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            SystemClock.sleep(1200)
+        }
         val connection = CoordinatorConnection(context)
         return connection to runBlocking { connection.getService() }
     }
@@ -137,6 +143,57 @@ class IndexDeviceTest {
             assertPerformance(result)
         } finally { connection.close(); fixture.deleteRecursively() }
     }
+
+    @Test fun rootProducerDeathKeepsProvisionalIndexAndAllowsReconnect() {
+        val args = InstrumentationRegistry.getArguments()
+        assumeTrue(BuildConfig.SCAN_BENCHMARK && args.getString("scanAcceptanceRootDeath") == "true")
+        val fixture = File(context.filesDir, "scan-acceptance-root-${UUID.randomUUID()}")
+        check(fixture.mkdir())
+        val (connection, remote) = service()
+        try {
+            repeat(100) { d ->
+                val dir = File(fixture, "d$d"); check(dir.mkdir())
+                repeat(200) { check(File(dir, "f$it").createNewFile()) }
+            }
+            root(remote)
+            val pid = JSONObject(remote.rootStatus).getInt("pid")
+            check(pid > 1)
+            val shell = Shell.getShell()
+            check(shell.isRoot)
+            var killed = false
+            val interrupted = scan(remote, fixture.path, "root") { active ->
+                if (!killed && active.getBoolean("active") && active.getLong("nodeCount") > 256) {
+                    check(active.getInt("scannerPid") == pid && active.getInt("scannerUid") == 0)
+                    val command = """
+                        name=${'$'}(tr '\000' '\n' </proc/$pid/cmdline | head -n 1)
+                        case "${'$'}name" in
+                          '${context.packageName}:root:'*)
+                            grep -Eq '^Uid:[[:space:]]+0[[:space:]]+0[[:space:]]+0[[:space:]]+0${'$'}' /proc/$pid/status &&
+                              kill -KILL $pid ;;
+                          *) false ;;
+                        esac
+                    """.trimIndent()
+                    check(shell.newJob().add(command).exec().isSuccess) { "Could not signal the verified test scanner" }
+                    killed = true
+                }
+            }
+            assertTrue("Did not reach active Root import", killed)
+            assertEquals("interrupted", interrupted.getString("state"))
+            assertTrue(interrupted.getBoolean("provisional"))
+            val id = interrupted.getString("sessionId")
+            val session = JSONObject(remote.queryIndex(JSONObject().put("kind", "session").put("sessionId", id).toString()))
+            assertEquals("interrupted", session.getString("state"))
+            assertTrue(session.getBoolean("provisional"))
+            val snapshots = JSONObject(remote.queryIndex("""{"kind":"snapshot-list"}""")).getJSONArray("snapshots")
+            assertTrue((0 until snapshots.length()).none { snapshots.getJSONObject(it).getString("id") == id })
+            root(remote)
+            val recovered = scan(remote, fixture.path, "root")
+            assertEquals("completed", recovered.getString("state"))
+            assertEquals(20_101, recovered.getLong("nodeCount"))
+            assertEquals(0, recovered.getLong("openFdsAtFinish"))
+        } finally { connection.close(); fixture.deleteRecursively() }
+    }
+
     @Test fun rootBaselineUsesOrdinaryUidIndex() {
         assumeTrue(InstrumentationRegistry.getArguments().getString("phase5Root") == "true")
         val (connection, remote) = service()

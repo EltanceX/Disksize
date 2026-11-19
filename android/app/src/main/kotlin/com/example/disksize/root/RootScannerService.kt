@@ -21,6 +21,8 @@ import java.io.File
 import java.nio.ByteBuffer
 import java.util.UUID
 import java.util.concurrent.Executors
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 // This process never opens the app's journal, database, export or cache paths.
 // A normal (non-daemon) libsu service dies with its ordinary coordinator client.
@@ -34,6 +36,7 @@ class RootScannerService : RootService() {
     private inner class Job(val id: String, val fd: ParcelFileDescriptor, val client: IBinder) {
         var handle = 0L
         var cancelled = false
+        val done = CountDownLatch(1)
         val death = IBinder.DeathRecipient { synchronized(lock) { stop(this) } }
     }
 
@@ -85,20 +88,26 @@ class RootScannerService : RootService() {
         override fun startBenchmark(sessionId: String, rootPath: ByteArray, output: ParcelFileDescriptor,
             client: IBinder, pipeline: Int) = startScan(sessionId, rootPath, output, client, pipeline)
 
+        override fun startSubtree(taskId: String, rootPath: ByteArray, relativePath: ByteArray, identities: LongArray,
+            filesystem: Long, output: ParcelFileDescriptor, client: IBinder) =
+            startScan(taskId, rootPath, output, client, null, Triple(relativePath, identities, filesystem))
+
         private fun startScan(sessionId: String, rootPath: ByteArray, output: ParcelFileDescriptor,
-            client: IBinder, benchmarkPipeline: Int?) {
+            client: IBinder, benchmarkPipeline: Int?, scope: Triple<ByteArray, LongArray, Long>? = null) {
             try {
                 authorize()
                 val pipeline = benchmarkPipeline?.let(ScanPipeline::benchmark) ?: ScanPipeline.OPTIMIZED
                 UUID.fromString(sessionId)
                 require(rootPath.isNotEmpty() && rootPath.size <= 4096 && rootPath[0] == '/'.code.toByte() && !rootPath.contains(0))
+                scope?.let { require(it.first.size <= 512 * 256 && it.second.size in 3..513 * 3 && it.second.size % 3 == 0 && it.third != 0L) }
                 val job = synchronized(lock) {
                     check(!destroyed && active == null) { "Root scan already active" }
                     Job(sessionId, output, client).also { it.client.linkToDeath(it.death, 0); active = it }
                 }
                 worker.execute {
                     try {
-                        val handle = NativeBridge.nativeCreateScan(rootPath)
+                        val handle = if (scope == null) NativeBridge.nativeCreateScan(rootPath) else
+                            NativeBridge.nativeCreateSubtreeScan(rootPath, scope.first, scope.second, scope.third)
                         synchronized(lock) { job.handle = handle; if (job.cancelled) NativeBridge.nativeCancelScan(handle) }
                         val uuid = UUID.fromString(sessionId)
                         val bytes = ByteBuffer.allocate(16).putLong(uuid.mostSignificantBits).putLong(uuid.leastSignificantBits).array()
@@ -109,9 +118,8 @@ class RootScannerService : RootService() {
                         synchronized(lock) {
                             if (job.handle != 0L) NativeBridge.nativeReleaseScan(job.handle)
                             job.handle = 0
-                            job.client.unlinkToDeath(job.death, 0)
-                            job.fd.close()
-                            if (active === job) active = null
+                            try { job.client.unlinkToDeath(job.death, 0); job.fd.close() }
+                            finally { if (active === job) active = null; job.done.countDown() }
                         }
                     }
                 }
@@ -121,6 +129,12 @@ class RootScannerService : RootService() {
         override fun cancel(sessionId: String) {
             authorize()
             synchronized(lock) { active?.takeIf { it.id == sessionId }?.let { stop(it) } }
+        }
+
+        override fun awaitIdle(taskId: String, timeoutMillis: Long): Boolean {
+            authorize(); require(timeoutMillis in 0..5000)
+            val job = synchronized(lock) { active?.takeIf { it.id == taskId } } ?: return true
+            return job.done.await(timeoutMillis, TimeUnit.MILLISECONDS)
         }
 
         override fun benchmarkTraversal(rootPath: ByteArray, pipeline: Int, measureMetadata: Boolean): LongArray {

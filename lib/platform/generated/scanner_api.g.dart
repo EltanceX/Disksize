@@ -1053,6 +1053,70 @@ class ScannerHostApi {
     return pigeonVar_replyValue! as String;
   }
 
+  Future<String> startSnapshotRescan(
+    String snapshotId,
+    int nodeId,
+    int expectedRevision,
+  ) async {
+    final pigeonVar_channelName =
+        'dev.flutter.pigeon.disksize.ScannerHostApi.startSnapshotRescan$pigeonVar_messageChannelSuffix';
+    final pigeonVar_channel = BasicMessageChannel<Object?>(
+      pigeonVar_channelName,
+      pigeonChannelCodec,
+      binaryMessenger: pigeonVar_binaryMessenger,
+    );
+    final Future<Object?> pigeonVar_sendFuture = pigeonVar_channel.send(
+      <Object?>[snapshotId, nodeId, expectedRevision],
+    );
+    final pigeonVar_replyList = await pigeonVar_sendFuture as List<Object?>?;
+    final Object? pigeonVar_replyValue = _extractReplyValueOrThrow(
+      pigeonVar_replyList,
+      pigeonVar_channelName,
+      isNullValid: false,
+    );
+    return pigeonVar_replyValue! as String;
+  }
+
+  Future<String> getSnapshotRescan(String taskId) async {
+    final pigeonVar_channelName =
+        'dev.flutter.pigeon.disksize.ScannerHostApi.getSnapshotRescan$pigeonVar_messageChannelSuffix';
+    final pigeonVar_channel = BasicMessageChannel<Object?>(
+      pigeonVar_channelName,
+      pigeonChannelCodec,
+      binaryMessenger: pigeonVar_binaryMessenger,
+    );
+    final Future<Object?> pigeonVar_sendFuture = pigeonVar_channel.send(
+      <Object?>[taskId],
+    );
+    final pigeonVar_replyList = await pigeonVar_sendFuture as List<Object?>?;
+    final Object? pigeonVar_replyValue = _extractReplyValueOrThrow(
+      pigeonVar_replyList,
+      pigeonVar_channelName,
+      isNullValid: false,
+    );
+    return pigeonVar_replyValue! as String;
+  }
+
+  Future<String> cancelSnapshotRescan(String taskId) async {
+    final pigeonVar_channelName =
+        'dev.flutter.pigeon.disksize.ScannerHostApi.cancelSnapshotRescan$pigeonVar_messageChannelSuffix';
+    final pigeonVar_channel = BasicMessageChannel<Object?>(
+      pigeonVar_channelName,
+      pigeonChannelCodec,
+      binaryMessenger: pigeonVar_binaryMessenger,
+    );
+    final Future<Object?> pigeonVar_sendFuture = pigeonVar_channel.send(
+      <Object?>[taskId],
+    );
+    final pigeonVar_replyList = await pigeonVar_sendFuture as List<Object?>?;
+    final Object? pigeonVar_replyValue = _extractReplyValueOrThrow(
+      pigeonVar_replyList,
+      pigeonVar_channelName,
+      isNullValid: false,
+    );
+    return pigeonVar_replyValue! as String;
+  }
+
   Future<void> openIndexedEntry(String sessionId, int nodeId) async {
     final pigeonVar_channelName =
         'dev.flutter.pigeon.disksize.ScannerHostApi.openIndexedEntry$pigeonVar_messageChannelSuffix';

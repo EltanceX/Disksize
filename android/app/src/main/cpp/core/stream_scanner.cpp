@@ -1,5 +1,6 @@
 #include "core/stream_scanner.h"
 #include "core/filesystem.h"
+#include "core/subtree_scope.h"
 #include <cerrno>
 #include <chrono>
 #include <cstdlib>
@@ -45,6 +46,7 @@ public:
         : c_(c), token_(token), cb_(cb), entries_(strategy, measurements) {}
     StreamResult run() {
         try { walk(); }
+        catch (const internal::ScopeError& e) { failed_ = true; issue(nullptr, classify(e.error), e.operation, e.error); }
         catch (...) { consumer_failed_ = true; }
         // On cancellation, ancestors already discovered remain explicitly incomplete.
         while (!stack_.empty()) {
@@ -56,6 +58,7 @@ public:
             }
             stack_.pop_back();
         }
+        scope_.reset();
         auto& r = result_.scan;
         r.state = consumer_failed_ || failed_ ? SessionState::Failed : token_.requested() ? SessionState::Cancelled :
             partial_ ? SessionState::Partial : SessionState::Completed;
@@ -97,11 +100,18 @@ private:
             failed_ = true; issue(nullptr, ScanErrorCode::InvalidConfiguration, "validate-stream", EINVAL); return;
         }
         if (token_.requested()) return;
-        std::unique_ptr<char, decltype(&std::free)> path(realpath(c_.root_path.c_str(), nullptr), &std::free);
-        if (!path) { failed_ = true; issue(nullptr, classify(errno), "resolve-root", errno); return; }
         auto& r = result_.scan;
-        r.canonical_root = path.get();
-        auto root = internal::open_canonical_directory(r.canonical_root, fds_);
+        internal::Fd root;
+        if (c_.subtree) {
+            scope_ = std::make_unique<internal::ScopedRoot>(c_, fds_, token_);
+            r.canonical_root = scope_->canonical();
+            root = scope_->duplicate();
+        } else {
+            std::unique_ptr<char, decltype(&std::free)> path(realpath(c_.root_path.c_str(), nullptr), &std::free);
+            if (!path) { failed_ = true; issue(nullptr, classify(errno), "resolve-root", errno); return; }
+            r.canonical_root = path.get();
+            root = internal::open_canonical_directory(r.canonical_root, fds_);
+        }
         struct stat s{}; struct statfs fs{};
         if (!root || fstat(root.get(), &s) || fstatfs(root.get(), &fs)) {
             failed_ = true; issue(nullptr, classify(errno), "open-stat-root", errno); return;
@@ -193,10 +203,12 @@ private:
             }
             push(child, std::move(next), opened);
         }
+        if (scope_ && !token_.requested()) scope_->verify();
     }
     const ScanConfiguration& c_; CancellationToken& token_; const StreamCallbacks& cb_;
     internal::EntryReader entries_;
     StreamResult result_; internal::FdMetrics fds_; std::vector<Frame> stack_;
+    std::unique_ptr<internal::ScopedRoot> scope_;
     Clock::time_point start_ = Clock::now(), last_ = start_;
     std::uint64_t observed_ = 0;
     bool partial_ = false, failed_ = false, consumer_failed_ = false;

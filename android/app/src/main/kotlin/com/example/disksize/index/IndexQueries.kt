@@ -8,13 +8,13 @@ import org.json.JSONObject
 
 /** Bounded pages and ancestor chains; no tree or unbounded cursor history in memory. */
 internal class IndexQueries(private val store: IndexStore) {
-    fun query(request: String): String = try { execute(JSONObject(request)).toString() }
+    fun query(request: String, nonBlockingSnapshots: Boolean = false): String = try { execute(JSONObject(request), nonBlockingSnapshots).toString() }
         catch (_: IllegalArgumentException) { JSONObject().put("status", "invalid-query").toString() }
         catch (_: org.json.JSONException) { JSONObject().put("status", "invalid-query").toString() }
 
-    private fun execute(q: JSONObject): JSONObject {
+    private fun execute(q: JSONObject, nonBlockingSnapshots: Boolean): JSONObject {
         val kind = q.getString("kind")
-        if (kind.startsWith("snapshot-")) return store.snapshots.execute(q)
+        if (kind.startsWith("snapshot-")) return store.snapshots.execute(q, waitForMutation = !nonBlockingSnapshots)
         val db = store.readableDatabase
         if (kind == "recent") {
             val sessions = JSONArray()
@@ -24,7 +24,7 @@ internal class IndexQueries(private val store: IndexStore) {
             return JSONObject().put("status", "ok").put("sessions", sessions)
         }
         val id = q.getString("sessionId"); require(id.length == 36)
-        require(kind in setOf("session", "children", "large-files", "detail", "issues", "ancestors", "treemap"))
+        require(kind in setOf("session", "children", "large-files", "detail", "issues", "ancestors", "treemap", "locate"))
         val parent = q.optLong("parentId"); val node = q.optLong("nodeId")
         val sort = q.optString("sort", "logical"); require(sort in setOf("logical", "allocated", "name"))
         val limit = q.optInt("limit", 100); require(limit in 1..100 && parent >= 0 && node >= 0)
@@ -34,6 +34,7 @@ internal class IndexQueries(private val store: IndexStore) {
         require(kind != "treemap" || (sort != "name" && token.isEmpty()))
         val meta = metadata(db, id) ?: return JSONObject().put("status", "not-found")
         val revision = meta.getLong("revision")
+        if (q.has("expectedRevision") && q.getLong("expectedRevision") != revision) return meta.put("status", "stale-cursor")
         val signature = "$id|$kind|$parent|$node|$sort|$limit"
         val cursor = if (token.isEmpty()) null else JSONObject(String(Base64.decode(token, Base64.URL_SAFE or Base64.NO_WRAP), Charsets.UTF_8)).also {
             require(it.getInt("version") == 2 && it.getString("query") == signature && it.getString("direction") in setOf("after", "before"))
@@ -41,6 +42,34 @@ internal class IndexQueries(private val store: IndexStore) {
         if (cursor != null && cursor.getLong("revision") != revision) return meta.put("status", "stale-cursor")
         val result = meta.put("status", "ok").put("entries", JSONArray()).put("issues", JSONArray())
         when (kind) {
+            "locate" -> {
+                // Resolve raw components relative to a known directory. Requests stay below the
+                // bridge's 8 KiB bound even for a 512-component path by resolving in chunks.
+                val hex = q.getString("pathHex")
+                require(parent > 0 && hex.length <= 6000 && hex.length % 2 == 0 && hex.matches(Regex("[0-9a-f]*")))
+                val suffix = ByteArray(hex.length / 2) { hex.substring(it * 2, it * 2 + 2).toInt(16).toByte() }
+                if (suffix.isNotEmpty()) require(suffix.splitComponentsValid())
+                val base = db.rawQuery("SELECT path FROM nodes WHERE sid=? AND id=? AND kind=1", arrayOf(id, parent.toString())).use {
+                    if (!it.moveToFirst()) return meta.put("status", "not-found")
+                    it.getBlob(0)
+                }
+                var path = if (base.isEmpty()) suffix else if (suffix.isEmpty()) base else base + byteArrayOf(47) + suffix
+                var exact = true
+                while (true) {
+                    val found = db.rawQuery("""SELECT n.*,a.logical,a.allocated AS total_allocated,a.complete AS subtree_complete,a.owner,
+                        EXISTS(SELECT 1 FROM issues i WHERE i.sid=n.sid AND i.node=n.id AND i.code=1) AS inaccessible
+                        FROM nodes n JOIN aggregates a ON a.sid=n.sid AND a.id=n.id
+                        WHERE n.sid=? AND n.path=X'${path.hex()}'""", arrayOf(id)).use {
+                        if (!it.moveToFirst() || (!exact && it.getInt(it.getColumnIndexOrThrow("kind")) != 1)) false
+                        else { result.put("detail", detail(it)).put("pathMatched", exact); true }
+                    }
+                    if (found) break
+                    if (path.contentEquals(base)) { result.put("status", "not-found"); break }
+                    val slash = path.lastIndexOf(47.toByte())
+                    path = if (slash < 0) byteArrayOf() else path.copyOf(slash)
+                    exact = false
+                }
+            }
             "detail" -> db.rawQuery("""SELECT n.*,a.logical,a.allocated AS total_allocated,a.complete AS subtree_complete,a.owner,
                 EXISTS(SELECT 1 FROM issues i WHERE i.sid=n.sid AND i.node=n.id AND i.code=1) AS inaccessible
                 FROM nodes n JOIN aggregates a ON a.sid=n.sid AND a.id=n.id WHERE n.sid=? AND n.id=?""", arrayOf(id, node.toString())).use {
@@ -65,7 +94,10 @@ internal class IndexQueries(private val store: IndexStore) {
             }
         }
         // Every indexed write advances revision atomically. Only accept a stable read interval.
-        if (metadata(db, id)?.getLong("revision") != revision) return JSONObject().put("status", "stale-cursor")
+        val currentRevision = db.rawQuery("SELECT revision FROM sessions WHERE id=?", arrayOf(id)).use {
+            if (it.moveToFirst()) it.getLong(0) else null
+        }
+        if (currentRevision != revision) return JSONObject().put("status", "stale-cursor")
         return result
     }
     private fun treemap(db: SQLiteDatabase, id: String, parent: Long, sort: String, limit: Int, depth: Int, signature: String, revision: Long, result: JSONObject) {
@@ -185,13 +217,32 @@ internal class IndexQueries(private val store: IndexStore) {
         }
         pages(rows, limit, cursor, signature, revision, result, "entries")
     }
+    private fun ByteArray.splitComponentsValid(): Boolean =
+        !contains(0) && first() != 47.toByte() && last() != 47.toByte() &&
+            toList().let { bytes ->
+                var start = 0
+                for (end in 0..size) if (end == size || bytes[end] == 47.toByte()) {
+                    val part = copyOfRange(start, end)
+                    if (part.isEmpty() || part.size > 255 || part.contentEquals(byteArrayOf(46)) || part.contentEquals(byteArrayOf(46, 46))) return false
+                    start = end + 1
+                }
+                true
+            }
+
     private fun metadata(db: SQLiteDatabase, id: String): JSONObject? = db.rawQuery(
-        "SELECT revision,provisional,state,phase,nodes,issues,metrics,root,backend,started,ended,volume,reason FROM sessions WHERE id=?", arrayOf(id)).use {
+        """SELECT s.revision,s.provisional,s.state,s.phase,s.nodes,s.issues,s.metrics,s.root,s.backend,s.started,s.ended,s.volume,s.reason,
+            p.id,p.retained,p.local_updated,p.local_updates FROM sessions s LEFT JOIN snapshots p ON p.sid=s.id WHERE s.id=?""", arrayOf(id)).use {
         if (!it.moveToFirst()) null else JSONObject().put("sessionId", id).put("revision", it.getLong(0)).put("provisional", it.getInt(1) == 1)
             .put("state", it.getString(2)).put("phase", it.getString(3)).put("nodeCount", it.getLong(4)).put("issueCount", it.getLong(5))
             .put("schemaVersion", IndexStore.SCHEMA_VERSION).put("metrics", JSONObject(it.getString(6))).put("rootPath", it.getString(7))
             .put("backend", it.getString(8)).put("startedAtMillis", it.getLong(9)).put("endedAtMillis", it.getLong(10))
-            .put("volume", JSONObject(it.getString(11))).put("reason", it.getString(12))
+            .put("volume", JSONObject(it.getString(11))).put("reason", it.getString(12)).also { value ->
+                if (!it.isNull(13)) {
+                    value.put("snapshotId", it.getString(13)).put("retained", it.getInt(14) == 1)
+                        .put("lastLocalUpdateAtMillis", it.getLong(15)).put("localUpdateCount", it.getLong(16))
+                    store.rescans.decorate(db, value, it.getString(13))
+                }
+            }
     }
     private fun detail(c: Cursor): JSONObject {
         fun long(name: String) = c.getLong(c.getColumnIndexOrThrow(name))

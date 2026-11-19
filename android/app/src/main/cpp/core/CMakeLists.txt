@@ -1,5 +1,5 @@
 find_package(Threads REQUIRED)
-add_library(disksize_core STATIC diagnostics.cpp filesystem.cpp scanner.cpp stream_scanner.cpp)
+add_library(disksize_core STATIC diagnostics.cpp filesystem.cpp scanner.cpp stream_scanner.cpp subtree_scope.cpp)
 set_target_properties(disksize_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(disksize_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/..")
 target_compile_features(disksize_core PUBLIC cxx_std_20)

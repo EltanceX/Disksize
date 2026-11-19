@@ -9,19 +9,26 @@ import kotlin.math.roundToLong
 /** One disposable on-disk comparison. Each call merges at most 512 raw-byte paths. */
 internal class SnapshotQueries(private val store: IndexStore) {
     private var builder: Builder? = null
-    @Synchronized fun execute(q: JSONObject): JSONObject {
+    fun execute(q: JSONObject, waitForMutation: Boolean = true): JSONObject {
+        val lock = store.snapshotMutationLock
+        if (waitForMutation) lock.lock() else if (!lock.tryLock()) return response("busy")
+        return try { executeLocked(q) } finally { lock.unlock() }
+    }
+    private fun executeLocked(q: JSONObject): JSONObject {
         val db = store.writableDatabase
         return when (q.getString("kind")) {
             "snapshot-list" -> list(db, q)
             "snapshot-retain" -> mutate(db) {
                 val id = uuid(q, "snapshotId")
                 val snapshot = snapshot(db, id) ?: return@mutate response("not-found")
+                if (store.rescans.hasActive(db, id)) return@mutate response("busy")
                 db.execSQL("UPDATE snapshots SET retained=? WHERE id=?", arrayOf<Any>(if (q.getBoolean("retained")) 1 else 0, id))
                 response("ok").put("snapshot", snapshot.put("retained", q.getBoolean("retained")))
             }
             "snapshot-delete" -> mutate(db) {
                 val id = uuid(q, "snapshotId")
                 val snapshot = snapshot(db, id) ?: return@mutate response("not-found")
+                if (store.rescans.hasActive(db, id)) return@mutate response("busy")
                 if (snapshot.getBoolean("retained")) return@mutate response("retained")
                 erase(db, id)
                 response("ok")
@@ -30,20 +37,56 @@ internal class SnapshotQueries(private val store: IndexStore) {
             else -> response("invalid-query")
         }
     }
+    internal fun invalidateForRescan(db: SQLiteDatabase, check: () -> Unit) {
+        kotlin.check(store.snapshotMutationLock.isHeldByCurrentThread && db.inTransaction())
+        db.compileStatement("DELETE FROM diff_rows WHERE path IN (SELECT path FROM diff_rows LIMIT 4096)").use { delete ->
+            do { check(); val rows = delete.executeUpdateDelete() } while (rows == 4096)
+        }
+        check()
+        db.execSQL("DELETE FROM diff_cache"); builder = null
+    }
     private fun response(status: String) = JSONObject().put("status", status)
     private fun uuid(q: JSONObject, key: String): String = q.getString(key).also {
         require(it.matches(Regex("[0-9a-fA-F-]{36}")))
     }
     private fun mutate(db: SQLiteDatabase, block: () -> JSONObject): JSONObject {
         db.beginTransactionNonExclusive()
-        return try { block().also { db.setTransactionSuccessful() } } finally { db.endTransaction() }
+        var failure: Throwable? = null
+        return try { block().also { db.setTransactionSuccessful() } }
+        catch (error: Throwable) { failure = error; throw error }
+        finally {
+            try { db.endTransaction() }
+            catch (error: Exception) { if (failure == null) throw error else failure.addSuppressed(error) }
+        }
     }
-    private fun erase(db: SQLiteDatabase, id: String) {
+    private fun erase(db: SQLiteDatabase, id: String) = withDeletionSpillThreshold(db) {
         // IDs originate in this database, never filesystem paths. Targets are never touched.
         db.execSQL("DELETE FROM diff_rows"); db.execSQL("DELETE FROM diff_cache"); builder = null
         db.execSQL("DELETE FROM snapshots WHERE id=?", arrayOf(id))
         for (table in listOf("issues", "hardlinks", "aggregates", "nodes")) db.execSQL("DELETE FROM $table WHERE sid=?", arrayOf(id))
         db.execSQL("DELETE FROM sessions WHERE id=?", arrayOf(id))
+    }
+    private fun withDeletionSpillThreshold(db: SQLiteDatabase, block: () -> Unit) {
+        // This runs on the transaction's pinned writer connection. Android's 8 MiB
+        // soft heap limit otherwise repeatedly spills and reloads dirty index pages.
+        // Keep spilling enabled, with a finite 32 MiB threshold for this deletion only.
+        fun pragma(name: String) = db.compileStatement("PRAGMA $name").use { it.simpleQueryForLong() }
+        val previous = pragma("cache_spill")
+        val threshold = maxOf(1L, 32L * 1024 * 1024 / pragma("page_size"))
+        if (previous == 0L || previous >= threshold) { block(); return }
+        fun setThreshold(pages: Long) {
+            db.execSQL("PRAGMA cache_spill=$pages")
+            // SQLite 3.44 truncates numeric booleans to 8 bits. Explicitly enable
+            // spilling after setting a threshold that may be a multiple of 256.
+            db.execSQL("PRAGMA cache_spill=ON")
+        }
+        var failure: Throwable? = null
+        try { setThreshold(threshold); block() }
+        catch (error: Throwable) { failure = error; throw error }
+        finally {
+            try { setThreshold(previous) }
+            catch (error: Exception) { if (failure == null) throw error else failure.addSuppressed(error) }
+        }
     }
     private fun list(db: SQLiteDatabase, q: JSONObject): JSONObject {
         val limit = q.optInt("limit", 20); require(limit in 1..50)
@@ -67,7 +110,7 @@ internal class SnapshotQueries(private val store: IndexStore) {
         return response("ok").put("snapshots", result).put("nextCursor", next)
     }
     // All sessions share table/index pages. Attribute used pages by stored
-    // node/issue counts, including unfinished sessions; this is not reclaimable
+    // node/issue counts, including unfinished sessions and isolated rescan staging; this is not reclaimable
     // filesystem space or an exact measurement of an individual snapshot.
     private data class StorageEstimate(val usedBytes: Long, val records: Long) {
         fun bytes(nodes: Long, issues: Long): Long =
@@ -76,7 +119,9 @@ internal class SnapshotQueries(private val store: IndexStore) {
     private fun storageEstimate(db: SQLiteDatabase): StorageEstimate {
         fun pragma(name: String) = db.rawQuery("PRAGMA $name", null).use { it.moveToFirst(); it.getLong(0) }
         val used = (pragma("page_count") - pragma("freelist_count")).coerceAtLeast(0) * pragma("page_size")
-        val records = db.rawQuery("SELECT COALESCE(SUM(nodes+issues+1),0) FROM sessions", null).use { it.moveToFirst(); it.getLong(0) }
+        val records = db.rawQuery("""SELECT (SELECT COALESCE(SUM(nodes+issues+1),0) FROM sessions)+
+            (SELECT COALESCE(SUM(CASE WHEN staging_cleaned=0 THEN nodes+issues+1 ELSE 1 END),0) FROM rescan_jobs)""",
+            null).use { it.moveToFirst(); it.getLong(0) }
         return StorageEstimate(used, records)
     }
     private fun snapshot(db: SQLiteDatabase, id: String, storage: StorageEstimate? = null): JSONObject? = db.rawQuery("""SELECT p.*,s.root,s.backend,s.state,s.started,s.ended,s.identity,
@@ -94,10 +139,12 @@ internal class SnapshotQueries(private val store: IndexStore) {
         JSONObject().put("id", id).put("sessionId", text("sid")).put("rootPath", text("root")).put("backend", text("backend"))
             .put("state", text("state")).put("startedAtMillis", number("started")).put("endedAtMillis", number("ended"))
             .put("createdAtMillis", number("created")).put("logicalBytes", number("logical")).put("allocatedBytes", number("allocated"))
+            .put("lastLocalUpdateAtMillis", number("local_updated")).put("localUpdateCount", number("local_updates"))
             .put("estimatedStorageBytes", storage?.bytes(number("stored_nodes"), number("stored_issues")) ?: JSONObject.NULL)
             .put("complete", number("complete") == 1L && text("state") == "completed").put("retained", number("retained") == 1L)
             .put("revision", number("revision")).put("identity", identity)
             .put("available", number("revision") == number("current_revision") && number("provisional") == 0L && text("state") in setOf("completed", "partial"))
+            .also { store.rescans.decorate(db, it, id) }
     }
     private fun compatibility(a: JSONObject, b: JSONObject): JSONArray {
         val reasons = JSONArray()
@@ -151,9 +198,16 @@ internal class SnapshotQueries(private val store: IndexStore) {
             builder = null
         }
         val query = "$signature|$sort|$filter|$limit"
-        val cursor = if (token.isEmpty()) null else decode(token).also {
-            require(it.getInt("version") == 1 && it.getString("query") == query)
-            require(it.getLong("rowId") >= 0)
+        val cursor = if (token.isEmpty()) null else decode(token)
+        if (cursor != null) {
+            val previous = cursor.getString("query").split('|')
+            val current = query.split('|')
+            if (cursor.getInt("version") == 1 && previous.size == 7 && previous[0] == base && previous[2] == target &&
+                previous.drop(4) == current.drop(4) && (previous[1] != current[1] || previous[3] != current[3])) {
+                return result.put("status", "stale-cursor")
+            }
+            require(cursor.getInt("version") == 1 && cursor.getString("query") == query)
+            require(cursor.getLong("rowId") >= 0)
         }
         val column = if (sort == "allocated") "allocated_delta" else "logical_delta"
         val conditions = mutableListOf("length(path)>0")

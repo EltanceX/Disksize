@@ -103,6 +103,30 @@ internal class ScannerPlatformApi(private val activity: MainActivity) : ScannerH
     }
 
     override suspend fun cancelScan(sessionId: String) { callCoordinator { it.cancelScan(sessionId) } }
+
+    override suspend fun startSnapshotRescan(snapshotId: String, nodeId: Long, expectedRevision: Long): String {
+        withContext(Dispatchers.Main.immediate) { requireForeground() }
+        return callCoordinator { service ->
+            val prepared = service.prepareSnapshotRescan(snapshotId, nodeId, expectedRevision)
+            val value = JSONObject(prepared)
+            if (value.optString("status") != "ok") return@callCoordinator prepared
+            val id = value.getString("taskId")
+            try {
+                withContext(Dispatchers.Main.immediate) {
+                    requireForeground()
+                    context.startForegroundService(Intent(context, CoordinatorService::class.java)
+                        .setAction(CoordinatorService.ACTION_START).putExtra(CoordinatorService.EXTRA_SESSION, id))
+                }
+                prepared
+            } catch (error: Exception) {
+                try { service.rejectPreparedScan(id, "foreground-start-denied") } catch (_: Exception) { }
+                throw FlutterError("foreground-start-denied", "请回到应用前台再重新扫描", null)
+            }
+        }
+    }
+
+    override suspend fun getSnapshotRescan(taskId: String): String = callCoordinator { it.getSnapshotRescan(taskId) }
+    override suspend fun cancelSnapshotRescan(taskId: String): String = callCoordinator { it.cancelSnapshotRescan(taskId) }
     override suspend fun queryIndex(requestJson: String): String {
         require(requestJson.length <= 8192)
         if (try { JSONObject(requestJson).optString("kind") == "volumes" } catch (_: org.json.JSONException) { false }) {

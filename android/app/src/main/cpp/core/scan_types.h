@@ -3,6 +3,8 @@
 #include <atomic>
 #include <cstdint>
 #include <string>
+#include <optional>
+#include <vector>
 
 namespace disksize {
 
@@ -15,8 +17,18 @@ enum class ScanErrorCode : std::uint8_t {
     ChangedDuringScan, ResourceLimit, ConsumerFailure
 };
 
+struct ScopeIdentity {
+    std::uint64_t device = 0, inode = 0, mount = 0;
+};
+struct SubtreeScope {
+    std::string relative_path;
+    std::vector<ScopeIdentity> chain; // Snapshot root through selected directory, inclusive.
+    std::uint64_t filesystem = 0;
+};
+
 struct ScanConfiguration {
     std::string root_path;
+    std::optional<SubtreeScope> subtree;
     AccessMode access_mode = AccessMode::App;
     bool follow_symbolic_links = false;
     bool cross_mount_points = false;

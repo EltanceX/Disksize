@@ -25,6 +25,9 @@ import com.example.disksize.root.RootFailure
 import com.example.disksize.index.IndexStore
 import com.example.disksize.index.LocalScanPipe
 import com.example.disksize.index.IndexQueries
+import com.example.disksize.index.SnapshotRescanSource
+import com.example.disksize.index.SnapshotRescanStore
+import com.example.disksize.scan.SnapshotRescanContract as Rescan
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -36,17 +39,21 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
 class CoordinatorService : Service() {
-    private class Active(val id: String, val root: String, val monitorShared: Boolean, val rootMode: Boolean,
-        val prepareStart: Long) {
+    private class Active(val id: String, var root: String, var monitorShared: Boolean, var rootMode: Boolean,
+        val prepareStart: Long, val rescanRequest: Rescan.Request? = null) {
         val preparedAt = System.nanoTime()
         var foregroundAt = 0L
         var handle = 0L
-        var started = false
-        var finalizing = false
-        var cancelled = false
-        var forcedState: String? = null
+        @Volatile var started = false
+        @Volatile var finalizing = false
+        @Volatile var cancelled = false
+        @Volatile var forcedState: String? = null
         var reason = ""
         val indexCancellation = CancellationSignal()
+        @Volatile var applying = false
+        @Volatile var rescanNodes = 0L
+        @Volatile var rescanIssues = 0L
+        @Volatile var publicationPending = false
     }
     private val lock = Any()
     private val main = Handler(Looper.getMainLooper())
@@ -66,7 +73,11 @@ class CoordinatorService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        if (BuildConfig.SCAN_BENCHMARK) {
+        if (BuildConfig.RESCAN_TEST_HOST) {
+            val storage = createDeviceProtectedStorageContext()
+            journal = SessionJournal(storage, "snapshot-rescan-service-test-v1.json")
+            index = IndexStore(storage, "snapshot-rescan-service-test-v1.db")
+        } else if (BuildConfig.SCAN_BENCHMARK) {
             val storage = BenchmarkStorage.context(this)
             journal = SessionJournal(storage, BenchmarkStorage.JOURNAL)
             index = IndexStore(storage, BenchmarkStorage.INDEX, BenchmarkStorage.importPolicy(storage),
@@ -84,7 +95,7 @@ class CoordinatorService : Service() {
         worker.execute { journalExecutor.execute {
             try {
                 index.recover()
-                val restored = journal.read()
+                var restored = journal.read()
                 if (restored != null && (restored.optBoolean("active") || restored.optString("state") in ACTIVE_STATES)) {
                     index.interrupt(restored.getString("sessionId"), "interrupted", "process-interrupted")
                     restored.put("state", "interrupted").put("reason", "process-interrupted")
@@ -92,6 +103,8 @@ class CoordinatorService : Service() {
                         .put("endedAtMillis", now()).put("updatedAtMillis", now())
                     journal.write(restored.toString())
                 }
+                val aligned = SnapshotRescanStatus.alignJournal(index, restored)
+                if (aligned?.toString() != restored?.toString()) { journal.write(aligned.toString()); restored = aligned }
                 synchronized(lock) { current = restored; encoded = restored?.toString() ?: "" }
             } catch (error: Exception) {
                 Log.e(TAG, "Session recovery failed", error)
@@ -149,6 +162,78 @@ class CoordinatorService : Service() {
         }
 
         override fun cancelScan(sessionId: String) { checkCallingUid(); cancel(sessionId) }
+        override fun prepareSnapshotRescan(snapshotId: String, nodeId: Long, expectedRevision: Long): String {
+            checkCallingUid(); initialized.get(5, TimeUnit.SECONDS)
+            val request = Rescan.Request(snapshotId, nodeId, expectedRevision)
+            if (Rescan.admissionError(request, null, false) == Rescan.Error.INVALID_REQUEST)
+                return rescanResponse(Rescan.Error.INVALID_REQUEST)
+            val task = synchronized(lock) {
+                if (destroyed || !journalHealthy) return rescanResponse(Rescan.Error.STORAGE_ERROR)
+                if (active != null) return rescanResponse(Rescan.Error.BUSY)
+                Active(UUID.randomUUID().toString(), "", false, false, System.nanoTime(), request).also { active = it }
+            }
+            main.postDelayed({ rejectPrepared(task.id, "foreground-start-not-received") }, 10_000)
+            return try {
+                worker.submit<String> {
+                    try {
+                        index.rescans.create(task.id, request)
+                        val scope = index.rescans.source(task.id)
+                        task.root = scope.root; task.rootMode = scope.backend == "root"
+                        if (task.rootMode && !rootBackend.ready()) throw SnapshotRescanStore.Rejected(Rescan.Error.ROOT_UNAVAILABLE)
+                        task.monitorShared = !task.rootMode && ScanAccess.requiresSharedAccess(this@CoordinatorService, scope.root)
+                        if (task.monitorShared && !ScanAccess.read(this@CoordinatorService).sharedAccessGranted)
+                            throw SnapshotRescanStore.Rejected(Rescan.Error.SCAN_FAILED)
+                        if (task.finalizing) throw SnapshotRescanStore.Rejected(Rescan.Error.SCAN_FAILED)
+                        if (task.cancelled || destroyed) throw SnapshotRescanStore.Rejected(cancellationReason(task))
+                        SnapshotRescanStatus.encode(requireNotNull(index.rescans.get(task.id))).toString()
+                    } catch (error: Exception) {
+                        val reason = (error as? SnapshotRescanStore.Rejected)?.reason ?: Rescan.Error.STORAGE_ERROR
+                        failRescan(task, reason); finishRescan(task)
+                        JSONObject(rescanResponse(reason)).also {
+                            if (index.rescans.get(task.id) != null) it.put("taskId", task.id)
+                        }.toString()
+                    }
+                }.get(5, TimeUnit.SECONDS)
+            } catch (error: Exception) {
+                rejectPrepared(task.id, "admission-failed-or-timeout")
+                JSONObject(rescanResponse(Rescan.Error.STORAGE_ERROR)).put("taskId", task.id).toString()
+            }
+        }
+
+        override fun getSnapshotRescan(taskId: String): String {
+            checkCallingUid(); initialized.get(5, TimeUnit.SECONDS)
+            if (!validTaskId(taskId)) return rescanResponse(Rescan.Error.INVALID_REQUEST)
+            val job = index.rescans.get(taskId) ?: return JSONObject().put("status", "not-found").toString()
+            val result = SnapshotRescanStatus.encode(job)
+            synchronized(lock) { active?.takeIf { it.id == taskId && it.rescanRequest != null }?.let {
+                result.put("nodeCount", maxOf(job.nodes, it.rescanNodes)).put("issueCount", maxOf(job.issues, it.rescanIssues))
+                    .put("cancellationRequested", job.cancellationRequested || it.cancelled)
+                    .put("publicationPending", it.publicationPending)
+            } }
+            return result.toString()
+        }
+
+        override fun cancelSnapshotRescan(taskId: String): String {
+            checkCallingUid(); initialized.get(5, TimeUnit.SECONDS)
+            if (!validTaskId(taskId)) return rescanResponse(Rescan.Error.INVALID_REQUEST)
+            val job = index.rescans.get(taskId) ?: return JSONObject().put("status", "not-found").toString()
+            val result = Rescan.cancellation(job.state, job.committedRevision)
+            if (result == Rescan.Cancellation.REQUESTED) {
+                val owned = synchronized(lock) { active?.let { it.id == taskId && it.rescanRequest != null } == true }
+                if (owned) cancel(taskId) else worker.execute {
+                    try {
+                        val pending = index.rescans.get(taskId)
+                        if (pending != null && !pending.state.terminal && pending.committedRevision == null) {
+                            index.rescans.requestCancellation(taskId)
+                            index.rescans.transition(taskId, Rescan.State.CANCELLED, Rescan.Error.CANCELLED)
+                        }
+                    } catch (error: Exception) {
+                        journalHealthy = false; Log.e(TAG, "Orphan rescan cancellation deferred to recovery", error)
+                    }
+                }
+            }
+            return JSONObject().put("status", result.wireName).put("taskId", taskId).toString()
+        }
         override fun queryIndex(requestJson: String): String {
             checkCallingUid(); initialized.get(5, TimeUnit.SECONDS)
             require(requestJson.length <= 8192)
@@ -156,13 +241,20 @@ class CoordinatorService : Service() {
                 return JSONObject().put("status", "invalid-query").toString()
             }
             synchronized(lock) {
+                val running = active
+                if (running?.rescanRequest != null) {
+                    val kind = query.optString("kind")
+                    if (kind in setOf("snapshot-delete", "snapshot-retain", "snapshot-compare") ||
+                        (running.applying && kind == "snapshot-list"))
+                        return rescanResponse(Rescan.Error.BUSY)
+                }
                 val id = active?.id
                 if (id != null && query.optString("kind").startsWith("snapshot-") &&
                     listOf("snapshotId", "baseId", "targetId").any { query.optString(it) == id }) {
                     return JSONObject().put("status", "index-finalizing").toString()
                 }
             }
-            val result = JSONObject(IndexQueries(index).query(requestJson))
+            val result = JSONObject(IndexQueries(index).query(requestJson, nonBlockingSnapshots = true))
             if (query.optString("kind") == "snapshot-delete" && result.optString("status") == "ok") {
                 journalExecutor.submit {
                     synchronized(lock) {
@@ -242,12 +334,11 @@ class CoordinatorService : Service() {
             active?.takeIf { it.id == intent?.getStringExtra(EXTRA_SESSION) && !it.started && !it.finalizing }?.also {
                 it.started = true
                 it.foregroundAt = System.nanoTime()
-                current!!.put("state", "running")
-                publishLocked()
+                if (it.rescanRequest == null) { current!!.put("state", "running"); publishLocked() }
             }
         }
         if (task != null) {
-            worker.execute { runScan(task) }
+            worker.execute { if (task.rescanRequest == null) runScan(task) else runRescan(task) }
             main.post(permissionWatch)
         } else releaseIfIdle()
         return START_NOT_STICKY
@@ -354,6 +445,128 @@ class CoordinatorService : Service() {
         }
     }
 
+    private fun rescanResponse(error: Rescan.Error) = JSONObject().put("status", error.wireName).toString()
+    private fun validTaskId(id: String) = id.matches(Regex("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"))
+    private fun cancellationReason(task: Active) =
+        if (destroyed || task.forcedState != null) Rescan.Error.PROCESS_INTERRUPTED else Rescan.Error.CANCELLED
+
+    private fun runRescan(task: Active) {
+        try {
+            journalExecutor.submit {}.get(5, TimeUnit.SECONDS)
+            check(journalHealthy)
+            if (task.cancelled || destroyed) throw SnapshotRescanStore.Rejected(cancellationReason(task))
+            // Read the source again at dispatch; no path supplied by Flutter or an Intent is used.
+            val scope = index.rescans.source(task.id)
+            if (task.rootMode && !rootBackend.ready()) throw SnapshotRescanStore.Rejected(Rescan.Error.ROOT_UNAVAILABLE)
+            val progress: (Long, Long, Long) -> Unit = { nodes, _, issues ->
+                task.rescanNodes = nodes; task.rescanIssues = issues
+                main.post { updateNotification() }
+            }
+            index.rescans.beginStaging(task.id).use { staging ->
+                val summary = if (task.rootMode) rootBackend.runSubtree(task.id, scope.root.toByteArray(Charsets.UTF_8),
+                    scope.path, scope.identities, scope.filesystem, staging, { task.cancelled || destroyed }, progress)
+                else {
+                    val handle = NativeBridge.nativeCreateSubtreeScan(scope.root.toByteArray(Charsets.UTF_8), scope.path, scope.identities, scope.filesystem)
+                    synchronized(lock) {
+                        task.handle = handle
+                        if (task.cancelled || destroyed) NativeBridge.nativeCancelScan(handle)
+                    }
+                    LocalScanPipe.run(handle, task.id, staging, ScanPipeline.OPTIMIZED, progress)
+                }
+                if (task.cancelled || destroyed) throw SnapshotRescanStore.Rejected(cancellationReason(task))
+                staging.finish(summary)
+            }
+            index.rescans.scopeError(task.id)?.let { throw SnapshotRescanStore.Rejected(it) }
+            task.applying = true
+            index.rescans.apply(task.id, task.indexCancellation, cancelled = { task.cancelled || destroyed },
+                checkpoint = { if (BuildConfig.RESCAN_TEST_HOST) rescanTestCheckpoint(task.id, it.name) },
+                cancellationError = { cancellationReason(task) })
+        } catch (error: Throwable) {
+            Log.w(TAG, "Snapshot rescan stopped", error)
+            val reason = when {
+                task.cancelled || destroyed -> cancellationReason(task)
+                error is SnapshotRescanStore.Rejected -> error.reason
+                error is RootFailure && error.reason == "root-process-died" -> Rescan.Error.PROCESS_INTERRUPTED
+                error is RootFailure && error.reason == "root-unavailable" -> Rescan.Error.ROOT_UNAVAILABLE
+                error is RootFailure || error is IllegalArgumentException -> Rescan.Error.PROTOCOL_ERROR
+                error is android.database.sqlite.SQLiteFullException || error is android.database.sqlite.SQLiteDiskIOException -> Rescan.Error.STORAGE_ERROR
+                else -> Rescan.Error.SCAN_FAILED
+            }
+            failRescan(task, reason)
+        } finally {
+            synchronized(lock) {
+                if (task.handle != 0L) { NativeBridge.nativeReleaseScan(task.handle); task.handle = 0L }
+            }
+            finishRescan(task)
+        }
+    }
+
+    /** Debug isolated-host only: let instrumentation kill a real process on either side of COMMIT. */
+    private fun rescanTestCheckpoint(id: String, point: String) {
+        check(BuildConfig.RESCAN_TEST_HOST)
+        val directory = createDeviceProtectedStorageContext().noBackupFilesDir
+        val control = java.io.File(directory, "snapshot-rescan-test-checkpoint.json")
+        if (!control.isFile) return
+        val request = JSONObject(control.readText())
+        if (request.optString("taskId") != id) return
+        val marker = java.io.File(directory, "snapshot-rescan-test-checkpoint.reached")
+        if (request.optString("point") == "MEASURE") {
+            marker.appendText("$point:${System.nanoTime()}\n")
+            return
+        }
+        if (request.optString("point") != point) return
+        marker.writeText("$id:$point")
+        val deadline = android.os.SystemClock.elapsedRealtime() + 30_000
+        while (control.isFile && android.os.SystemClock.elapsedRealtime() < deadline) Thread.sleep(10)
+        check(!control.isFile) { "Test checkpoint timed out" }
+    }
+
+    private fun failRescan(task: Active, reason: Rescan.Error) {
+        try {
+            val job = index.rescans.get(task.id) ?: return
+            if (job.committedRevision != null || job.state.terminal) return
+            val state = when (reason) {
+                Rescan.Error.CANCELLED -> Rescan.State.CANCELLED
+                Rescan.Error.PROCESS_INTERRUPTED -> Rescan.State.INTERRUPTED
+                Rescan.Error.STALE_REVISION -> Rescan.State.STALE
+                else -> Rescan.State.FAILED
+            }
+            index.rescans.transition(task.id, state, reason)
+        } catch (error: Exception) {
+            journalHealthy = false
+            Log.e(TAG, "Rescan failure persistence deferred to recovery", error)
+        }
+    }
+
+    private fun finishRescan(task: Active) {
+        synchronized(lock) { task.finalizing = true }
+        try {
+            val job = index.rescans.get(task.id)
+            if (job?.committedRevision != null) {
+                val before = synchronized(lock) { current?.let { JSONObject(it.toString()) } }
+                val aligned = SnapshotRescanStatus.alignJournal(index, before)
+                if (aligned?.toString() != before?.toString()) {
+                    pendingWrite.set(null)
+                    journalExecutor.submit {
+                        journal.write(aligned.toString())
+                        synchronized(lock) {
+                            if (active === task && current?.optString("sessionId") == job.sessionId) {
+                                current = aligned; encoded = aligned.toString()
+                            }
+                        }
+                    }.get(5, TimeUnit.SECONDS)
+                }
+            }
+        } catch (error: Exception) {
+            // The durable SQLite marker wins even if the independent journal cannot be published.
+            journalHealthy = false; task.publicationPending = true
+            Log.e(TAG, "Committed rescan journal publication deferred to recovery", error)
+        } finally {
+            synchronized(lock) { if (active === task) active = null }
+            main.post { releaseIfIdle() }
+        }
+    }
+
     private fun finishLocked(task: Active) {
         check(active === task)
         task.finalizing = true
@@ -391,6 +604,11 @@ class CoordinatorService : Service() {
     private fun rejectPrepared(id: String, reason: String) {
         synchronized(lock) {
             val task = active?.takeIf { it.id == id && !it.started && !it.finalizing } ?: return
+            if (task.rescanRequest != null) {
+                task.finalizing = true
+                worker.execute { failRescan(task, Rescan.Error.SCAN_FAILED); finishRescan(task) }
+                return
+            }
             current!!.put("state", "failed").put("reason", reason).put("complete", false)
             finishLocked(task)
         }
@@ -398,6 +616,24 @@ class CoordinatorService : Service() {
     }
 
     private fun cancel(id: String) {
+        val rescan = synchronized(lock) { active?.takeIf { it.id == id && it.rescanRequest != null && !it.finalizing }?.also { it.cancelled = true } }
+        if (rescan != null) {
+            // Signal SQL before queuing any persistence write behind its transaction.
+            rescan.indexCancellation.cancel()
+            synchronized(lock) { if (rescan.handle != 0L) NativeBridge.nativeCancelScan(rescan.handle) }
+            if (rescan.rootMode) rootBackend.cancel(id)
+            worker.execute {
+                try {
+                    val job = index.rescans.get(id)
+                    if (job != null && !job.state.terminal) index.rescans.requestCancellation(id)
+                    if (!rescan.started) { failRescan(rescan, cancellationReason(rescan)); finishRescan(rescan) }
+                } catch (error: Exception) {
+                    journalHealthy = false; Log.e(TAG, "Rescan cancellation persistence deferred to recovery", error)
+                }
+            }
+            main.post { updateNotification(); releaseIfIdle() }
+            return
+        }
         synchronized(lock) {
             val task = active?.takeIf { it.id == id && !it.finalizing } ?: return
             task.cancelled = true
@@ -417,7 +653,7 @@ class CoordinatorService : Service() {
         val id = synchronized(lock) {
             val task = active?.takeUnless { it.finalizing } ?: return
             task.forcedState = state; task.reason = reason
-            current!!.put("reason", reason)
+            if (task.rescanRequest == null) current!!.put("reason", reason)
             task.id
         }
         cancel(id)
@@ -445,10 +681,15 @@ class CoordinatorService : Service() {
                 task.indexCancellation.cancel()
                 if (task.handle != 0L) NativeBridge.nativeCancelScan(task.handle)
                 if (task.rootMode) rootBackend.cancel(task.id)
-                current!!.put("state", task.forcedState ?: "interrupted")
-                    .put("reason", task.reason.ifEmpty { "service-destroyed" })
-                    .put("complete", false).put("active", false).put("endedAtMillis", now())
-                publishLocked()
+                if (task.rescanRequest == null) {
+                    current!!.put("state", task.forcedState ?: "interrupted")
+                        .put("reason", task.reason.ifEmpty { "service-destroyed" })
+                        .put("complete", false).put("active", false).put("endedAtMillis", now())
+                    publishLocked()
+                } else {
+                    task.forcedState = "interrupted"
+                    if (!task.started) worker.execute { failRescan(task, Rescan.Error.PROCESS_INTERRUPTED); finishRescan(task) }
+                }
             }
         }
         main.removeCallbacksAndMessages(null)
@@ -492,7 +733,12 @@ class CoordinatorService : Service() {
         .put("entries", JSONArray()).put("issues", JSONArray())
 
     private fun notification(): Notification {
-        val snapshot = synchronized(lock) { current?.let { JSONObject(it.toString()) } }
+        val snapshot = synchronized(lock) {
+            val task = active
+            if (task?.rescanRequest != null) JSONObject().put("sessionId", task.id).put("nodeCount", task.rescanNodes)
+                .put("state", if (task.cancelled) "cancelling" else if (task.applying) "applying" else "scanning")
+            else current?.let { JSONObject(it.toString()) }
+        }
         val id = snapshot?.optString("sessionId") ?: ""
         val open = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)

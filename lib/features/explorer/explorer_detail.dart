@@ -8,6 +8,7 @@ import '../../platform/entry_opener.dart';
 import '../../platform/scan_client.dart';
 import 'explorer_format.dart';
 import 'external_open_button.dart';
+import '../snapshots/local_update_summary.dart';
 
 class ExplorerDetail extends StatefulWidget {
   const ExplorerDetail({
@@ -17,12 +18,18 @@ class ExplorerDetail extends StatefulWidget {
     required this.nodeId,
     required this.onLocate,
     this.opener,
+    this.expectedRevision,
+    this.onRescan,
+    this.rescanEnabled = true,
   });
   final IndexClient client;
   final String sessionId;
   final int nodeId;
   final ValueChanged<int> onLocate;
   final EntryOpener? opener;
+  final int? expectedRevision;
+  final void Function(int nodeId, int revision)? onRescan;
+  final bool rescanEnabled;
   @override
   State<ExplorerDetail> createState() => _ExplorerDetailState();
 }
@@ -42,7 +49,8 @@ class _ExplorerDetailState extends State<ExplorerDetail> {
   void didUpdateWidget(covariant ExplorerDetail oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.nodeId != widget.nodeId ||
-        oldWidget.sessionId != widget.sessionId) {
+        oldWidget.sessionId != widget.sessionId ||
+        oldWidget.expectedRevision != widget.expectedRevision) {
       _load();
     }
   }
@@ -62,6 +70,7 @@ class _ExplorerDetailState extends State<ExplorerDetail> {
             sessionId: widget.sessionId,
             kind: IndexQueryKind.detail,
             nodeId: widget.nodeId,
+            expectedRevision: widget.expectedRevision,
           ),
         ),
         widget.client.query(
@@ -71,13 +80,16 @@ class _ExplorerDetailState extends State<ExplorerDetail> {
             nodeId: widget.nodeId,
             limit: 20,
             cursor: cursor,
+            expectedRevision: widget.expectedRevision,
           ),
         ),
       ]);
       if (!mounted || generation != _generation) return;
       setState(() {
         if (values.any((p) => p.status != 'ok') ||
-            values[0].revision != values[1].revision) {
+            values[0].revision != values[1].revision ||
+            (widget.expectedRevision != null &&
+                values[0].revision != widget.expectedRevision)) {
           _error = '条目已变化或索引正在更新，请刷新详情。';
         } else {
           _page = values[0];
@@ -93,6 +105,28 @@ class _ExplorerDetailState extends State<ExplorerDetail> {
         setState(() => _loading = false);
       }
     }
+  }
+
+  Future<void> _open(IndexDetail detail) async {
+    final expected = _page!.revision;
+    final current = await widget.client.query(
+      IndexRequest(
+        sessionId: widget.sessionId,
+        kind: IndexQueryKind.detail,
+        nodeId: detail.entry.id,
+        expectedRevision: expected,
+      ),
+    );
+    if (!mounted || current.status != 'ok' || current.revision != expected) {
+      throw PlatformException(
+        code: 'entry-changed',
+        message: '索引已更新，请重新加载详情后再打开。',
+      );
+    }
+    await (widget.opener ?? AndroidEntryOpener()).open(
+      widget.sessionId,
+      detail.entry.id,
+    );
   }
 
   Future<void> _copyPath(IndexDetail detail) async {
@@ -139,7 +173,7 @@ class _ExplorerDetailState extends State<ExplorerDetail> {
               ),
             ),
             IconButton(
-              tooltip: '刷新详情',
+              tooltip: '重新加载详情',
               onPressed: _loading ? null : () => _load(),
               icon: const Icon(Icons.refresh),
             ),
@@ -170,10 +204,7 @@ class _ExplorerDetailState extends State<ExplorerDetail> {
               alignment: Alignment.centerLeft,
               child: ExternalOpenButton(
                 key: const Key('open-indexed-entry'),
-                onOpen: () => (widget.opener ?? AndroidEntryOpener()).open(
-                  widget.sessionId,
-                  detail.entry.id,
-                ),
+                onOpen: () => _open(detail),
               ),
             ),
             const Text(
@@ -181,6 +212,21 @@ class _ExplorerDetailState extends State<ExplorerDetail> {
               style: TextStyle(fontSize: 12),
             ),
           ],
+          if (detail.entry.kind == 'directory' && widget.onRescan != null) ...[
+            TextButton.icon(
+              key: const Key('detail-rescan'),
+              onPressed: !widget.rescanEnabled || _page!.session.retained
+                  ? null
+                  : () => widget.onRescan!(detail.entry.id, _page!.revision),
+              icon: const Icon(Icons.manage_search),
+              label: const Text('重新扫描此文件夹'),
+            ),
+            if (_page!.session.retained) const Text('已保留快照；取消保留后可重新扫描。'),
+          ],
+          LocalUpdateSummary(
+            update: _page!.session.localUpdate,
+            revision: _page!.revision,
+          ),
           if (detail.entry.parentId > 0)
             TextButton.icon(
               key: const Key('locate-indexed-parent'),

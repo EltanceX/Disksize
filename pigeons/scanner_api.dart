@@ -64,6 +64,12 @@ abstract class ScannerHostApi {
   @async
   String queryIndex(String requestJson);
   @async
+  String startSnapshotRescan(String snapshotId, int nodeId, int expectedRevision);
+  @async
+  String getSnapshotRescan(String taskId);
+  @async
+  String cancelSnapshotRescan(String taskId);
+  @async
   void openIndexedEntry(String sessionId, int nodeId);
 }
 

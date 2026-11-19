@@ -801,6 +801,9 @@ interface ScannerHostApi {
   suspend fun getScanSnapshot(): ScanSnapshot?
   suspend fun cancelScan(sessionId: String)
   suspend fun queryIndex(requestJson: String): String
+  suspend fun startSnapshotRescan(snapshotId: String, nodeId: Long, expectedRevision: Long): String
+  suspend fun getSnapshotRescan(taskId: String): String
+  suspend fun cancelSnapshotRescan(taskId: String): String
   suspend fun openIndexedEntry(sessionId: String, nodeId: Long)
 
   companion object {
@@ -983,6 +986,65 @@ interface ScannerHostApi {
             CoroutineScope(Dispatchers.Main).launch {
               val wrapped: List<Any?> = try {
                 listOf(api.queryIndex(requestJsonArg))
+              } catch (exception: Throwable) {
+                ScannerApiPigeonUtils.wrapError(exception)
+              }
+              reply.reply(wrapped)
+            }
+          }
+        } else {
+          channel.setMessageHandler(null)
+        }
+      }
+      run {
+        val channel = BasicMessageChannel<Any?>(binaryMessenger, "dev.flutter.pigeon.disksize.ScannerHostApi.startSnapshotRescan$separatedMessageChannelSuffix", codec)
+        if (api != null) {
+          channel.setMessageHandler { message, reply ->
+            val args = message as List<Any?>
+            val snapshotIdArg = args[0] as String
+            val nodeIdArg = args[1] as Long
+            val expectedRevisionArg = args[2] as Long
+            CoroutineScope(Dispatchers.Main).launch {
+              val wrapped: List<Any?> = try {
+                listOf(api.startSnapshotRescan(snapshotIdArg, nodeIdArg, expectedRevisionArg))
+              } catch (exception: Throwable) {
+                ScannerApiPigeonUtils.wrapError(exception)
+              }
+              reply.reply(wrapped)
+            }
+          }
+        } else {
+          channel.setMessageHandler(null)
+        }
+      }
+      run {
+        val channel = BasicMessageChannel<Any?>(binaryMessenger, "dev.flutter.pigeon.disksize.ScannerHostApi.getSnapshotRescan$separatedMessageChannelSuffix", codec)
+        if (api != null) {
+          channel.setMessageHandler { message, reply ->
+            val args = message as List<Any?>
+            val taskIdArg = args[0] as String
+            CoroutineScope(Dispatchers.Main).launch {
+              val wrapped: List<Any?> = try {
+                listOf(api.getSnapshotRescan(taskIdArg))
+              } catch (exception: Throwable) {
+                ScannerApiPigeonUtils.wrapError(exception)
+              }
+              reply.reply(wrapped)
+            }
+          }
+        } else {
+          channel.setMessageHandler(null)
+        }
+      }
+      run {
+        val channel = BasicMessageChannel<Any?>(binaryMessenger, "dev.flutter.pigeon.disksize.ScannerHostApi.cancelSnapshotRescan$separatedMessageChannelSuffix", codec)
+        if (api != null) {
+          channel.setMessageHandler { message, reply ->
+            val args = message as List<Any?>
+            val taskIdArg = args[0] as String
+            CoroutineScope(Dispatchers.Main).launch {
+              val wrapped: List<Any?> = try {
+                listOf(api.cancelSnapshotRescan(taskIdArg))
               } catch (exception: Throwable) {
                 ScannerApiPigeonUtils.wrapError(exception)
               }
